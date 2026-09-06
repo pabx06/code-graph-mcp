@@ -10320,3 +10320,202 @@ fn test_cli_similar_discloses_noise_filtered_candidates() {
          would do nothing here; stderr:\n{stderr}"
     );
 }
+
+/// Fixture for the `similar` success path: one seed plus named neighbours, each
+/// given a hand-built 384-dim vector so the whole path runs on the no-embed leg.
+/// `similar --node-id` reads a STORED embedding rather than embedding a query,
+/// so no model is involved — the same reason
+/// `test_cli_similar_discloses_noise_filtered_candidates` can do this.
+///
+/// Every neighbour is a production symbol in `src/`, so the noise filter takes
+/// nothing and distance is the only thing that decides the answer.
+///
+/// Returns the seed node_id.
+fn similar_fixture(project: &TempDir, neighbours: &[(&str, f32)]) -> i64 {
+    use code_graph_mcp::storage::queries;
+
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut app = String::from("pub fn seed_symbol() {}\n");
+    for (name, _) in neighbours {
+        app.push_str(&format!("pub fn {name}() {{}}\n"));
+    }
+    std::fs::write(src.join("app.rs"), app).unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let conn = db.conn();
+    conn.execute_batch(&code_graph_mcp::storage::schema::create_vec_tables_sql())
+        .unwrap();
+
+    let node_id = |name: &str| -> i64 {
+        queries::get_nodes_by_name(conn, name)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("fixture node {name} must be indexed"))
+            .id
+    };
+
+    let seed = node_id("seed_symbol");
+    let mut vectors = vec![(seed, vec![0.1f32; 384])];
+    for (name, value) in neighbours {
+        vectors.push((node_id(name), vec![*value; 384]));
+    }
+    queries::insert_node_vectors_batch(conn, &vectors).unwrap();
+    drop(db);
+    seed
+}
+
+/// The human-readable render of `similar` — the default output, and the one
+/// shape no test asserted (audit 2026-09-05 named `similar.rs` the
+/// lowest-covered production file at 40.3%).
+///
+/// It pins the similarity arithmetic too: the column is `1/(1+distance)` as a
+/// percentage, not the distance and not `1-distance`, so an identical neighbour
+/// reads 100.0% and the number cannot silently change meaning.
+#[test]
+fn test_cli_similar_human_render_shows_percent_symbol_and_location() {
+    let project = TempDir::new().unwrap();
+    // Same point as the seed → L2 distance 0 → similarity 1/(1+0) = 100.0%.
+    let seed = similar_fixture(&project, &[("twin_symbol", 0.1)]);
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["similar", "--node-id", &seed.to_string(), "--top-k", "5"],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("twin_symbol"))
+        .unwrap_or_else(|| panic!("the neighbour must be rendered; stdout:\n{stdout}"));
+    assert!(
+        line.starts_with("100.0%"),
+        "an identical vector is 1/(1+0) = 100.0%, not a distance and not 1-distance; got: {line:?}"
+    );
+    assert!(
+        line.contains("function"),
+        "the node type is part of the line; got: {line:?}"
+    );
+    assert!(
+        line.contains("src/app.rs:"),
+        "and the file:line location; got: {line:?}"
+    );
+    assert!(
+        !stdout.trim_start().starts_with('['),
+        "without --json the output is human text, not an array; got: {stdout:?}"
+    );
+}
+
+/// The `--max-distance` cutoff disclosure. Its wording was WRONG once — it said
+/// "nearer candidate(s) exceeded the cutoff" when `cutoff_dropped` counts the
+/// less-similar tail — and nothing failed, because no test read the sentence.
+#[test]
+fn test_cli_similar_cutoff_message_names_the_less_similar_tail() {
+    let project = TempDir::new().unwrap();
+    // One neighbour on top of the seed, one far away: L2 over 384 dims between
+    // 0.1 and 0.9 is sqrt(384 * 0.64) ≈ 15.7, far beyond the 0.8 default.
+    let seed = similar_fixture(&project, &[("near_symbol", 0.1), ("far_symbol", 0.9)]);
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["similar", "--node-id", &seed.to_string(), "--top-k", "5"],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("near_symbol") && !stdout.contains("far_symbol"),
+        "fixture precondition: exactly one neighbour inside the cutoff and one \
+         outside it, or the message under test does not fire; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("beyond the cutoff"),
+        "the shortfall must be disclosed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("less-similar"),
+        "and it must name what was dropped as the LESS-similar tail — the earlier \
+         wording called them nearer, which is the opposite of what the counter \
+         counts; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Raise --max-distance"),
+        "this filter, unlike the noise filter, IS adjustable and the message must \
+         say so; stderr:\n{stderr}"
+    );
+}
+
+/// `similar` resolves ambiguity through the shared resolver rather than
+/// answering about one arbitrary definition of five. Its own source calls a
+/// silent wrong answer the worst shape this CLI can produce; nothing tested it.
+#[test]
+fn test_cli_similar_refuses_an_ambiguous_name_instead_of_picking_one() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Two definitions of the same name in different files — the ambiguity class
+    // `callgraph` and `impact` already refuse on.
+    std::fs::write(src.join("a.rs"), "pub fn twin() {}\n").unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn twin() {}\n").unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, stderr, code) = run_cli(&project, &["similar", "twin", "--json"]);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.to_lowercase().contains("ambiguous"),
+        "two same-name definitions must produce the ambiguity verdict, not a \
+         silent pick of one; code {code}, stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_ne!(
+        code, 0,
+        "and it must not report success on a question it did not answer; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// `similar` patches line numbers IN PLACE after the freshness resync instead of
+/// re-running the vector search, and that difference from every other read
+/// command is deliberate: `ensure_file_indexed` re-indexes with `model=None`, so
+/// a re-run would drop the embeddings of exactly the file that was just edited
+/// and lose the neighbour it was reporting. This pins both halves — the line
+/// number moves, and the result survives.
+#[test]
+fn test_cli_similar_repatches_line_numbers_without_losing_the_neighbour() {
+    let project = TempDir::new().unwrap();
+    let seed = similar_fixture(&project, &[("twin_symbol", 0.1)]);
+    let args = ["similar", "--node-id", "", "--top-k", "5", "--json"];
+    let seed_s = seed.to_string();
+    let args: Vec<&str> = args
+        .iter()
+        .map(|a| if a.is_empty() { seed_s.as_str() } else { *a })
+        .collect();
+
+    let (before, stderr, code) = run_cli(&project, &args);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(before.trim()).unwrap();
+    let start_before = v[0]["start_line"].as_i64().unwrap_or_else(|| {
+        panic!("fixture precondition: one neighbour must be returned; got {before}")
+    });
+
+    prepend_pad(&project, "src/app.rs", 10);
+
+    let (after, stderr2, code2) = run_cli(&project, &args);
+    assert_eq!(code2, 0, "stderr:\n{stderr2}");
+    let v2: serde_json::Value = serde_json::from_str(after.trim()).unwrap();
+    assert_eq!(
+        v2.as_array().map(|a| a.len()),
+        Some(1),
+        "the neighbour must survive the resync — re-running the vector search \
+         here would lose it, which is why this path patches instead; got {after}"
+    );
+    assert_eq!(
+        v2[0]["start_line"].as_i64(),
+        Some(start_before + 10),
+        "and its line number must be the post-edit one; got {after}"
+    );
+}
