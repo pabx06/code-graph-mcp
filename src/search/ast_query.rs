@@ -204,6 +204,11 @@ pub fn run(conn: &Connection, p: &AstSearchParams<'_>) -> Result<AstSearchOutcom
 
     let mut dropped_by_filter = 0usize;
     let mut survivors: Vec<NodeWithFile> = Vec::new();
+    // Hoisted: the filter string does not vary across candidates, and
+    // `normalize_type_filter` allocates a Vec on every call — one per row of the
+    // pool (SURF-07, audit 2026-09-05).
+    let normalized_types: Option<Vec<&'static str>> =
+        p.type_filter.map(crate::domain::normalize_type_filter);
     for nwf in sorted {
         let n = &nwf.node;
         // Skip <module>/<external> placeholders and test symbols, consistent
@@ -211,8 +216,7 @@ pub fn run(conn: &Connection, p: &AstSearchParams<'_>) -> Result<AstSearchOutcom
         if crate::domain::is_skippable_result(n.is_test, &n.node_type, &n.name, &nwf.file_path) {
             continue;
         }
-        if let Some(tf) = p.type_filter {
-            let types = crate::domain::normalize_type_filter(tf);
+        if let Some(types) = normalized_types.as_deref() {
             if !types.iter().any(|t| n.node_type == *t) {
                 dropped_by_filter += 1;
                 continue;

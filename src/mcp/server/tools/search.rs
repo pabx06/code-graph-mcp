@@ -294,6 +294,14 @@ impl McpServer {
         // dominance below and the confidence exemption further down (single source).
         let query_trimmed = query.trim().to_lowercase();
 
+        // Hoisted out of the per-candidate loop below: the filter string is
+        // invariant for the whole call, while `normalize_type_filter_mcp`
+        // allocates a fresh `Vec<String>` on every invocation — once per
+        // candidate, over a pool of up to 1000, and the closure runs TWICE when
+        // the pool-exhaustion retry fires (SURF-07, audit 2026-09-05).
+        let normalized_type_filter: Option<Vec<String>> =
+            node_type_filter.map(normalize_type_filter_mcp);
+
         // Scoring/filtering for one fused pool. Returns the candidates plus BOTH
         // drop counts: the optional language/node_type filter AND the always-on
         // module/external/test skip. The latter used to be a bare `continue` —
@@ -330,8 +338,7 @@ impl McpServer {
                         skipped_noise += 1;
                         continue;
                     }
-                    if let Some(nt) = node_type_filter {
-                        let normalized = normalize_type_filter_mcp(nt);
+                    if let Some(normalized) = normalized_type_filter.as_deref() {
                         if !normalized.iter().any(|t| t == &node.node_type) {
                             dropped_by_filter += 1;
                             continue;

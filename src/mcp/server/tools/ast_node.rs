@@ -150,6 +150,15 @@ impl McpServer {
                     }
                 }
             };
+            // This re-reads the node the refresh above already read, and that is
+            // NOT the redundant lookup audit 2026-09-05 SURF-07 listed. Refuted
+            // here so the next round does not re-derive it: the first read exists
+            // only to learn the file path, `ensure_file_fresh_reported` can then
+            // re-index that file — deleting and re-inserting its rows, which is
+            // why `nid` may have been renumbered on the line above — and a row
+            // read BEFORE that pass is pre-re-index data. Reusing it would return
+            // the stale line numbers this branch's own CON-10 comment exists to
+            // prevent. On `skip_indexing` no refresh runs and there is one read.
             let mut out = self.ast_node_by_id(
                 nid,
                 include_refs,

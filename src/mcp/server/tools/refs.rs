@@ -292,11 +292,17 @@ impl McpServer {
         // which binds to the method node, not the type) will not appear here. Tell the
         // caller so rename audits get broader coverage via a second query.
         let type_kinds = ["struct", "enum", "trait", "type", "interface", "class"];
-        let target_types: Vec<String> = target_ids
-            .iter()
-            .filter_map(|id| queries::get_node_by_id(self.db.conn(), *id).ok().flatten())
-            .map(|n| n.node_type)
-            .collect();
+        // One batched query, not one per target id (SURF-07, audit 2026-09-05):
+        // the fuzzy-resolve branch above can put many ids in `target_ids`, and
+        // this ran a statement for each. Errors now propagate instead of being
+        // swallowed per id by `.ok().flatten()` — a failed lookup used to read
+        // as "not a type definition" and silently drop the warning below, which
+        // is the swallowed-probe class this repo fixed in `doctor.js` (JS-04).
+        let target_types: Vec<String> =
+            queries::get_nodes_with_files_by_ids(self.db.conn(), &target_ids)?
+                .into_iter()
+                .map(|nwf| nwf.node.node_type)
+                .collect();
         let is_type_def = target_types
             .iter()
             .any(|t| type_kinds.contains(&t.as_str()));
