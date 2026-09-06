@@ -6717,6 +6717,74 @@ app.get('/widgets', widgetsHandler);
     );
 }
 
+/// SURF-07 (audit 2026-09-05), the half of item 1 that is a correctness bug and
+/// not a performance note.
+///
+/// `find_routes_by_path` returns one row per route EDGE, so a handler registered
+/// on two paths that both match the query appears twice. The loop then ran the
+/// call-graph traversal once per ROW — keyed by exactly `handler_name` +
+/// `file_path`, so the second run was byte-identical to the first — and added
+/// its `suppressed_ambiguous` to the running total each time. "N direct
+/// ambiguous by-name edge(s) hidden" therefore counted the SAME hidden edges
+/// once per route, and the number the caller is asked to act on was wrong.
+///
+/// Two edges are hidden here, behind one handler, on two routes. The answer is
+/// 2 however the loop is written; it was 4.
+#[test]
+fn test_cli_trace_counts_each_hidden_edge_once_per_handler_not_per_route() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Same ambiguity recipe as the test above: two same-name `thing` defs, not
+    // imported, so the handler's bare `thing()` ties to both.
+    std::fs::write(src.join("a.ts"), "export function thing() { return 1; }\n").unwrap();
+    std::fs::write(src.join("b.ts"), "export function thing() { return 2; }\n").unwrap();
+    // ONE handler, TWO routes, both matched by `/widgets` (the exact arm and the
+    // `/widgets/%` prefix arm of find_routes_by_path).
+    std::fs::write(
+        src.join("server.ts"),
+        r#"
+const app = express();
+function widgetsHandler(req, res) {
+    thing();
+    res.json([]);
+}
+app.get('/widgets', widgetsHandler);
+app.get('/widgets/bulk', widgetsHandler);
+"#,
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (stdout, _, code) = run_cli(&project, &["trace", "GET /widgets", "--json"]);
+    assert_eq!(code, 0, "trace should resolve the routes; got: {stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let names: Vec<&str> = v["handlers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|h| h["handler_name"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        names,
+        vec!["widgetsHandler", "widgetsHandler"],
+        "fixture precondition: both routes must resolve to the SAME handler, or \
+         there is no duplicate traversal to count twice; got: {stdout}"
+    );
+    assert_eq!(
+        v["ambiguous_edges_hidden"].as_u64(),
+        Some(2),
+        "two `thing` edges are hidden, once — not once per route that reaches the \
+         same handler through the same traversal; got: {stdout}"
+    );
+}
+
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection.
 #[test]
 fn test_cli_trace_help_exits_zero() {

@@ -152,20 +152,44 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         std::collections::HashMap::new()
     };
 
+    // One traversal per DISTINCT handler, not per route row, and hoisted above
+    // both render branches so the two cannot drift.
+    //
+    // `find_routes_by_path` returns one row per route EDGE, so a handler
+    // registered on two paths that both match appears twice — and the traversal
+    // is keyed by exactly `handler_name` + `file_path`, so the second run
+    // returned byte-identical nodes. That was only wasted work; the bug was that
+    // `suppressed_ambiguous` was added once per ROW, so "N direct ambiguous
+    // by-name edge(s) hidden" counted the same hidden edges once per route and
+    // told the caller to go looking for edges that do not exist (SURF-07, audit
+    // 2026-09-05).
+    let mut chains: std::collections::HashMap<(&str, &str), crate::graph::query::CallGraphResult> =
+        std::collections::HashMap::new();
+    let mut ambiguous_hidden: usize = 0;
+    for rm in &rows {
+        let key = (rm.handler_name.as_str(), rm.file_path.as_str());
+        if chains.contains_key(&key) {
+            continue;
+        }
+        let chain = crate::graph::query::get_call_graph_filtered(
+            conn,
+            &rm.handler_name,
+            "callees",
+            depth,
+            Some(&rm.file_path),
+            min_conf_rank,
+        )?;
+        ambiguous_hidden += chain.suppressed_ambiguous;
+        chains.insert(key, chain);
+    }
     if json_mode {
         // Single JSON object envelope matching MCP trace_http_chain shape
         let mut handlers = Vec::with_capacity(rows.len());
-        let mut ambiguous_hidden: usize = 0;
         for rm in &rows {
-            let chain = crate::graph::query::get_call_graph_filtered(
-                conn,
-                &rm.handler_name,
-                "callees",
-                depth,
-                Some(&rm.file_path),
-                min_conf_rank,
-            )?;
-            ambiguous_hidden += chain.suppressed_ambiguous;
+            // Every row's key was inserted above, so this cannot miss.
+            let chain = chains
+                .get(&(rm.handler_name.as_str(), rm.file_path.as_str()))
+                .expect("every route row's handler was traversed above");
             let chain_nodes: Vec<serde_json::Value> = chain
                 .nodes
                 .iter()
@@ -208,7 +232,6 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut ambiguous_hidden: usize = 0;
     for rm in &rows {
         // Render the route label as "METHOD path" from the routes_to metadata
         // (matching the map's Entry Points) instead of dumping the raw JSON blob.
@@ -238,16 +261,10 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
             }
         }
 
-        // Show call chain
-        let chain = crate::graph::query::get_call_graph_filtered(
-            conn,
-            &rm.handler_name,
-            "callees",
-            depth,
-            Some(&rm.file_path),
-            min_conf_rank,
-        )?;
-        ambiguous_hidden += chain.suppressed_ambiguous;
+        // Show call chain — traversed once above, per distinct handler.
+        let chain = chains
+            .get(&(rm.handler_name.as_str(), rm.file_path.as_str()))
+            .expect("every route row's handler was traversed above");
         for n in &chain.nodes {
             if n.depth == 0 {
                 continue;

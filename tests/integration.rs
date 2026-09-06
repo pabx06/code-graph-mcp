@@ -1521,6 +1521,55 @@ fn test_trace_http_chain_verb_matches_wildcard_and_filters_mismatch() {
     );
 }
 
+/// MCP half of the same SURF-07 count. Kept as a separate test rather than
+/// trusted to the CLI twin: the two surfaces run their own loops over the same
+/// rows, and this repo has shipped a fix to one half of a twin twice already —
+/// both times caught only because the other half had its own test.
+#[test]
+fn test_trace_http_chain_counts_each_hidden_edge_once_per_handler() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.ts"), "export function thing() { return 1; }\n").unwrap();
+    fs::write(src.join("b.ts"), "export function thing() { return 2; }\n").unwrap();
+    // One handler, two routes, both matched by `/widgets`.
+    fs::write(
+        src.join("server.ts"),
+        "\nconst app = express();\nfunction widgetsHandler(req, res) {\n    thing();\n    res.json([]);\n}\napp.get('/widgets', widgetsHandler);\napp.get('/widgets/bulk', widgetsHandler);\n",
+    )
+    .unwrap();
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let msg = tool_call_json(
+        "trace_http_chain",
+        serde_json::json!({"route_path": "GET /widgets"}),
+    );
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let names: Vec<&str> = result["handlers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|h| h["handler_name"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        names,
+        vec!["widgetsHandler", "widgetsHandler"],
+        "fixture precondition: both routes must resolve to the SAME handler; got: {result}"
+    );
+    assert_eq!(
+        result["ambiguous_edges_hidden"].as_u64(),
+        Some(2),
+        "the two hidden `thing` edges are one traversal's worth, not one per \
+         route row; got: {result}"
+    );
+}
+
 #[test]
 fn test_project_map_detects_main_entry_points() {
     let project = TempDir::new().unwrap();

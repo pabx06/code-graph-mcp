@@ -67,8 +67,38 @@ impl McpServer {
             std::collections::HashMap::new()
         };
 
-        let mut handlers: Vec<serde_json::Value> = Vec::new();
+        // One traversal per DISTINCT handler, not per route row — the CLI twin
+        // (`cli/commands/trace.rs`) does the same, for the same reason.
+        // `find_routes_by_path` returns one row per route EDGE, so a handler
+        // registered on two matching paths appears twice, and the traversal is
+        // keyed by exactly `handler_name` + `file_path`, so the repeat run was
+        // byte-identical. The wasted work was the smaller half: adding
+        // `suppressed_ambiguous` once per ROW made `ambiguous_edges_hidden`
+        // report the same hidden edges once per route (SURF-07, audit
+        // 2026-09-05).
+        let mut chains: std::collections::HashMap<
+            (&str, &str),
+            crate::graph::query::CallGraphResult,
+        > = std::collections::HashMap::new();
         let mut ambiguous_hidden: usize = 0;
+        for rm in &rows {
+            let key = (rm.handler_name.as_str(), rm.file_path.as_str());
+            if chains.contains_key(&key) {
+                continue;
+            }
+            let chain = crate::graph::query::get_call_graph_filtered(
+                self.db.conn(),
+                &rm.handler_name,
+                "callees",
+                depth,
+                Some(&rm.file_path),
+                min_conf_rank,
+            )?;
+            ambiguous_hidden += chain.suppressed_ambiguous;
+            chains.insert(key, chain);
+        }
+
+        let mut handlers: Vec<serde_json::Value> = Vec::new();
         for rm in &rows {
             let mut handler = json!({
                 "node_id": rm.node_id,
@@ -87,16 +117,11 @@ impl McpServer {
                 handler["downstream_calls"] = json!(downstream);
             }
 
-            // Recursive call chain via call graph
-            let chain = crate::graph::query::get_call_graph_filtered(
-                self.db.conn(),
-                &rm.handler_name,
-                "callees",
-                depth,
-                Some(&rm.file_path),
-                min_conf_rank,
-            )?;
-            ambiguous_hidden += chain.suppressed_ambiguous;
+            // Recursive call chain via call graph — traversed once above, per
+            // distinct handler; every row's key is present.
+            let chain = chains
+                .get(&(rm.handler_name.as_str(), rm.file_path.as_str()))
+                .expect("every route row's handler was traversed above");
             let chain_nodes: Vec<serde_json::Value> = chain
                 .nodes
                 .iter()
