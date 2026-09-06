@@ -10,6 +10,7 @@ const {
   settingsPath, surveyHookCoverage,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');
+const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { findBinary, clearCache: clearBinaryCache } = require('./find-binary');
 const { hidden } = require('./proc-opts');
 const { MAX_UPDATE_ATTEMPTS, GLOBAL_PKG_HEAL_MAX_ATTEMPTS, isBinaryHealExhausted, readState } = require('./auto-update');
@@ -589,7 +590,7 @@ function runDiagnostics({ checkOnly = false } = {}) {
       // this line used to hardcode 3 while the comment named the constant, so
       // raising the cap in auto-update.js would have left this diagnosis
       // reporting the old one (audit 2026-08-29 JS-07).
-      const state = readJson(path.join(CACHE_DIR, 'update-state.json')) || {};
+      const state = readJson(UPDATE_STATE_FILE) || {};
       const healGaveUp = (state.globalPkgHealAttempts || 0) >= GLOBAL_PKG_HEAL_MAX_ATTEMPTS;
       results.push({
         name: 'Global npm packages',
@@ -858,7 +859,7 @@ function probeHealth({ find = findBinary } = {}) {
 }
 
 function readUpdateState() {
-  try { return readJson(path.join(CACHE_DIR, 'update-state.json')); } catch { return null; }
+  try { return readJson(UPDATE_STATE_FILE); } catch { return null; }
 }
 
 /**

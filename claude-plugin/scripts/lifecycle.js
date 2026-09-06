@@ -12,7 +12,11 @@ const OLD_PLUGIN_IDS = [
   'code-graph@sdsrss-code-graph', // v2 legacy ID (pre-rename)
 ];
 const MARKETPLACE_NAME = 'code-graph-mcp';
-const CACHE_DIR = path.join(os.homedir(), '.cache', 'code-graph');
+// Imported, not defined here: five other modules needed these three names and
+// two of them cannot afford to load this file (see cache-paths.js, JS-05). The
+// export surface below is unchanged — CACHE_DIR / MANIFEST_FILE /
+// INSTALL_LOCK_FILE still come out of `lifecycle`, so no importer moves.
+const { CACHE_DIR, MANIFEST_FILE, INSTALL_LOCK_FILE } = require('./cache-paths');
 // Bound for the `ps` fallback in getActiveCmdlines (pre-ship review 2026-09-06).
 // 2 s matches the other hook-path probes; the floor is what a budget-exhausted
 // hook still gives it, since an empty list degrades to recency-only.
@@ -22,14 +26,12 @@ const PS_PROBE_MIN_MS = 250;
 // plugins when hooks run in shared process context (e.g. claude-mem-lite sets it
 // to its own marketplace path, polluting all subsequent settings.json hook processes).
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
-const MANIFEST_FILE = path.join(CACHE_DIR, 'install-manifest.json');
 const REGISTRY_FILE = path.join(CACHE_DIR, 'statusline-registry.json');
 // Written by the launcher's background install when ITS `npm install -g` step
 // introduced the global shell + platform packages. Uninstall only removes
 // global packages it can prove the plugin installed (marker present) or when
 // the user passes --purge-global — a deliberate user install is never yanked.
 const GLOBAL_INSTALL_MARKER = path.join(CACHE_DIR, 'global-install-marker.json');
-const INSTALL_LOCK_FILE = path.join(CACHE_DIR, 'install.lock');
 const SHELL_PKG = '@sdsrs/code-graph';
 
 // Lazy resolvers — Claude Code's config dir can be overridden by CLAUDE_CONFIG_DIR

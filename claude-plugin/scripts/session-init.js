@@ -8,6 +8,7 @@ const {
   cleanupDisabledStatusline, isPluginInactive, isPluginUninstalled, removeCacheResidue,
   readJson, CACHE_DIR, settingsPath, isStaleRelicContext, hookCmdScript,
 } = require('./lifecycle');
+const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const { maybeAutoAdopt, isAdopted, unadopt } = require('./adopt');
 const { isNonProjectCwd } = require('./project-detect');
@@ -604,7 +605,7 @@ function consistencyCheck(binary) {
 
   // Check 3: Auto-update incomplete
   try {
-    const statePath = path.join(CACHE_DIR, 'update-state.json');
+    const statePath = UPDATE_STATE_FILE;
     const state = readJson(statePath);
     if (state && state.updateAvailable && state.binaryUpdated === false) {
       issues.push({

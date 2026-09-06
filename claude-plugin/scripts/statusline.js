@@ -10,11 +10,11 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('st
 
 const { execFileSync } = require('child_process');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { findBinary } = require('./find-binary');
 const { resolveProjectRoot } = require('./project-root');
 const lifecycle = require('./lifecycle');
+const { UPDATE_STATE_FILE } = require('./cache-paths');
 const { hidden } = require('./proc-opts');
 const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => ({ cleaned: false }));
 
@@ -29,8 +29,7 @@ const cleanupDisabledStatusline = lifecycle.cleanupDisabledStatusline || (() => 
 const STUCK_UPDATE_ATTEMPTS = 5;
 function readUpdateState() {
   try {
-    return JSON.parse(fs.readFileSync(
-      path.join(os.homedir(), '.cache', 'code-graph', 'update-state.json'), 'utf8'));
+    return JSON.parse(fs.readFileSync(UPDATE_STATE_FILE, 'utf8'));
   } catch { return null; /* no state file or unreadable */ }
 }
 function updatePending(st = readUpdateState()) {

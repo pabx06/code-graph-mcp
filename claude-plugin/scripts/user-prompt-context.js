@@ -23,8 +23,11 @@ const os = require('os');
 const { cgTmpDir, cwdHash } = require('./tmp-dir');
 const { hidden } = require('./proc-opts');
 
-// Mid-session install detection: hook fires but no manifest yet.
-const MANIFEST_PATH = path.join(os.homedir(), '.cache', 'code-graph', 'install-manifest.json');
+// Mid-session install detection: hook fires but no manifest yet. The path comes
+// from `cache-paths.js` — deliberately NOT from `lifecycle.js`, which this hook
+// must not load (startup budget); it used to be a third hand-spelled copy of the
+// same three path segments (JS-05).
+const { MANIFEST_FILE: MANIFEST_PATH } = require('./cache-paths');
 
 // --- Per-type rate limiting (replaces single global cooldown) ---
 const COOLDOWNS = {

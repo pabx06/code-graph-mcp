@@ -3884,3 +3884,139 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
         offenders.join("\n  ")
     );
 }
+
+/// The `~/.cache/code-graph` file names that must have exactly one spelling.
+const CACHE_FILE_NAMES: [&str; 3] = ["update-state.json", "install-manifest.json", "install.lock"];
+
+/// Which of [`CACHE_FILE_NAMES`] appear in `src` as a PATH LITERAL.
+///
+/// Quoted with `'` or `"` only. A name inside a `//` comment, or inside a
+/// backtick template (where it is prose in a message the user reads — see
+/// `doctor.js`'s "update-state.json is unreadable"), is not a second source of
+/// truth and must not be flagged: a guard that forces those to be rewritten
+/// buys nothing and gets itself disabled.
+fn cache_path_literals(src: &str) -> Vec<&'static str> {
+    let stripped: String = src
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    CACHE_FILE_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            stripped.contains(&format!("'{name}'")) || stripped.contains(&format!("\"{name}\""))
+        })
+        .collect()
+}
+
+/// Non-test JS modules under `claude-plugin/scripts`.
+fn js_source_files() -> Vec<std::path::PathBuf> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("claude-plugin/scripts");
+    assert!(dir.is_dir(), "claude-plugin/scripts is not a directory");
+    let mut files: Vec<_> = fs::read_dir(&dir)
+        .expect("read claude-plugin/scripts")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.ends_with(".js") && !name.ends_with(".test.js")
+        })
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 20,
+        "expected the plugin's JS modules to be discovered, found {} — a path \
+         change would make this guard vacuous",
+        files.len()
+    );
+    files
+}
+
+/// JS-05 (audit 2026-09-05): three `~/.cache/code-graph` file names were spelled
+/// in seven places across five modules. Two of those rebuilt the whole path from
+/// `os.homedir()` instead of joining `CACHE_DIR`, so the modules that would break
+/// first if the cache layout moved were also the two that never load the module
+/// where it is defined — a rename would have had to be found by grep.
+///
+/// `cache-paths.js` is the single home. It is deliberately tiny and
+/// dependency-free so the hook-path modules can import it without paying for
+/// `lifecycle.js`.
+#[test]
+fn cache_file_names_have_exactly_one_spelling() {
+    let mut offenders = Vec::new();
+    let mut owner_defines = Vec::new();
+    for path in js_source_files() {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        let hits = cache_path_literals(&src);
+        if name == "cache-paths.js" {
+            owner_defines = hits;
+            continue;
+        }
+        for hit in hits {
+            offenders.push(format!("{name}: {hit}"));
+        }
+    }
+    assert_eq!(
+        owner_defines.len(),
+        CACHE_FILE_NAMES.len(),
+        "cache-paths.js must define every name this guard protects, or the guard \
+         forbids a spelling with no home to move to; it defines {owner_defines:?}"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these modules spell a cache file name that cache-paths.js already owns. \
+         Import the constant instead:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// Negative control for the scanner above, on synthetic sources — the guard's
+/// own green is worth nothing unless a reintroduced literal reddens it and the
+/// two legitimate shapes do not.
+#[test]
+fn cache_path_scanner_catches_literals_and_spares_prose() {
+    let literal = "const P = path.join(CACHE_DIR, 'update-state.json');";
+    let commented = "// the updater writes update-state.json here";
+    let prose = "detail: `update-state.json is unreadable, so the next check runs`,";
+    let double_quoted = "readJson(\"install.lock\")";
+
+    // Assert the fixtures ARE the shapes they claim, before asserting the verdict:
+    // a control whose input does not contain the token proves nothing when the
+    // predicate says "absent".
+    assert!(literal.contains("'update-state.json'"), "fixture shape");
+    assert!(
+        commented.contains("update-state.json") && commented.trim_start().starts_with("//"),
+        "fixture shape"
+    );
+    assert!(
+        prose.contains("`update-state.json") && !prose.contains("'update-state.json'"),
+        "fixture shape"
+    );
+
+    assert_eq!(cache_path_literals(literal), vec!["update-state.json"]);
+    assert_eq!(cache_path_literals(double_quoted), vec!["install.lock"]);
+    assert!(
+        cache_path_literals(commented).is_empty(),
+        "a name in a `//` comment is documentation, not a second source of truth"
+    );
+    assert!(
+        cache_path_literals(prose).is_empty(),
+        "a name inside a backtick template is a message the user reads"
+    );
+    // Trailing-comment form: the literal is on the same line as a comment that
+    // also names it. Stripping from `//` must not swallow the code before it.
+    assert_eq!(
+        cache_path_literals("const P = 'install.lock'; // the install.lock path"),
+        vec!["install.lock"],
+        "a trailing comment must not hide the literal in front of it"
+    );
+}

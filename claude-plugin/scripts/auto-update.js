@@ -35,7 +35,7 @@ function commandExists(cmd) {
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/code-graph-mcp';
-const STATE_FILE = path.join(CACHE_DIR, 'update-state.json');
+const { UPDATE_STATE_FILE: STATE_FILE, MANIFEST_FILE, INSTALL_LOCK_FILE } = require('./cache-paths');
 const BINARY_CACHE_DIR = path.join(CACHE_DIR, 'bin');
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;        // 6h — steady-state re-check
 const UP_TO_DATE_RECHECK_MS = 30 * 60 * 1000;        // 30min — re-verify an "up to date" result (release-race guard)
@@ -956,7 +956,7 @@ async function downloadAndInstall(latest, {
           const manifest = readManifest();
           manifest.version = latest.version;
           manifest.updatedAt = new Date().toISOString();
-          writeJsonAtomic(path.join(CACHE_DIR, 'install-manifest.json'), manifest);
+          writeJsonAtomic(MANIFEST_FILE, manifest);
         } catch { /* not fatal */ }
       }
 
@@ -1272,7 +1272,7 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
       // shouldHealGlobalsOnThrottle). Cheap local check first; only the actually-
       // stale case takes the slow, lock-guarded npm path.
       if (shouldHealGlobalsOnThrottle(state)) {
-        installLock = acquireLock(path.join(CACHE_DIR, 'install.lock'));
+        installLock = acquireLock(INSTALL_LOCK_FILE);
         if (installLock) {
           const globalHeal = await selfHealGlobalPkgs({ version: state.latestVersion }, state);
           saveState({ ...readState(), ...globalHeal });
@@ -1317,7 +1317,7 @@ async function checkForUpdate({ installMissing = false, force = false, requestJs
     // it marks that with CODE_GRAPH_INSTALL_LOCK_HELD so we don't deadlock
     // against our own parent.
     if (process.env.CODE_GRAPH_INSTALL_LOCK_HELD !== '1') {
-      installLock = acquireLock(path.join(CACHE_DIR, 'install.lock'));
+      installLock = acquireLock(INSTALL_LOCK_FILE);
       // Reason, not null — same misreport as the fetch failure above: the
       // holder is mid-update, so "Up to date (v<old>)" is exactly wrong.
       if (!installLock) return { noop: true, reason: 'install-lock-held', from: installedVersion };
