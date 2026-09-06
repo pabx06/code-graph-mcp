@@ -413,6 +413,15 @@ impl McpServer {
         let (mut candidates, mut dropped_by_filter, mut skipped_noise_count) =
             build_candidates(&fused)?;
 
+        // Which pool the returned candidates actually came from. The retry below
+        // REPLACES the candidate set wholesale when it wins, so "did the pool come
+        // back full" has to be asked of the pool that produced the answer: reading
+        // `fused.len()` after an adopted retry tests a pool no result came from,
+        // and reports a truncation that did not happen (a first pool is full far
+        // more often than the 4× wider retry pool).
+        let mut final_pool_len = fused.len();
+        let mut final_fetch_count = fetch_count;
+
         // Pool-exhaustion retry: when the first pool came back FULL and the
         // post-fetch filters still left top_k unfilled, matches may sit just
         // below the cut — widen once and re-rank. Confidence (measured above on
@@ -433,8 +442,22 @@ impl McpServer {
                 candidates = retry_candidates;
                 dropped_by_filter = retry_dropped;
                 skipped_noise_count = retry_skipped;
+                final_pool_len = fused_retry.len();
+                final_fetch_count = retry_fetch;
             }
         }
+
+        // Everything a short `results` array cannot say about itself, computed
+        // once here (the counts and both pool numbers are only in scope at this
+        // point) and attached to whichever of the three response shapes returns.
+        let shortfall = PoolShortfall {
+            dropped_by_filter,
+            skipped_noise: skipped_noise_count,
+            pool_len: final_pool_len,
+            saturated: candidates.len() < top_k as usize
+                && final_pool_len >= final_fetch_count as usize
+                && (dropped_by_filter + skipped_noise_count) > 0,
+        };
 
         // Phase 2: Re-rank by adjusted score (name relevance + size normalization)
         candidates.sort_by(|a, b| b.adjusted_score.total_cmp(&a.adjusted_score));
@@ -464,7 +487,7 @@ impl McpServer {
         });
 
         // Context Sandbox: compress only if results likely exceed token threshold.
-        if let Some(compressed) = try_compress_results(
+        if let Some(mut compressed) = try_compress_results(
             &candidates,
             compact,
             match_confidence,
@@ -472,18 +495,23 @@ impl McpServer {
             vector_only_no_anchor,
             has_exact_name_match,
         )? {
+            // A compressed answer is under-returned in the same way and by the
+            // same mechanism; the envelope contract is what makes one attach
+            // point cover all three shapes.
+            shortfall.attach(&mut compressed);
             return Ok(compressed);
         }
 
         if results.is_empty() {
-            return Ok(explain_empty_results(
+            let mut out = explain_empty_results(
                 query,
                 filtered,
-                dropped_by_filter,
-                skipped_noise_count,
+                &shortfall,
                 fts_not_searched,
                 vector_available,
-            ));
+            );
+            shortfall.attach(&mut out);
+            return Ok(out);
         }
 
         // Shape the response: one object envelope on every path ({results, …}),
@@ -491,13 +519,15 @@ impl McpServer {
         // signals when they apply. Mirrors the compressed path above AND keeps
         // the response writable by the server-level disclosures that run after
         // every tool call (see `finalize_search_results`).
-        Ok(finalize_search_results(
+        let mut out = finalize_search_results(
             results,
             match_confidence,
             vector_only_no_anchor,
             has_exact_name_match,
             vector_available,
-        ))
+        );
+        shortfall.attach(&mut out);
+        Ok(out)
     }
 }
 
@@ -694,6 +724,76 @@ fn try_compress_results(
     Ok(None)
 }
 
+/// What a short `results` array cannot say about itself.
+///
+/// A truncated answer is byte-identical to a complete one: the caller sees three
+/// results and cannot tell whether the repo holds three matches or three hundred
+/// with the pool consumed before `top_k` was filled. The CLI twin says so on
+/// stderr (`src/cli/commands/search.rs:457`); an MCP client has no stderr, so
+/// here the finding has to ride in the envelope or reach nobody — which is what
+/// it did (audit 2026-09-05 §15).
+///
+/// `saturated` is deliberately a conjunction rather than `dropped > 0`: a query
+/// with three matches in the whole repo returns a short answer that is COMPLETE,
+/// and flagging it would teach callers to ignore the field.
+#[derive(Debug, Default, Clone, Copy)]
+struct PoolShortfall {
+    /// Rows the caller's language/node_type filter removed after the fetch.
+    dropped_by_filter: usize,
+    /// Rows the always-on module/external/test filter removed.
+    skipped_noise: usize,
+    /// Size of the pool the returned candidates came from — the retry pool when
+    /// the retry was adopted, the first pool otherwise.
+    pool_len: usize,
+    /// That pool came back FULL and was still consumed before `top_k` was
+    /// filled, with the retry already widened as far as it may go.
+    saturated: bool,
+}
+
+impl PoolShortfall {
+    /// One sentence naming the pool that ran out. Appended to the empty-result
+    /// arms whose standing advice — broaden the filter — cannot help when the
+    /// filter is not what removed the match. Empty when nothing was cut off, so
+    /// the unaffected arms keep their wording verbatim.
+    fn exhaustion_note(&self) -> String {
+        if !self.saturated {
+            return String::new();
+        }
+        format!(
+            " The candidate pool ({} rows) came back full and was consumed before top_k was filled, so matches may sit below the fetch cut: raise top_k to widen it — broadening the filter will not, because the filter is not what removed them.",
+            self.pool_len
+        )
+    }
+
+    /// Attach the disclosure to any of this tool's response envelopes.
+    ///
+    /// Silent unless something was actually cut off, so the common complete
+    /// answer keeps its current shape byte for byte. `entry` rather than
+    /// `insert`: the empty-result arms already publish their own drop count
+    /// under these names, and their wording is the more specific one.
+    fn attach(&self, out: &mut serde_json::Value) {
+        if !self.saturated {
+            return;
+        }
+        let Some(obj) = out.as_object_mut() else {
+            return;
+        };
+        obj.insert("pool_saturated".into(), json!(true));
+        obj.insert(
+            "pool_saturated_note".into(),
+            json!(self.exhaustion_note().trim()),
+        );
+        if self.dropped_by_filter > 0 {
+            obj.entry("dropped_by_filter")
+                .or_insert_with(|| json!(self.dropped_by_filter));
+        }
+        if self.skipped_noise > 0 {
+            obj.entry("skipped_noise")
+                .or_insert_with(|| json!(self.skipped_noise));
+        }
+    }
+}
+
 /// Every "no results" answer this tool can give, and why each is a different
 /// sentence: an explicit filter dropped real matches, the always-on noise
 /// filter did, the text channel never ran, or the query genuinely missed.
@@ -702,11 +802,12 @@ fn try_compress_results(
 fn explain_empty_results(
     query: &str,
     filtered: bool,
-    dropped_by_filter: usize,
-    skipped_noise_count: usize,
+    shortfall: &PoolShortfall,
     fts_not_searched: Option<&str>,
     vector_available: bool,
 ) -> serde_json::Value {
+    let dropped_by_filter = shortfall.dropped_by_filter;
+    let skipped_noise_count = shortfall.skipped_noise;
     // Filter-aware: if a language/node_type filter removed candidates that DID
     // match the query, say so — the index has matches, just not of this
     // language/type. (vec0 can't pre-filter, so this is a post-fetch drop.)
@@ -715,10 +816,22 @@ fn explain_empty_results(
             "results": [],
             "message": "No matching symbols after filtering.",
             "dropped_by_filter": dropped_by_filter,
-            "hint": format!(
-                "{} candidate(s) matched the query but were removed by the active language/node_type filter. Broaden or clear the filter, or raise top_k.",
-                dropped_by_filter
-            ),
+            // "Broaden or clear the filter" is REPLACED, not appended to, when the
+            // pool ran out: the filter is not what removed the match there, and a
+            // hint that gives both instructions in one breath leaves the caller to
+            // pick the wrong one. The unsaturated wording is unchanged.
+            "hint": if shortfall.saturated {
+                format!(
+                    "{} candidate(s) matched the query but were removed by the active language/node_type filter.{}",
+                    dropped_by_filter,
+                    shortfall.exhaustion_note()
+                )
+            } else {
+                format!(
+                    "{} candidate(s) matched the query but were removed by the active language/node_type filter. Broaden or clear the filter, or raise top_k.",
+                    dropped_by_filter
+                )
+            },
             // The envelope contract ("ONE envelope on every path", see
             // `finalize_search_results`) — this was the only branch that omitted
             // both fields, so a caller reading `search_mode` had to special-case
@@ -741,7 +854,13 @@ fn explain_empty_results(
                 skipped_noise_count
             ),
             "skipped_noise": skipped_noise_count,
-            "hint": "Spelling and index freshness are not the problem. To reach test symbols use `find_references` with include_tests, or `code-graph-mcp grep`; for structural enumeration use `ast_search`.",
+            // Appended here rather than substituted: this arm's advice (reach the
+            // test symbols another way) stays correct on a consumed pool, it is
+            // just no longer the whole story.
+            "hint": format!(
+                "Spelling and index freshness are not the problem. To reach test symbols use `find_references` with include_tests, or `code-graph-mcp grep`; for structural enumeration use `ast_search`.{}",
+                shortfall.exhaustion_note()
+            ),
             "search_mode": if vector_available { "hybrid" } else { "fts_only" },
             "vector_available": vector_available
         });
@@ -1147,7 +1266,13 @@ mod tests {
         // The empty answer owes the same note: "no matching symbols" on an
         // FTS-only index reads as "this code does not exist" unless the response
         // says the semantic channel never ran.
-        let empty = explain_empty_results("handle user login", false, 0, 0, None, false);
+        let empty = explain_empty_results(
+            "handle user login",
+            false,
+            &PoolShortfall::default(),
+            None,
+            false,
+        );
         assert_eq!(
             empty["note"].as_str(),
             Some(note),
@@ -1159,7 +1284,16 @@ mod tests {
         // reach it — it needs its own call (`dropped_by_filter > 0`). It was the
         // one path with no `search_mode` / `vector_available` at all, against a
         // doc-comment promising "ONE envelope on every path".
-        let filtered = explain_empty_results("widget", true, 7, 0, None, false);
+        let filtered = explain_empty_results(
+            "widget",
+            true,
+            &PoolShortfall {
+                dropped_by_filter: 7,
+                ..Default::default()
+            },
+            None,
+            false,
+        );
         assert_eq!(filtered["search_mode"], "fts_only");
         assert_eq!(filtered["vector_available"], false);
         assert_eq!(filtered["dropped_by_filter"], 7);
@@ -1189,6 +1323,170 @@ mod tests {
         assert!(
             !note.contains("built without the `embed-model` feature"),
             "this build HAS the feature; the not-compiled arm must not fire, got: {note}"
+        );
+    }
+
+    /// A pool that comes back FULL of rows the caller's filter then removes.
+    /// Ported from `setup_saturating_pool_project` (tests/cli_e2e.rs:1136) — the
+    /// recipe is identical because the mechanism is: neither vec0 KNN nor FTS5
+    /// can pre-filter on `language`, so a selective filter eats the fetch after
+    /// it lands.
+    ///
+    /// `distractors` TypeScript `widgetHandler*` functions saturate the pool.
+    /// `carrier_reachable` picks which half of the mechanism runs: a SHORT
+    /// Python function named for the query ranks inside the pool (short answer),
+    /// a long one mentioning the term once ranks below the cut (empty answer).
+    fn saturating_pool_project(distractors: usize, carrier_reachable: bool) -> tempfile::TempDir {
+        let project = tempfile::TempDir::new().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        let mut pool = String::new();
+        for i in 0..distractors {
+            pool.push_str(&format!("function widgetHandler{i}() {{ return {i}; }}\n"));
+        }
+        std::fs::write(src.join("pool.ts"), &pool).unwrap();
+
+        let carrier = if carrier_reachable {
+            "def widget():\n    return widget\n".to_string()
+        } else {
+            let mut long = String::from("def carrier_box():\n");
+            for i in 0..80 {
+                long.push_str(&format!("    filler_{i} = {i}\n"));
+            }
+            long.push_str("    return widget\n");
+            long
+        };
+        std::fs::write(src.join("carrier.py"), carrier).unwrap();
+        project
+    }
+
+    /// A SHORT `results` array is byte-identical to a complete one. The CLI twin
+    /// discloses the shortfall on stderr (`src/cli/commands/search.rs:457`); an
+    /// MCP client has no stderr, so the envelope is the only channel the finding
+    /// can ride — and it carried nothing, `finalize_search_results` not even
+    /// taking the two drop counts (audit 2026-09-05 §15).
+    #[test]
+    fn short_answer_discloses_the_pool_it_could_not_fill() {
+        let project = saturating_pool_project(420, true);
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 2, "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(1),
+            "fixture precondition: exactly one Python match survives, or this is \
+             exercising the empty path instead; got {out}"
+        );
+        assert_eq!(
+            out["pool_saturated"],
+            json!(true),
+            "the pool came back full and was consumed before top_k=2 was filled — \
+             the one fact a 1-element array cannot state about itself; got {out}"
+        );
+        assert!(
+            out["dropped_by_filter"].as_u64().unwrap_or(0) > 0,
+            "and the count that explains it; got {out}"
+        );
+        let note = out["pool_saturated_note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("raise top_k"),
+            "the note must name the lever that actually widens the pool; got {out}"
+        );
+        // The note DOES contain the word "broadening" — in the clause saying it
+        // will not help. What must never appear is the instruction itself.
+        assert!(
+            !note.contains("Broaden or clear the filter"),
+            "broadening the filter is the WRONG fix here — the filter is not what \
+             removed the match; got {out}"
+        );
+    }
+
+    /// The empty twin. `explain_empty_results`' filter arm sends the caller to
+    /// "Broaden or clear the filter, or raise top_k", and on a consumed pool the
+    /// first half of that sentence is the wrong instruction — the same reason
+    /// the CLI spells out at `src/cli/commands/search.rs:365`.
+    #[test]
+    fn empty_after_a_consumed_pool_does_not_only_blame_the_filter() {
+        let project = saturating_pool_project(420, false);
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 1, "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(0),
+            "fixture precondition: the match must stay below the cut even after the \
+             retry, or this is the short-answer case; got {out}"
+        );
+        assert_eq!(out["pool_saturated"], json!(true), "got {out}");
+        assert!(
+            out["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("came back full"),
+            "the hint must say the pool ran out, not only that the filter dropped \
+             rows; got {out}"
+        );
+    }
+
+    /// Negative control: short is not truncated. One match in a four-row repo is
+    /// a COMPLETE answer, and flagging it would train the caller to ignore the
+    /// field. Only the pool-came-back-full leg separates the two cases, so this
+    /// reddens if `saturated` is ever weakened to "results < top_k".
+    #[test]
+    fn a_short_but_complete_answer_carries_no_pool_disclosure() {
+        let project = saturating_pool_project(3, true);
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 5, "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(1),
+            "precondition: short (1 of top_k=5) WITH rows dropped by the filter, so \
+             only pool fullness can decide; got {out}"
+        );
+        assert!(
+            out.get("pool_saturated").is_none(),
+            "a 4-row pool cannot have come back full at fetch 100 — this answer is \
+             complete, not truncated; got {out}"
+        );
+    }
+
+    /// The retry REPLACES the candidate set wholesale, so "did the pool come
+    /// back full" must be asked of the pool that produced the answer. Here the
+    /// FIRST pool is full (100 of 100) and the retry pool is not (121 of 400),
+    /// and the surviving match came from the retry — so measuring `fused.len()`
+    /// against `fetch_count` reports a truncation that did not happen. This is
+    /// the accounting risk the audit named before the fix existed (§15).
+    #[test]
+    fn saturation_is_measured_against_the_pool_that_produced_the_answer() {
+        let project = saturating_pool_project(120, false);
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 2, "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(1),
+            "precondition: the match is reachable ONLY through the retry (120 \
+             distractors fill the first pool of 100, not the retry pool of 400); \
+             got {out}"
+        );
+        assert!(
+            out.get("pool_saturated").is_none(),
+            "the retry pool held 121 rows of a possible 400 — nothing was cut off. \
+             Reading the FIRST pool here calls a complete answer truncated; got {out}"
         );
     }
 }
