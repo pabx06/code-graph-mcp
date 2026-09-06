@@ -4020,3 +4020,115 @@ fn cache_path_scanner_catches_literals_and_spares_prose() {
         "a trailing comment must not hide the literal in front of it"
     );
 }
+
+/// Download commands whose timeout flag the curl scanner does not know.
+///
+/// `wget --timeout` and `Invoke-WebRequest -TimeoutSec` are real, and teaching
+/// [`untimed_curl_invocations`] two more spellings is possible. It is not what
+/// this does, because a parser for flags that appear nowhere in the tree is a
+/// parser nobody ever sees fail — the shape this repo has now been bitten by
+/// three times in one session. `curl` is present on all three runner images, so
+/// the cheap fail-CLOSED answer is to keep downloads to the one command the
+/// timeout guard actually reads.
+const UNSCANNED_DOWNLOAD_COMMANDS: [&str; 2] = ["wget", "Invoke-WebRequest"];
+
+/// Occurrences of [`UNSCANNED_DOWNLOAD_COMMANDS`] in shell lines, as
+/// `(line, snippet)`. Word-anchored: `/usr/bin/wget` counts, `swget` does not.
+fn unscanned_download_invocations(src: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (line_no, logical) in logical_shell_lines(src) {
+        for cmd in UNSCANNED_DOWNLOAD_COMMANDS {
+            for (i, _) in logical.match_indices(cmd) {
+                let preceded_by_word_char = logical[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-');
+                if preceded_by_word_char {
+                    continue;
+                }
+                hits.push((line_no, logical.trim().to_string()));
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// Registered as a known blind spot in the 0.138.0 CHANGELOG and closed here:
+/// the transfer-timeout guard reads `curl --max-time` and nothing else, so a
+/// `wget` added to a workflow is an unbounded download that the guard reports as
+/// zero findings. Only the job timeout catches it, and only after burning the
+/// whole job budget.
+#[test]
+fn ci_downloads_use_the_one_command_the_timeout_guard_understands() {
+    let wf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut offenders: Vec<String> = Vec::new();
+    let mut files = 0usize;
+    for entry in fs::read_dir(&wf).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "yml" && ext != "yaml" {
+            continue;
+        }
+        files += 1;
+        let src = fs::read_to_string(&path).expect("read workflow");
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        offenders.extend(
+            unscanned_download_invocations(&src)
+                .into_iter()
+                .map(|(line, call)| format!("{name}:{line}: {call}")),
+        );
+    }
+    assert!(
+        files >= 5,
+        "only {files} workflow files found — the scan lost its grip"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these downloads use a command the transfer-timeout guard cannot read, so \
+         `every_ci_curl_has_a_transfer_timeout` reports zero findings for them and \
+         only the job timeout bounds the stall:\n  {}\n\
+         Use `curl --max-time N`, or teach untimed_curl_invocations this command's \
+         timeout flag in the same commit.",
+        offenders.join("\n  ")
+    );
+}
+
+/// Negative control for the scanner above. The guard is green because the tree
+/// has no such download today, which is exactly the state in which a broken
+/// scanner is indistinguishable from a clean tree.
+#[test]
+fn unscanned_download_scanner_is_word_anchored_and_comment_blind() {
+    let flagged = [
+        "          wget https://example.com/x.tar.gz",
+        "          /usr/bin/wget -q https://example.com/x",
+        "          Invoke-WebRequest -Uri https://example.com/x -OutFile x",
+        "          curl -o a URL && wget -O b URL",
+    ];
+    for line in flagged {
+        assert_eq!(
+            unscanned_download_invocations(line).len(),
+            1,
+            "must be flagged: {line}"
+        );
+    }
+
+    let clear = [
+        "          # wget is deliberately not used here",
+        "          curl --max-time 10 -o a https://example.com/x",
+        "          swget --not-a-download",
+        "          echo \"no-wget-here\"",
+    ];
+    for line in clear {
+        // Fixture shape first: three of these DO contain the token, so an empty
+        // verdict is only meaningful if the input was not empty of it.
+        if line.contains("wget") {
+            assert!(line.contains("wget"), "fixture shape: {line}");
+        }
+        assert!(
+            unscanned_download_invocations(line).is_empty(),
+            "must not be flagged: {line} -> {:?}",
+            unscanned_download_invocations(line)
+        );
+    }
+}

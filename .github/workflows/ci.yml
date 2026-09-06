@@ -19,6 +19,14 @@ on:
   schedule:
     # 05:23 UTC daily — odd minute, off the on-the-hour scheduler stampede.
     - cron: '23 5 * * *'
+  # The other three workflows already have this; ci.yml was the holdout, which
+  # meant the daily `schedule:` above and the per-job gates that make it run the
+  # audit ALONE could not be exercised on demand — the first evidence either
+  # works would have been whatever 05:23 UTC produced. A manual run reports
+  # `github.event_name == 'workflow_dispatch'`, so the gates below let it run
+  # everything, which is the right answer for a button someone deliberately
+  # pressed.
+  workflow_dispatch:
 
 # Least privilege: every job here only reads the repo. Without an explicit block
 # a workflow inherits the repository's DEFAULT token permissions, which on many

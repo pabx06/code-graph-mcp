@@ -247,6 +247,18 @@ impl McpServer {
         // every match, and `resolve.rs` documents "two `fn new()` in one file"
         // as the case that must not be silently merged (audit 2026-09-05
         // SURF-02; same class as the 2026-06-03 #6 CLI/MCP split verdict).
+        //
+        // NEW-10, decided 2026-09-06 (user): this does NOT narrow by node_type,
+        // and that is settled, not pending. Measured on this repo, the envelope
+        // fires for 54 of 5239 (name, file) pairs — 1.0% — and the bulk is not
+        // function overloads: `#[cfg]`-gated same-name definitions
+        // (`src/embedding/model.rs` has two each of `EmbeddingModel`, `embed`,
+        // `embed_batch`) and repeated Markdown headings (101 `Fixed` nodes in
+        // CHANGELOG.md). Returning candidates for those is CORRECT — they really
+        // are several definitions, and picking the first by `start_line` is the
+        // exact silent behaviour SURF-02 removed. Exempting doc files would buy a
+        // shorter answer on a Markdown heading by reintroducing, for one
+        // node_type, the bug this branch exists to prevent.
         let matching: Vec<_> = nodes.iter().filter(|n| n.name == symbol_name).collect();
         if matching.len() > 1 {
             let cands: Vec<crate::storage::queries::NameCandidate> = matching

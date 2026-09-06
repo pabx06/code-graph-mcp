@@ -331,10 +331,26 @@ fn warn_skipped_symlinks(skipped: &[String]) {
 /// failure became a phantom deletion — `hash_files_parallel` drops the file, and
 /// the diff reads the gap as "deleted". It now delegates to
 /// `run_incremental_index_cached`, so the only remaining callers are this
-/// module's own tests. Kept because it is `pub`: removing it is a breaking
-/// change to the library surface, so it goes with a deliberate minor bump, not
-/// as a side effect of the fix that orphaned it.
-pub fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
+/// module's own tests.
+///
+/// Narrowed from `pub` deliberately (2026-09-06, user decision): keeping a `pub`
+/// function with no production caller advertises a walk-and-hash entry point
+/// whose own doc says not to diff its output, and every audit round rediscovers
+/// it as dead. It is a breaking change for any library consumer that imported it
+/// — hence a decision rather than a cleanup — and belongs in the Upgrading
+/// section of whatever release carries it.
+///
+/// `#[cfg(test)]` rather than `pub(crate)`, which is what the decision named:
+/// with the last production caller gone, `pub(crate)` is dead code and
+/// `-D warnings` says so. The two honest ways to answer that are this and
+/// `#[allow(dead_code)]`, and the second one keeps the function compiled into
+/// the shipped binary while silencing the compiler about it. This says the true
+/// thing structurally — the only callers are the three tests below, which cover
+/// the walk-plus-hash COMPOSITION; rewriting them against the two halves
+/// separately would drop that coverage to make a dead symbol slightly deader,
+/// which is why deleting it was not the option taken.
+#[cfg(test)]
+pub(crate) fn scan_directory(root: &Path) -> Result<HashMap<String, String>> {
     Ok(hash_files_parallel(&walk_indexable_files(root)?))
 }
 
