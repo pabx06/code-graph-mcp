@@ -1,5 +1,120 @@
 # Changelog
 
+## 0.139.0
+
+**Upgrading:** five things can change what your tooling reads.
+`semantic_code_search` gains up to four response fields, but only on an answer
+that was actually cut short — a complete answer is byte-identical to before.
+`trace` / `trace_http_chain` report a SMALLER `ambiguous_edges_hidden` on repos
+where one handler serves several matching routes; the old number counted the same
+hidden edges once per route. `find_references` can now return an error where it
+previously returned a slightly poorer answer, because a database failure while
+classifying the target is no longer swallowed. Two `hint` strings on empty
+`semantic_code_search` answers are reworded, so anything string-matching them
+breaks. And library consumers lose
+`indexer::merkle::scan_directory` from the public surface — it has had no
+production caller since 0.135.0. If you match MCP responses against a fixed key
+set, assert on that count, or import that function, pin `0.138.0`.
+
+### A search answer that could not say it was cut short
+
+`semantic_code_search` has widened its candidate pool on exhaustion since
+0.117.0, but neither of its answer paths could report that the widened pool still
+came back short. The non-empty path returned `{results, search_mode,
+vector_available, match_confidence}` and nothing else, so three results where
+twelve matched were byte-identical to a complete answer of three. The empty path
+did publish its drop counts, but its hint read "Broaden or clear the filter, or
+raise top_k" — and when the pool ran out, the filter is not what removed the
+match, so the first half of that sentence sends you to the one fix that cannot
+work.
+
+The CLI twin has disclosed this since 0.137.0 and states the reason exactly: a
+short array is byte-identical to a complete one, so the consumer that cannot
+infer the shortfall is the one reading `--json`. An MCP client is that consumer
+and has no stderr channel at all.
+
+Truncated answers now carry `pool_saturated: true`, a `pool_saturated_note`, and
+the two drop counts. All four describe one fetch, so they add up against the pool
+size the note reports. The flag is raised only when the WIDEST fetch performed
+came back full: if the exhaustion retry read the index to its end, nothing sat
+below a cut and nothing is claimed. At `top_k=100`, the maximum, the note names a
+remedy you can still act on rather than telling you to raise a value that is
+already clamped.
+
+Nothing is added when the answer is complete, and no existing field changes
+value.
+
+### `trace` counted the same hidden edge once per route
+
+Route lookup returns one row per route EDGE. A handler registered on two paths
+that both match your query came back as two rows, and the call-graph traversal
+ran once per row — identical work, keyed by the same handler and file. The wasted
+traversal was the smaller half: the suppressed-edge count accumulated per row, so
+`ambiguous_edges_hidden` reported the same hidden edges once per route. Measured
+on a two-route, one-handler fixture with two hidden edges, it said four. Told four
+ambiguous edges are hidden you go looking for two that do not exist, and
+`--min-confidence ambiguous` then shows two, which reads as the tool losing edges.
+
+Both surfaces now traverse once per distinct handler. The count is right; the
+answer is otherwise unchanged.
+
+### Fewer queries on three hot paths
+
+`find_references` ran one lookup per target id purely to ask whether any of them
+is a type definition — an N+1 on a path that already had a batched query
+available. Both search paths normalised the node-type filter inside their
+per-candidate loop, on a pool of up to 1000 rows, twice over when the exhaustion
+retry fired. Neither changes an answer, but the `find_references` batch no longer
+swallows a database error per id: a failure that used to read as "not a type
+definition" and quietly drop the accompanying warning now surfaces.
+
+### Internals and guards
+
+The three `~/.cache/code-graph` file names had seven spellings across five plugin
+modules, two of which rebuilt the path from `os.homedir()` instead of joining the
+constant — so the modules that would break first if the cache layout moved were
+the two that never load the module defining it. They now come from one place, and
+a source scan keeps it that way.
+
+`ci.yml` gained `workflow_dispatch`, so CI can be run on demand rather than only
+on a push. Downloads in CI are now restricted to the one command the
+transfer-timeout guard can actually read — `wget` and `Invoke-WebRequest` were
+unscanned, and only the job timeout bounded them.
+
+`similar` gained four tests covering its default human render, its
+`--max-distance` disclosure, its ambiguity refusal, and the line-number repatch it
+does instead of re-running the vector search. File coverage 66.67% → 87.68%.
+
+### Not covered
+
+- `pool_saturated` means "rows below the fetch cut went unread", which is a fact
+  about the pool rather than proof that matches were missed. On an index a full
+  fetch nearly exhausts, it can appear on an answer that happens to be complete.
+- `build_candidates` drops a candidate whose `files` row is missing without
+  counting it in either drop counter, so a pool consumed entirely by such rows
+  raises no flag at all. `find_references` was hardened against that state in
+  this release; `semantic_code_search` was not.
+- The `pool_len == results + dropped_by_filter + skipped_noise` identity holds on
+  the plain response, not on the compressed ones, where a result entry can stand
+  for a whole file or directory.
+- `find_references`' batched lookup propagates a query error where it previously
+  swallowed one per id. No test injects a SQL error on that path.
+- The `mcp_startup_embeds_without_any_tool_call` zero-vector failure remains
+  undiagnosed. Local runs are 10/10 green but the 95% upper bound on the failure
+  rate is still 26%; the cache-warm cron accumulates the rate for free.
+- `lifecycle.e2e.test.js`'s "issue #24" is a pre-existing flake under parallel
+  `node --test`. It now prints the provider's error code when it reddens.
+- 38 of the 40 hardening guards were confirmed to carry an anti-vacuity floor or
+  a negative control by READING them; only two were verified by mutation.
+- No reindex is needed. The recorded extraction fingerprint changed, but
+  `INDEX_VERSION` deliberately did not: the only fingerprinted source that moved
+  was a `cfg(test)` narrowing plus doc comments, which cannot alter what is
+  extracted from your code.
+- Route lookup still has no LIMIT, so a prefix query is one traversal per
+  DISTINCT handler. Deliberately not capped: measured at a 91 ms median for 200
+  handlers with 60-node chains, and a cap would truncate a default answer
+  without being adjustable.
+
 ## 0.138.0
 
 **Upgrading:** if your statusline used to flicker back to something shorter —
