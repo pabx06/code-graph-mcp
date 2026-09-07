@@ -445,19 +445,28 @@ impl McpServer {
             let (fts_retry, vec_retry, _, _) = retrieve(retry_fetch)?;
             let fused_retry = fuse(&fts_retry, &vec_retry, retry_fetch as usize);
             let (retry_candidates, retry_dropped, retry_skipped) = build_candidates(&fused_retry)?;
-            // The pool numbers move whenever the retry RAN, adopted or not: those
-            // rows were fetched and examined either way, so they are what "did the
-            // pool come back full" has to be asked of. Updating them only on
-            // adoption measured the superseded first pool — at top_k=20 on a
-            // 421-row index that reported "the candidate pool (320 rows) came back
-            // full" while the retry had just read all 421 and found nothing below
-            // any cut (pre-ship review round 2).
-            final_pool_len = fused_retry.len();
-            final_fetch_count = retry_fetch;
-            if retry_candidates.len() > candidates.len() {
+            // Adopt the retry WHOLESALE, on `>=` rather than `>`, so every number
+            // the response reports comes from one pool.
+            //
+            // Two rounds of review landed here. Recording the pool size only on a
+            // strict improvement measured the superseded FIRST pool: at top_k=20
+            // on a 421-row index it announced "the candidate pool (320 rows) came
+            // back full" while the retry had just read all 421 and found nothing
+            // below any cut. Moving the size alone then split the envelope — the
+            // size came from the retry pool and the drop counts from the first, so
+            // a 400-row pool reported 99 rows dropped and the arithmetic did not
+            // close (rounds 2 and 3).
+            //
+            // `>=` is safe because the retry pool is a superset: it fetches the
+            // same query at a strictly larger cap, so it cannot yield fewer
+            // survivors, and on equality the two candidate sets hold the same rows
+            // in the same rank order.
+            if retry_candidates.len() >= candidates.len() {
                 candidates = retry_candidates;
                 dropped_by_filter = retry_dropped;
                 skipped_noise_count = retry_skipped;
+                final_pool_len = fused_retry.len();
+                final_fetch_count = retry_fetch;
             }
         }
 
@@ -489,6 +498,7 @@ impl McpServer {
             saturated: candidates.len() < top_k as usize
                 && final_pool_len >= final_fetch_count as usize
                 && (dropped_by_filter + skipped_noise_count) > 0,
+            top_k,
         };
 
         // Phase 2: Re-rank by adjusted score (name relevance + size normalization)
@@ -780,6 +790,9 @@ struct PoolShortfall {
     /// That pool came back FULL and was still consumed before `top_k` was
     /// filled, so rows below the fetch cut were never examined.
     saturated: bool,
+    /// The `top_k` this answer was built for, so the note can tell whether
+    /// raising it is still an instruction the caller can follow.
+    top_k: i64,
 }
 
 impl PoolShortfall {
@@ -804,8 +817,27 @@ impl PoolShortfall {
         if !self.saturated {
             return String::new();
         }
+        // At the clamp ceiling "raise top_k" is an instruction the caller cannot
+        // follow — `top_k: 200` is silently clamped to 100, so the same answer
+        // comes back with the same advice. Same defect `HintStyle::limit_remedy`
+        // exists to avoid in `ast_search`, and the ceiling is READ from
+        // `COUNT_RANGES` rather than restated, because the comment on that table
+        // records a release where two independent literal 100s drifted apart.
+        let ceiling = count_range("semantic_code_search", "top_k").map(|(_, hi)| hi);
+        if ceiling.is_some_and(|hi| self.top_k as u64 >= hi) {
+            return format!(
+                " The candidate pool ({} rows) came back full at the maximum top_k, so matches may sit below the cut. Narrow the query to reach them.",
+                self.pool_len
+            );
+        }
+        // Speaks only about the POOL. An earlier version ended "…; broadening the
+        // filter will not", which is false on the arm that appends it most often:
+        // that arm fires on `filtered && dropped_by_filter > 0`, i.e. exactly when
+        // the filter DID remove candidates the query matched, so the sentence
+        // contradicted the one before it (pre-ship review round 3). Each arm now
+        // states its own remedy and this states the pool's.
         format!(
-            " The candidate pool ({} rows) came back full before top_k was filled, so matches may sit below the cut. Raise top_k to widen it; broadening the filter will not.",
+            " The candidate pool ({} rows) came back full before top_k was filled, so matches may sit below the cut. Raise top_k to widen it.",
             self.pool_len
         )
     }
@@ -864,13 +896,15 @@ fn explain_empty_results(
             "results": [],
             "message": "No matching symbols after filtering.",
             "dropped_by_filter": dropped_by_filter,
-            // "Broaden or clear the filter" is REPLACED, not appended to, when the
-            // pool ran out: the filter is not what removed the match there, and a
-            // hint that gives both instructions in one breath leaves the caller to
-            // pick the wrong one. The unsaturated wording is unchanged.
+            // BOTH remedies, because on this arm both are real: the guard above is
+            // `filtered && dropped_by_filter > 0`, so the filter did remove
+            // candidates the query matched, AND the pool ran out. An earlier
+            // version replaced the filter remedy with the pool's and left the
+            // caller told, in consecutive sentences, that the filter removed 100
+            // matches and that broadening it would not help (round 3).
             "hint": if shortfall.saturated {
                 format!(
-                    "{} candidate(s) matched the query but were removed by the active language/node_type filter.{}",
+                    "{} candidate(s) matched the query but were removed by the active language/node_type filter — broadening or clearing it recovers those.{}",
                     dropped_by_filter,
                     shortfall.exhaustion_note()
                 )
@@ -1170,9 +1204,15 @@ mod tests {
             text.contains("test symbols") && text.contains("placeholder"),
             "the empty response must name the always-on filter that consumed the candidates; got: {out}"
         );
+        // 30, not the 20 this asserted before: the fixture holds thirty
+        // `widgetonly_*` helpers, and the count now covers the pool actually
+        // examined rather than the first fetch's cut of it. The retry reads all
+        // thirty and is adopted, so the sentence and the index agree (pre-ship
+        // review round 3 — the two numbers used to come from different pools).
         assert!(
-            text.contains("20"),
-            "and how many candidates it consumed; got: {out}"
+            text.contains("30"),
+            "and how many candidates it consumed — every one that exists, not the \
+             first fetch's cut; got: {out}"
         );
         assert!(
             !text.contains("check spelling"),
@@ -1646,6 +1686,91 @@ mod tests {
             json!(true),
             "a compressed answer is under-returned by the same mechanism and owes \
              the same disclosure; got {out}"
+        );
+    }
+
+    /// Regression, pre-ship review round 3: the reported numbers came from two
+    /// different pools and did not add up.
+    ///
+    /// Round 2 moved `pool_len` to the retry's pool while leaving the drop counts
+    /// on the first pool's, so a 400-row pool reported 99 rows dropped by the
+    /// filter — a caller could not tell where the other 300 went. On a saturated
+    /// answer the identity is exact, because every fetched row is either returned
+    /// or dropped by one of the two filters:
+    ///
+    ///     pool_len == results + dropped_by_filter + skipped_noise
+    ///
+    /// Asserting the identity rather than the three literals is deliberate: it
+    /// stays true if the fixture's rank order shifts, and it fails for the right
+    /// reason if any one number is ever sourced from a different fetch.
+    #[test]
+    fn every_disclosed_number_describes_the_same_pool() {
+        let project = saturating_pool_project(420, &[("widget", 0)]);
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 2, "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["pool_saturated"],
+            json!(true),
+            "precondition: this arm only claims a pool size when saturated; got {out}"
+        );
+        let results = out["results"].as_array().map(|a| a.len()).unwrap_or(0) as u64;
+        let dropped = out["dropped_by_filter"].as_u64().unwrap_or(0);
+        let noise = out["skipped_noise"].as_u64().unwrap_or(0);
+        let pool: u64 = out["pool_saturated_note"]
+            .as_str()
+            .and_then(|n| n.split_once('(').and_then(|(_, r)| r.split_once(" rows")))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or_else(|| panic!("the note must name the pool size; got {out}"));
+        assert_eq!(
+            results + dropped + noise,
+            pool,
+            "every fetched row is returned or dropped, so the disclosed numbers \
+             must close over the pool they are reported beside: {results} + \
+             {dropped} + {noise} != {pool}; got {out}"
+        );
+    }
+
+    /// At the `top_k` ceiling, "raise top_k" is an instruction the caller cannot
+    /// follow — `top_k: 200` is clamped to 100 and returns the same answer with
+    /// the same advice (pre-ship review round 3). Exercised on the note directly
+    /// rather than end to end: saturating at top_k=100 needs a 1600-row pool, and
+    /// the branch under test is a pure function of the struct.
+    #[test]
+    fn at_the_top_k_ceiling_the_note_stops_advising_a_bigger_top_k() {
+        let ceiling = count_range("semantic_code_search", "top_k")
+            .map(|(_, hi)| hi as i64)
+            .expect("semantic_code_search.top_k must have a COUNT_RANGES row");
+        let at_ceiling = PoolShortfall {
+            dropped_by_filter: 1599,
+            skipped_noise: 0,
+            pool_len: 1600,
+            saturated: true,
+            top_k: ceiling,
+        };
+        let note = at_ceiling.exhaustion_note();
+        assert!(
+            !note.contains("Raise top_k"),
+            "top_k is already at its maximum; got {note:?}"
+        );
+        assert!(
+            note.contains("Narrow the query"),
+            "and the remedy that DOES remain must be named; got {note:?}"
+        );
+
+        let below = PoolShortfall {
+            top_k: ceiling - 1,
+            ..at_ceiling
+        };
+        assert!(
+            below.exhaustion_note().contains("Raise top_k to widen it"),
+            "one below the ceiling raising it still works, so the ordinary wording \
+             must survive — otherwise this test would pass on a note that never \
+             advises anything; got {:?}",
+            below.exhaustion_note()
         );
     }
 
