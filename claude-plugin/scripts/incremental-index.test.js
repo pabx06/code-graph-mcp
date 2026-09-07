@@ -63,6 +63,60 @@ test('hook script default-env spawn does not invoke the binary (default OFF)', (
   assert.ok(Date.now() - t0 < 500, 'default-OFF must short-circuit fast (< 500ms)');
 });
 
+// ── JS-32: the last registered hook that armed a budget and ignored it ──────
+//
+// `installHookFailOpen('PostToolUse:Write|Edit')` arms a 10 s deadline; the
+// child below spent a literal 8 s regardless of what was left of it, and
+// `findBinary()` runs first. Warm that fits; cold — first install, version
+// bump, after `clearCache()` — the version probes plus 8 s overrun the deadline
+// and Claude Code kills the hook on the user's own edit. JS-18 fixed the same
+// shape in user-prompt-context.js; this was the one file left.
+
+test('childBudgetMs reports the three budget states (JS-32)', () => {
+  const { childBudgetMs, CHILD_TIMEOUT_MS } = require('./incremental-index');
+  const { resetHookDeadline } = require('./hook-fail-open');
+
+  try {
+    // Nothing armed (a test importing this module): unchanged default.
+    resetHookDeadline();
+    assert.equal(childBudgetMs(), CHILD_TIMEOUT_MS);
+
+    // More budget than the default: the default still caps it, so this change
+    // cannot make the indexer run LONGER than it used to.
+    resetHookDeadline(Date.now() + 60_000);
+    assert.equal(childBudgetMs(), CHILD_TIMEOUT_MS);
+
+    // Less: take what is left, as an integer — `child_process` throws
+    // ERR_OUT_OF_RANGE on a fractional timeout and this hook's catch would
+    // swallow that into silence.
+    resetHookDeadline(Date.now() + 900);
+    const tight = childBudgetMs();
+    assert.ok(Number.isInteger(tight) && tight > 0 && tight <= 900, `got ${tight}`);
+
+    // Exhausted: null means DO NOT RUN. Not 0 — node reads `timeout: 0` as no
+    // timeout at all, which is the unbounded child this exists to prevent.
+    resetHookDeadline(Date.now() - 1);
+    assert.equal(childBudgetMs(), null);
+  } finally {
+    resetHookDeadline();
+  }
+});
+
+test('no child of this hook carries a hard-coded timeout (JS-32)', () => {
+  // The literal is the defect, so this reads the source: re-introducing
+  // `timeout: 8000` would pass every behavioural assertion above while
+  // restoring the overrun. The helper test and this one each cover half —
+  // three states, and the wiring that spends them.
+  const src = fs.readFileSync(path.join(__dirname, 'incremental-index.js'), 'utf8');
+  const literals = src.match(/^\s*timeout:\s*\d+/gm) || [];
+  assert.deepEqual(literals, [],
+    `every child must take its timeout from childBudgetMs(); found ${literals.join(', ')}`);
+  assert.match(src, /timeout: budget/,
+    'the exec options must read the budget variable');
+  assert.match(src, /budget === null/,
+    'an exhausted budget must skip the child, not spend a default');
+});
+
 test('incremental-index bails silently when cwd is not a git repo', (t) => {
   const bin = findBinary();
   if (!bin) {
