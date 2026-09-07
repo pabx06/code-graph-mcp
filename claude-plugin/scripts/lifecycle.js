@@ -13,9 +13,13 @@ const OLD_PLUGIN_IDS = [
 ];
 const MARKETPLACE_NAME = 'code-graph-mcp';
 // Imported, not defined here: five other modules needed these three names and
-// two of them cannot afford to load this file (see cache-paths.js, JS-05). The
-// export surface below is unchanged — CACHE_DIR / MANIFEST_FILE /
-// INSTALL_LOCK_FILE still come out of `lifecycle`, so no importer moves.
+// one of them — `user-prompt-context.js`, on the UserPromptSubmit hook path —
+// cannot afford to load this file for them (see cache-paths.js, JS-05).
+//
+// The export surface below is unchanged. Measured rather than asserted, after
+// the first version of this comment claimed `MANIFEST_FILE` was exported from
+// here: `CACHE_DIR` and `INSTALL_LOCK_FILE` are exported and still are;
+// `MANIFEST_FILE` is module-private and always was, so nothing importable moved.
 const { CACHE_DIR, MANIFEST_FILE, INSTALL_LOCK_FILE } = require('./cache-paths');
 // Bound for the `ps` fallback in getActiveCmdlines (pre-ship review 2026-09-06).
 // 2 s matches the other hook-path probes; the floor is what a budget-exhausted

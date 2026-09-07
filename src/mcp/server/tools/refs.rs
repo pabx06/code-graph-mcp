@@ -298,11 +298,16 @@ impl McpServer {
         // swallowed per id by `.ok().flatten()` — a failed lookup used to read
         // as "not a type definition" and silently drop the warning below, which
         // is the swallowed-probe class this repo fixed in `doctor.js` (JS-04).
+        //
+        // `get_node_types_by_ids`, NOT `get_nodes_with_files_by_ids`: the latter
+        // INNER JOINs `files`, so a node whose file row is missing vanishes from
+        // the result and the warning disappears again — the same silent drop, by
+        // a different mechanism. Orphans reach `target_ids` (the node_id arm uses
+        // an unjoined `get_node_by_id`, the fuzzy arm a deliberate LEFT JOIN), and
+        // the first version of this batching reinstated the bug it was fixing
+        // (pre-ship review 2026-09-07).
         let target_types: Vec<String> =
-            queries::get_nodes_with_files_by_ids(self.db.conn(), &target_ids)?
-                .into_iter()
-                .map(|nwf| nwf.node.node_type)
-                .collect();
+            queries::get_node_types_by_ids(self.db.conn(), &target_ids)?;
         let is_type_def = target_types
             .iter()
             .any(|t| type_kinds.contains(&t.as_str()));

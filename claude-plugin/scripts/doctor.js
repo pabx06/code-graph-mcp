@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 const { readBinaryVersion, isDevMode, getNewestMtime } = require('./version-utils');
 const {
-  getPluginVersion, readJson, readJsonResult, healthCheck, scanForBrokenPaths, CACHE_DIR,
+  getPluginVersion, readJson, readJsonResult, healthCheck, scanForBrokenPaths,
   settingsPath, surveyHookCoverage,
   installedGlobalPkgs, GLOBAL_INSTALL_MARKER, SHELL_PKG,
 } = require('./lifecycle');

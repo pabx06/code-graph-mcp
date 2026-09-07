@@ -730,6 +730,39 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
 
 /// Batch-fetch nodes with their file path and language by node IDs.
 /// Avoids N+1 queries when loading search results.
+/// Node types for the given ids, chunked, with NO join to `files`.
+///
+/// The joining twin below drops any node whose `files` row is missing, and that
+/// state is reachable — `get_node_by_id` and `get_node_ids_by_name` both survive
+/// it deliberately (the latter with an explicit `LEFT JOIN … COALESCE`), and the
+/// server calls such rows "residue from a previous crashed session or external
+/// DB modification". A caller that only needs `node_type` must not inherit the
+/// join's row loss: `find_references` did, and silently stopped emitting its
+/// type-definition warning for orphaned targets (pre-ship review 2026-09-07).
+///
+/// Order is not preserved and ids with no row are simply absent, matching the
+/// per-id `get_node_by_id` loop this replaced.
+pub fn get_node_types_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<String>> {
+    if node_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut types = Vec::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let placeholders = make_placeholders(1, chunk.len());
+        let sql = format!("SELECT type FROM nodes WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        for row in rows {
+            types.push(row?);
+        }
+    }
+    Ok(types)
+}
+
 pub fn get_nodes_with_files_by_ids(
     conn: &Connection,
     node_ids: &[i64],

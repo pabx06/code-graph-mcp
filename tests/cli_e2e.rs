@@ -10374,13 +10374,44 @@ fn similar_fixture(project: &TempDir, neighbours: &[(&str, f32)]) -> i64 {
 /// lowest-covered production file at 40.3%).
 ///
 /// It pins the similarity arithmetic too: the column is `1/(1+distance)` as a
-/// percentage, not the distance and not `1-distance`, so an identical neighbour
-/// reads 100.0% and the number cannot silently change meaning.
+/// percentage, not the distance and not `1-distance`.
+///
+/// The neighbour is deliberately at a NON-ZERO distance. An identical vector was
+/// the first version of this fixture and pinned nothing: at distance 0 both
+/// `1/(1+d)` and `1-d` are exactly 1.0, so mutating the formula left the test
+/// green (pre-ship review 2026-09-07). The expected percentage is derived from
+/// the distance the `--json` render reports for the same neighbour, so the two
+/// output paths are checked against each other rather than against a float
+/// literal that would drift with the fixture.
 #[test]
 fn test_cli_similar_human_render_shows_percent_symbol_and_location() {
     let project = TempDir::new().unwrap();
-    // Same point as the seed → L2 distance 0 → similarity 1/(1+0) = 100.0%.
-    let seed = similar_fixture(&project, &[("twin_symbol", 0.1)]);
+    // 0.1 -> 0.13 over 384 dims is an L2 distance of sqrt(384)*0.03 ≈ 0.588,
+    // inside the 0.8 default cutoff and far from 0.
+    let seed = similar_fixture(&project, &[("twin_symbol", 0.13)]);
+
+    let (json_out, _, json_code) = run_cli(
+        &project,
+        &[
+            "similar",
+            "--node-id",
+            &seed.to_string(),
+            "--top-k",
+            "5",
+            "--json",
+        ],
+    );
+    assert_eq!(json_code, 0, "json render must succeed; got {json_out}");
+    let v: serde_json::Value = serde_json::from_str(json_out.trim()).unwrap();
+    let distance = v[0]["distance"].as_f64().unwrap_or_else(|| {
+        panic!("fixture precondition: one neighbour with a distance; got {json_out}")
+    });
+    assert!(
+        distance > 0.05,
+        "fixture precondition: the distance must be far from zero, or `1/(1+d)` \
+         and `1-d` agree and this pins nothing; got {distance}"
+    );
+    let expected = format!("{:.1}%", 100.0 / (1.0 + distance));
 
     let (stdout, stderr, code) = run_cli(
         &project,
@@ -10392,8 +10423,9 @@ fn test_cli_similar_human_render_shows_percent_symbol_and_location() {
         .find(|l| l.contains("twin_symbol"))
         .unwrap_or_else(|| panic!("the neighbour must be rendered; stdout:\n{stdout}"));
     assert!(
-        line.starts_with("100.0%"),
-        "an identical vector is 1/(1+0) = 100.0%, not a distance and not 1-distance; got: {line:?}"
+        line.starts_with(&expected),
+        "the percent column is 1/(1+distance), not the distance and not 1-distance \
+         — at distance {distance} that is {expected}; got: {line:?}"
     );
     assert!(
         line.contains("function"),

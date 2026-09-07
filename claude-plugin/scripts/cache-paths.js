@@ -9,11 +9,16 @@
 // by grep. `tests/hardening.rs::cache_file_names_have_exactly_one_spelling`
 // keeps this the only file that may spell them.
 //
-// Deliberately tiny and dependency-free beyond node builtins. `statusline.js`
-// and `user-prompt-context.js` run on hook paths with a measured startup budget;
-// pulling `lifecycle.js` (2k lines) into them for a path string would spend that
-// budget on a constant, which is why one of them was hardcoding the path in the
-// first place.
+// Deliberately tiny and dependency-free beyond node builtins, for ONE consumer:
+// `user-prompt-context.js` runs on the UserPromptSubmit hook path and does not
+// load `lifecycle.js`, so taking a path string from there would cost it the
+// whole module. Measured at 30.1 ms as shipped versus 34.5 ms if it also loaded
+// `lifecycle.js` (+14%).
+//
+// `statusline.js` was the other hardcoded spelling and is NOT a reason for this
+// file — it already does `require('./lifecycle')`, so its copy of the three path
+// segments bought nothing. An earlier version of this comment claimed both
+// modules needed the split (pre-ship review 2026-09-07).
 const os = require('os');
 const path = require('path');
 

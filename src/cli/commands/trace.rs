@@ -167,9 +167,11 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     // SURF-07 also proposed CAPPING the number of handlers traversed, and that
     // half is deliberately NOT done. `find_routes_by_path` has no LIMIT, so a
     // prefix query really is one traversal per DISTINCT handler — but measured
-    // on a synthetic repo of 200 routes over 200 distinct handlers, each with a
-    // 60-node call chain, `trace /api` costs 90-95 ms at the default depth and
-    // 102-105 ms at `--depth 5` (2026-09-06, release binary). A cap would trade
+    // on a synthetic repo of 200 routes over 200 distinct handlers, each with 60
+    // nodes reachable in the traversal, `trace /api` costs 90-101 ms at the
+    // default depth and 102-105 ms at `--depth 5` (release binary; two
+    // independent measurements on differently-sized fixtures, 2026-09-06/07,
+    // whose medians were 90-95 and 100.7 ms). A cap would trade
     // that for a truncated default answer, and a non-adjustable one — the shape
     // SURF-06 had just finished removing from `similar`'s noise filter. Each
     // per-handler traversal is separately bounded by CALL_GRAPH_MAX_DEPTH and

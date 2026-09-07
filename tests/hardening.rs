@@ -3896,12 +3896,28 @@ const CACHE_FILE_NAMES: [&str; 3] = ["update-state.json", "install-manifest.json
 /// truth and must not be flagged: a guard that forces those to be rewritten
 /// buys nothing and gets itself disabled.
 fn cache_path_literals(src: &str) -> Vec<&'static str> {
+    // A `//` preceded by `:` is a URL scheme, not a comment marker. Stripping
+    // from the first `//` unconditionally made every literal AFTER a URL on the
+    // same line invisible — and `auto-update.js` is precisely the module that
+    // both holds `https://api.github.com/...` and joins cache paths, so the one
+    // file most likely to reintroduce a duplicate spelling was the one the guard
+    // could be blinded on (pre-ship review 2026-09-07).
+    fn strip_line_comment(l: &str) -> &str {
+        let bytes = l.as_bytes();
+        let mut i = 0;
+        while let Some(rel) = l[i..].find("//") {
+            let at = i + rel;
+            if at > 0 && bytes[at - 1] == b':' {
+                i = at + 2;
+                continue;
+            }
+            return &l[..at];
+        }
+        l
+    }
     let stripped: String = src
         .lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        })
+        .map(strip_line_comment)
         .collect::<Vec<_>>()
         .join("\n");
     CACHE_FILE_NAMES
@@ -4019,6 +4035,22 @@ fn cache_path_scanner_catches_literals_and_spares_prose() {
         vec!["install.lock"],
         "a trailing comment must not hide the literal in front of it"
     );
+    // A URL's `//` is not a comment marker. `auto-update.js` holds both a GitHub
+    // URL and cache-path joins, so this is the realistic shape in which the
+    // guard would have gone blind on the file most able to reintroduce the bug.
+    assert_eq!(
+        cache_path_literals(
+            "const U = 'https://api.github.com/x'; const P = path.join(CACHE_DIR, 'install-manifest.json');"
+        ),
+        vec!["install-manifest.json"],
+        "a literal after a URL on the same line must still be seen"
+    );
+    // …and a real comment AFTER a URL still ends the code.
+    assert!(
+        cache_path_literals("fetch('https://example.com/a'); // writes update-state.json")
+            .is_empty(),
+        "the second `//` here IS a comment marker and must still strip"
+    );
 }
 
 /// Download commands whose timeout flag the curl scanner does not know.
@@ -4119,12 +4151,18 @@ fn unscanned_download_scanner_is_word_anchored_and_comment_blind() {
         "          swget --not-a-download",
         "          echo \"no-wget-here\"",
     ];
+    // Fixture shape first: an empty verdict is only meaningful if the input was
+    // not empty of the token. Three of the four `clear` lines contain "wget";
+    // the earlier form of this check was `if line.contains("wget") { assert!(
+    // line.contains("wget")) }`, a tautology guarded by its own predicate that
+    // could not fail (pre-ship review 2026-09-07).
+    assert_eq!(
+        clear.iter().filter(|l| l.contains("wget")).count(),
+        3,
+        "three of these lines must carry the token they are asserted not to be \
+         flagged for; got {clear:?}"
+    );
     for line in clear {
-        // Fixture shape first: three of these DO contain the token, so an empty
-        // verdict is only meaningful if the input was not empty of it.
-        if line.contains("wget") {
-            assert!(line.contains("wget"), "fixture shape: {line}");
-        }
         assert!(
             unscanned_download_invocations(line).is_empty(),
             "must not be flagged: {line} -> {:?}",

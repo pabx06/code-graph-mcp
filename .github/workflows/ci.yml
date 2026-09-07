@@ -19,13 +19,18 @@ on:
   schedule:
     # 05:23 UTC daily — odd minute, off the on-the-hour scheduler stampede.
     - cron: '23 5 * * *'
-  # The other three workflows already have this; ci.yml was the holdout, which
-  # meant the daily `schedule:` above and the per-job gates that make it run the
-  # audit ALONE could not be exercised on demand — the first evidence either
-  # works would have been whatever 05:23 UTC produced. A manual run reports
-  # `github.event_name == 'workflow_dispatch'`, so the gates below let it run
-  # everything, which is the right answer for a button someone deliberately
-  # pressed.
+  # Of the five workflows here, three already had this and `pr-impact-review` is
+  # `pull_request`-only with nothing to dispatch, so ci.yml was the one that
+  # lacked it and could have it.
+  #
+  # What it buys, stated precisely: a full CI run on demand. A manual run reports
+  # `github.event_name == 'workflow_dispatch'`, so every `if:` below evaluates
+  # true and all five jobs run alongside the ungated `audit` — the right answer
+  # for a button someone deliberately pressed, but NOT a way to exercise the
+  # schedule-only path. That path is verified statically instead, by
+  # `ci_schedule_runs_only_the_audit_job` in tests/hardening.rs. An earlier
+  # version of this comment claimed the button closed that gap; it does not
+  # (pre-ship review 2026-09-07).
   workflow_dispatch:
 
 # Least privilege: every job here only reads the repo. Without an explicit block

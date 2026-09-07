@@ -4136,3 +4136,77 @@ fn tool_descriptions_and_instructions_name_no_unlisted_tool() {
         }
     }
 }
+
+/// Regression, pre-ship review 2026-09-07: batching the type lookup in
+/// `find_references` must not inherit an INNER JOIN's row loss.
+///
+/// The first version of that batching used `get_nodes_with_files_by_ids`, which
+/// joins `files`. A node whose `files` row is missing is returned by the
+/// unjoined `get_node_by_id` the loop had used and dropped by the joined batch —
+/// so `type_definition_note` silently stopped appearing for orphaned targets.
+/// That is the same swallowed-disclosure the batching commit was fixing,
+/// reintroduced by a different mechanism.
+///
+/// Orphans are reachable: the `node_id` arm resolves through an unjoined query
+/// and the fuzzy arm through a deliberate `LEFT JOIN … COALESCE`, and the server
+/// describes such rows as residue from a crashed session or external DB edit.
+#[test]
+fn test_find_references_type_note_survives_a_node_whose_file_row_is_gone() {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Widget { pub id: i64 }\n\npub fn make() -> Widget { Widget { id: 1 } }\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    let widget_id = code_graph_mcp::storage::queries::get_nodes_by_name(db.conn(), "Widget")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("fixture must index the struct")
+        .id;
+    drop(db);
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+
+    let ask = |server: &McpServer| -> serde_json::Value {
+        let msg = tool_call_json(
+            "find_references",
+            serde_json::json!({"node_id": widget_id, "skip_indexing": true}),
+        );
+        parse_tool_result(&server.handle_message(&msg).unwrap())
+    };
+
+    let before = ask(&server);
+    assert!(
+        before.get("type_definition_note").is_some(),
+        "fixture precondition: a struct target must carry the type-definition \
+         warning to begin with, or the orphan check below proves nothing; got {before}"
+    );
+    drop(server);
+
+    // Orphan the node: drop its `files` row, which is what a crashed session or
+    // an external DB edit leaves behind.
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    db.conn()
+        .execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM files;")
+        .unwrap();
+    drop(db);
+
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    server.handle_message(init).unwrap();
+    let after = ask(&server);
+    assert!(
+        after.get("type_definition_note").is_some(),
+        "the target is still a struct and the caller still needs the warning — a \
+         missing file row is not an answer about the symbol's type; got {after}"
+    );
+}

@@ -106,10 +106,11 @@ test('the documented registry paths are the ones lifecycle writes', () => {
   // Derived from the source, so a move breaks the test rather than the docs.
   assert.ok(src.includes("'statusline-registry.json'"), 'the working-copy filename moved');
   assert.ok(src.includes("'statusline-providers.json'"), 'the durable-mirror filename moved');
-  // CACHE_DIR moved to cache-paths.js (JS-05): five modules needed it and two
-  // could not afford to load lifecycle.js for it. The assertion follows the
-  // definition rather than being dropped — the point is still that a move of the
-  // cache directory reddens a test instead of silently drifting from the README.
+  // CACHE_DIR moved to cache-paths.js (JS-05): five modules needed it and one —
+  // user-prompt-context.js, on a hook path — could not afford to load
+  // lifecycle.js for it. The assertion follows the definition rather than being
+  // dropped: the point is still that a move of the cache directory reddens a
+  // test instead of silently drifting from the README.
   const paths = fs.readFileSync(path.join(__dirname, 'cache-paths.js'), 'utf8');
   assert.ok(paths.includes("path.join(os.homedir(), '.cache', 'code-graph')"),
     'the cache directory moved — the README names it');

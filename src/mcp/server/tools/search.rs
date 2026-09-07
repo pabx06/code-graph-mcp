@@ -437,6 +437,11 @@ impl McpServer {
         // exhausted, or that lost nothing to filtering, retrieves exactly as
         // before — the retrieval benchmark path is untouched.
         let retry_fetch = crate::domain::search_retry_fetch_count(fetch_count);
+        // Set when the widening below RAN and produced no additional survivor.
+        // That outcome is evidence, not a non-event: a pool four times wider found
+        // nothing more, so the short answer is the complete one and telling the
+        // caller to raise top_k sends them to repeat an experiment already run.
+        let mut widening_found_nothing_more = false;
         if candidates.len() < top_k as usize
             && fused.len() >= fetch_count as usize
             && (skipped_noise_count + dropped_by_filter) > 0
@@ -451,12 +456,29 @@ impl McpServer {
                 skipped_noise_count = retry_skipped;
                 final_pool_len = fused_retry.len();
                 final_fetch_count = retry_fetch;
+            } else {
+                widening_found_nothing_more = true;
             }
         }
 
         // Everything a short `results` array cannot say about itself, computed
         // once here (the counts and both pool numbers are only in scope at this
         // point) and attached to whichever of the three response shapes returns.
+        //
+        // `widening_found_nothing_more` changes the ADVICE, not the flag. Getting
+        // that split right took a wrong first attempt worth recording: suppressing
+        // the flag outright when the widening added nothing also silenced the
+        // empty-result case, where a match provably DOES exist below the cut — the
+        // widened pool held 400 of 422 rows and still missed it. "A wider pool
+        // found nothing more" is evidence, not proof, so it cannot decide whether
+        // the answer is complete.
+        //
+        // What it can decide is what to tell the caller. Pre-ship review measured
+        // an index with exactly one match for the filter: top_k=2 returned it and
+        // advised raising top_k; top_k=20 returned the same one result and gave
+        // the same advice again. The flag was right — 23 of 423 nodes really were
+        // unseen — and the instruction was the part that sent the caller to repeat
+        // an experiment the tool had already run.
         let shortfall = PoolShortfall {
             dropped_by_filter,
             skipped_noise: skipped_noise_count,
@@ -464,6 +486,7 @@ impl McpServer {
             saturated: candidates.len() < top_k as usize
                 && final_pool_len >= final_fetch_count as usize
                 && (dropped_by_filter + skipped_noise_count) > 0,
+            widening_exhausted: widening_found_nothing_more,
         };
 
         // Phase 2: Re-rank by adjusted score (name relevance + size normalization)
@@ -740,9 +763,9 @@ fn try_compress_results(
 /// here the finding has to ride in the envelope or reach nobody — which is what
 /// it did (audit 2026-09-05 §15).
 ///
-/// `saturated` is deliberately a conjunction rather than `dropped > 0`: a query
-/// with three matches in the whole repo returns a short answer that is COMPLETE,
-/// and flagging it would teach callers to ignore the field.
+/// `saturated` is deliberately a conjunction rather than `dropped > 0`: a pool
+/// that did NOT come back full was read to its end, so a short answer from it is
+/// COMPLETE, and flagging that would teach callers to ignore the field.
 #[derive(Debug, Default, Clone, Copy)]
 struct PoolShortfall {
     /// Rows the caller's language/node_type filter removed after the fetch.
@@ -753,8 +776,13 @@ struct PoolShortfall {
     /// the retry was adopted, the first pool otherwise.
     pool_len: usize,
     /// That pool came back FULL and was still consumed before `top_k` was
-    /// filled, with the retry already widened as far as it may go.
+    /// filled, so rows below the fetch cut were never examined.
     saturated: bool,
+    /// The widening retry RAN and produced no additional survivor. Evidence that
+    /// a bigger `top_k` is unlikely to help — not proof that the answer is
+    /// complete (the widened pool can still stop short of the whole index), so
+    /// it steers the advice rather than the flag.
+    widening_exhausted: bool,
 }
 
 impl PoolShortfall {
@@ -762,12 +790,28 @@ impl PoolShortfall {
     /// arms whose standing advice — broaden the filter — cannot help when the
     /// filter is not what removed the match. Empty when nothing was cut off, so
     /// the unaffected arms keep their wording verbatim.
+    ///
+    /// Kept under 200 characters on purpose: `truncate_large_strings` (see
+    /// `server/helpers.rs`'s `TRUNCATE_MIN_LEN`) cuts longer strings mid-sentence
+    /// on a large compact response, and an advisory that ends in "…" advises
+    /// nothing. Measured at 168 characters for a four-digit pool size.
     fn exhaustion_note(&self) -> String {
         if !self.saturated {
             return String::new();
         }
+        // Two remedies, and only one of them is ever true. When the widening
+        // already ran and returned nothing extra, "raise top_k" is the advice a
+        // caller has just been shown to be useless — measured pre-ship as the
+        // same one-result answer at top_k=2 and top_k=20, each time telling the
+        // caller to raise it.
+        if self.widening_exhausted {
+            return format!(
+                " The candidate pool ({} rows) came back full, and a wider fetch already returned no further match — so raising top_k is unlikely to help here.",
+                self.pool_len
+            );
+        }
         format!(
-            " The candidate pool ({} rows) came back full and was consumed before top_k was filled, so matches may sit below the fetch cut: raise top_k to widen it — broadening the filter will not, because the filter is not what removed them.",
+            " The candidate pool ({} rows) came back full before top_k was filled, so matches may sit below the cut. Raise top_k to widen it; broadening the filter will not.",
             self.pool_len
         )
     }
@@ -775,9 +819,14 @@ impl PoolShortfall {
     /// Attach the disclosure to any of this tool's response envelopes.
     ///
     /// Silent unless something was actually cut off, so the common complete
-    /// answer keeps its current shape byte for byte. `entry` rather than
-    /// `insert`: the empty-result arms already publish their own drop count
-    /// under these names, and their wording is the more specific one.
+    /// answer keeps its current shape byte for byte.
+    ///
+    /// Plain `insert` for all four keys. An earlier version used `entry` for the
+    /// two counts and justified it as deferring to the empty-result arms' "more
+    /// specific" values — a mechanism that does not exist: those arms now read
+    /// the SAME `PoolShortfall`, so the values are identical, and the two
+    /// producers that could differ (`finalize_search_results`,
+    /// `try_compress_results`) write neither key.
     fn attach(&self, out: &mut serde_json::Value) {
         if !self.saturated {
             return;
@@ -791,12 +840,10 @@ impl PoolShortfall {
             json!(self.exhaustion_note().trim()),
         );
         if self.dropped_by_filter > 0 {
-            obj.entry("dropped_by_filter")
-                .or_insert_with(|| json!(self.dropped_by_filter));
+            obj.insert("dropped_by_filter".into(), json!(self.dropped_by_filter));
         }
         if self.skipped_noise > 0 {
-            obj.entry("skipped_noise")
-                .or_insert_with(|| json!(self.skipped_noise));
+            obj.insert("skipped_noise".into(), json!(self.skipped_noise));
         }
     }
 }
@@ -1340,10 +1387,15 @@ mod tests {
     /// it lands.
     ///
     /// `distractors` TypeScript `widgetHandler*` functions saturate the pool.
-    /// `carrier_reachable` picks which half of the mechanism runs: a SHORT
-    /// Python function named for the query ranks inside the pool (short answer),
-    /// a long one mentioning the term once ranks below the cut (empty answer).
-    fn saturating_pool_project(distractors: usize, carrier_reachable: bool) -> tempfile::TempDir {
+    /// Each carrier is `(name, filler_lines)`: filler decides where BM25 ranks
+    /// it, so `("widget", 0)` lands inside the FIRST pool, a middling one is
+    /// reachable only through the retry, and a long one stays below every cut.
+    /// The tests assert which of those actually happened rather than trusting
+    /// the tuning.
+    fn saturating_pool_project(
+        distractors: usize,
+        carriers: &[(&str, usize)],
+    ) -> tempfile::TempDir {
         let project = tempfile::TempDir::new().unwrap();
         let src = project.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1354,17 +1406,15 @@ mod tests {
         }
         std::fs::write(src.join("pool.ts"), &pool).unwrap();
 
-        let carrier = if carrier_reachable {
-            "def widget():\n    return widget\n".to_string()
-        } else {
-            let mut long = String::from("def carrier_box():\n");
-            for i in 0..80 {
-                long.push_str(&format!("    filler_{i} = {i}\n"));
+        let mut py = String::new();
+        for (name, filler) in carriers {
+            py.push_str(&format!("def {name}():\n"));
+            for i in 0..*filler {
+                py.push_str(&format!("    filler_{i} = {i}\n"));
             }
-            long.push_str("    return widget\n");
-            long
-        };
-        std::fs::write(src.join("carrier.py"), carrier).unwrap();
+            py.push_str("    return widget\n\n");
+        }
+        std::fs::write(src.join("carrier.py"), py).unwrap();
         project
     }
 
@@ -1375,33 +1425,78 @@ mod tests {
     /// taking the two drop counts (audit 2026-09-05 §15).
     #[test]
     fn short_answer_discloses_the_pool_it_could_not_fill() {
-        let project = saturating_pool_project(420, true);
+        // Rank is controlled by DOCUMENT LENGTH in three tiers, not by tuning a
+        // filler count until it lands: 20 short test helpers outrank everything,
+        // the two production symbols sit next, and 70 long test helpers fill the
+        // tail. Unfiltered, so `fetch_count` is 20 and the retry is 80 — small
+        // enough that the tiers decide the pools outright.
+        //
+        //   first pool (20 rows) = 20 short helpers    -> 0 survivors, all noise
+        //   retry pool (80 rows) = those + 2 prod + …  -> 2 survivors, ADOPTED
+        //
+        // So the retry recovers matches and the answer is STILL short of top_k=3:
+        // the one shape whose remedy really is "raise top_k". Two earlier attempts
+        // tuned a Python carrier's filler count instead, and both landed outside
+        // the retry pool entirely — length beats name-match against a field of
+        // short name-matching distractors.
+        let project = tempfile::TempDir::new().unwrap();
+        let src = project.path().join("src");
+        let tests_dir = project.path().join("tests");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        for i in 0..20 {
+            std::fs::write(
+                tests_dir.join(format!("short_{i}.py")),
+                format!("def widget_short_{i}():\n    return widget\n"),
+            )
+            .unwrap();
+        }
+        let mut prod = String::new();
+        for name in ["widget_prod_a", "widget_prod_b"] {
+            prod.push_str(&format!("def {name}():\n"));
+            for j in 0..6 {
+                prod.push_str(&format!("    step_{j} = {j}\n"));
+            }
+            prod.push_str("    return widget\n\n");
+        }
+        std::fs::write(src.join("prod.py"), prod).unwrap();
+        for i in 0..70 {
+            let mut long = format!("def widget_long_{i}():\n");
+            for j in 0..25 {
+                long.push_str(&format!("    pad_{j} = {j}\n"));
+            }
+            long.push_str("    return widget\n");
+            std::fs::write(tests_dir.join(format!("long_{i}.py")), long).unwrap();
+        }
         let server = indexed_server(&project);
         let out = server
             .tool_semantic_search(&json!({
-                "query": "widget", "language": "python", "top_k": 2, "skip_indexing": true
+                "query": "widget", "top_k": 3, "skip_indexing": true
             }))
             .unwrap();
         assert_eq!(
             out["results"].as_array().map(|a| a.len()),
-            Some(1),
-            "fixture precondition: exactly one Python match survives, or this is \
-             exercising the empty path instead; got {out}"
+            Some(2),
+            "fixture precondition: the retry must RECOVER the second match and the \
+             answer must still be short of top_k=3 — otherwise this is testing the \
+             widening-found-nothing case below, not a truncation; got {out}"
         );
         assert_eq!(
             out["pool_saturated"],
             json!(true),
-            "the pool came back full and was consumed before top_k=2 was filled — \
-             the one fact a 1-element array cannot state about itself; got {out}"
+            "the pool came back full and was consumed before top_k=3 was filled — \
+             the one fact a 2-element array cannot state about itself; got {out}"
         );
         assert!(
-            out["dropped_by_filter"].as_u64().unwrap_or(0) > 0,
-            "and the count that explains it; got {out}"
+            out["skipped_noise"].as_u64().unwrap_or(0) > 0,
+            "and the count that explains it — here the always-on noise filter, not \
+             a caller filter; got {out}"
         );
         let note = out["pool_saturated_note"].as_str().unwrap_or_default();
         assert!(
-            note.contains("raise top_k"),
-            "the note must name the lever that actually widens the pool; got {out}"
+            note.contains("Raise top_k to widen it"),
+            "the retry recovered matches here, so widening is the remedy that WOULD \
+             help and the note must say so; got {out}"
         );
         // The note DOES contain the word "broadening" — in the clause saying it
         // will not help. What must never appear is the instruction itself.
@@ -1418,7 +1513,7 @@ mod tests {
     /// the CLI spells out at `src/cli/commands/search.rs:365`.
     #[test]
     fn empty_after_a_consumed_pool_does_not_only_blame_the_filter() {
-        let project = saturating_pool_project(420, false);
+        let project = saturating_pool_project(420, &[("carrier_box", 80)]);
         let server = indexed_server(&project);
         let out = server
             .tool_semantic_search(&json!({
@@ -1442,13 +1537,114 @@ mod tests {
         );
     }
 
+    /// Regression, pre-ship review 2026-09-07: the advice looped.
+    ///
+    /// One Python match in the whole index. Pre-fix, `top_k=2` returned it and
+    /// said "raise top_k"; `top_k=20` returned the same one result and said
+    /// "raise top_k" again — while the retry had already fetched four times as
+    /// many rows and found no second match. The flag itself was right (rows below
+    /// the cut really were unread), so what has to change is the remedy, and both
+    /// values of `top_k` must now say the widening has already been tried.
+    #[test]
+    fn an_exhausted_widening_stops_advising_a_bigger_top_k() {
+        let project = saturating_pool_project(420, &[("widget", 0)]);
+        let server = indexed_server(&project);
+        for top_k in [2, 20] {
+            let out = server
+                .tool_semantic_search(&json!({
+                    "query": "widget", "language": "python",
+                    "top_k": top_k, "skip_indexing": true
+                }))
+                .unwrap();
+            assert_eq!(
+                out["results"].as_array().map(|a| a.len()),
+                Some(1),
+                "precondition at top_k={top_k}: exactly one Python match exists, so \
+                 the widening cannot recover a second; got {out}"
+            );
+            let note = out["pool_saturated_note"].as_str().unwrap_or_default();
+            assert!(
+                note.contains("already returned no further match"),
+                "top_k={top_k}: the caller must be told the wider fetch was already \
+                 run, not sent to run it again; got {out}"
+            );
+            assert!(
+                !note.contains("Raise top_k to widen"),
+                "top_k={top_k}: that is the instruction this test exists to remove; \
+                 got {out}"
+            );
+        }
+    }
+
+    /// The compressed envelope is the third response shape, and removing its
+    /// `attach` call left every test in this module green (pre-ship review
+    /// 2026-09-07) — the one-envelope contract was asserted in a comment and
+    /// covered on two paths out of three.
+    ///
+    /// `top_k=63` makes `fetch_count` 1008, so `search_retry_fetch_count` caps at
+    /// 1000 and the retry cannot run at all: saturation here is the no-widening-
+    /// available kind, which keeps the fixture to one pool.
+    #[test]
+    fn the_compressed_envelope_carries_the_pool_disclosure_too() {
+        // Bespoke rather than `saturating_pool_project`: this one needs the
+        // distractors to rank BELOW the carriers, so that filling the pool cuts
+        // distractors instead of the matches. The shared fixture's one-line
+        // distractors outrank everything, and its first build of this test
+        // returned 0 results for exactly that reason.
+        let project = tempfile::TempDir::new().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut pool = String::new();
+        for i in 0..1000 {
+            pool.push_str(&format!("function drainer{i}(a) {{\n"));
+            for j in 0..30 {
+                pool.push_str(&format!("  const s{j} = a + {j};\n"));
+            }
+            pool.push_str(&format!("  return widget + {i};\n}}\n"));
+        }
+        std::fs::write(src.join("pool.ts"), &pool).unwrap();
+        // 24 short, name-matching Python functions: each is ~200 bytes of code, so
+        // 24 of them clear the 2000-token compression threshold together.
+        let mut py = String::new();
+        for i in 0..24 {
+            py.push_str(&format!("def widget_{i:02}():\n"));
+            for j in 0..10 {
+                py.push_str(&format!("    filler_{j} = {j}\n"));
+            }
+            py.push_str("    return widget\n\n");
+        }
+        std::fs::write(src.join("carrier.py"), py).unwrap();
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 63, "skip_indexing": true
+            }))
+            .unwrap();
+        assert!(
+            out["mode"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("compressed")),
+            "fixture precondition: the answer must exceed the compression \
+             threshold, or this is testing the plain envelope again; got mode={:?} \
+             with {:?} results",
+            out["mode"],
+            out["results"].as_array().map(|a| a.len())
+        );
+        assert_eq!(
+            out["pool_saturated"],
+            json!(true),
+            "a compressed answer is under-returned by the same mechanism and owes \
+             the same disclosure; got {out}"
+        );
+    }
+
     /// Negative control: short is not truncated. One match in a four-row repo is
     /// a COMPLETE answer, and flagging it would train the caller to ignore the
     /// field. Only the pool-came-back-full leg separates the two cases, so this
     /// reddens if `saturated` is ever weakened to "results < top_k".
     #[test]
     fn a_short_but_complete_answer_carries_no_pool_disclosure() {
-        let project = saturating_pool_project(3, true);
+        let project = saturating_pool_project(3, &[("widget", 0)]);
         let server = indexed_server(&project);
         let out = server
             .tool_semantic_search(&json!({
@@ -1476,7 +1672,7 @@ mod tests {
     /// the accounting risk the audit named before the fix existed (§15).
     #[test]
     fn saturation_is_measured_against_the_pool_that_produced_the_answer() {
-        let project = saturating_pool_project(120, false);
+        let project = saturating_pool_project(120, &[("carrier_box", 80)]);
         let server = indexed_server(&project);
         let out = server
             .tool_semantic_search(&json!({

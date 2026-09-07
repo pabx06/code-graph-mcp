@@ -14,7 +14,6 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Us
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 // Hook cooldown flags + the restart notice go under cgTmpDir() (a code-graph-mcp/
 // subdir of os.tmpdir()), NOT bare os.tmpdir(): Claude Code overrides $TMPDIR to
 // ~/.claude/tmp/, so bare-tmp flags interleave with transcript captures —
