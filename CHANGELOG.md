@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.140.0
+
+**Upgrading:** four behaviours change for a caller who was relying on the old
+one. `refs <symbol> --file <path>` now REFUSES a file holding two definitions of
+that name — exit 1 with `{error, suggestions}` instead of exit 0 with a merged
+`{symbol, total_references, by_relation, references}`; pass `--node-id` (the
+suggestions carry them) to pick one. `show --refs` and `show --impact` now exit
+non-zero when the underlying query fails, where they used to exit 0 reporting
+`called_by: []` and `Impact: LOW`. MCP `find_references` re-words its same-file
+ambiguity `error` and now caps `suggestions` at 5, where it was unbounded — an
+existing key's value, not an addition. And `uninstall` without `--unadopt-all`
+no longer deletes `~/.cache/code-graph` in full: `adopted-projects.json`
+survives, so the directory it used to remove now holds one file. If you match on
+any of those, pin `0.139.0`.
+
+Everything else added here is additive: `callers_truncated` /
+`callers_truncated_note` on the three impact surfaces, and `node_id_renumbered`
+/ `node_id_renumbered_note` / `node_id_now` on `find_references` and
+`find_similar_code`. Each appears only on the event it describes; an answer that
+was complete and an id that is still valid are byte-identical to before.
+
+### `refs` could answer with a different symbol's references
+
+`nodes.id` is a bare `INTEGER PRIMARY KEY` — a rowid alias with no
+AUTOINCREMENT. An incremental re-index deletes a file's rows and re-inserts
+them, and SQLite then hands out `max(rowid) + 1`, so ids freed by the delete are
+REUSED. Both reference surfaces resolved their target ids, ran the query-time
+freshness refresh, and then re-ran the query with the SAME ids. When the refresh
+re-indexed the file those ids lived in, they no longer named the symbol the
+caller asked about — and the envelope still carried that symbol's name.
+
+Reproduced end to end on a two-function file: after inserting two functions
+above `helper`, `refs helper --json` returned `"symbol": "helper"` with a
+reference list belonging to `zeta_a`. A rename audit that trusts it renames the
+wrong call sites, and nothing in the output says so. `show --node-id` has
+re-resolved by identity since the same defect was found there; `refs` and
+`find_references` were the surfaces that had not.
+
+The CLI now re-finds its targets after the refresh — by identity for
+`--node-id`, by the settled name otherwise — and re-runs the ambiguity gate,
+because a re-index can also ADD a same-name definition. The MCP fix sits one
+layer up, in the result-set refresh itself: that wrapper re-dispatches the tool
+with the caller's ORIGINAL arguments, so it captures the node's identity before
+refreshing anything, rewrites `node_id` for the re-run, and keeps the pre-refresh
+answer when the symbol is gone rather than answering about whatever inherited
+the id. `find_similar_code(node_id)` is covered by the same change.
+
+### One traversal, two stories
+
+`callgraph <symbol> --direction callers` reported `limit_hit: true` when its
+recursive query stopped at the 200-row limit. `impact <symbol>` ran the same
+traversal and published the result as a total. `risk`, `affected_files` and the
+covering-test list are all computed from that set, so a symbol whose test
+callers eat the quota can report a lower risk than it has, with no key saying
+the number is a floor.
+
+The truncation flags now travel with the callers, and all three impact surfaces
+disclose them: CLI `impact`, CLI `show --impact`, and MCP `get_ast_node` with
+`include_impact`. Leaving the third silent would have recreated the split one
+layer down.
+
+### A database error is not a low-risk verdict
+
+`show --refs` and `show --impact` read their edge data through
+`unwrap_or_default()`. A failed query therefore arrived as an empty set — which
+the impact classifier renders as `Impact: LOW`, and the refs arm as
+`called_by: []`, both on exit 0. A database error came back as a safety
+endorsement. `impact` has run the identical query with `?` since the same hazard
+was fixed on its typo path.
+
+### `uninstall` deleted the registry it then told you to use
+
+Without `--unadopt-all`, `uninstall` removed `~/.cache/code-graph` wholesale —
+`adopted-projects.json` with it — and then printed "Clean all at once: re-run
+with --unadopt-all". The second run read an absent registry, reported nothing to
+clean, and every other repository kept its managed `CLAUDE.md` block with
+nothing left that knew where they were. The preserve-the-registry helper this
+needed already existed, and its own comment claimed `uninstall` routed through
+it. It did not.
+
+### Two stretches of hook time nobody was paying for
+
+`user-prompt-context.js` armed a 5-second UserPromptSubmit deadline on its first
+line and then never consulted it: the child ran on a hard-coded 3 seconds. And
+`findBinary()` — the first thing every hook does — version-gates up to six
+candidate binaries by running each one, at a 5-second default apiece, before any
+budget had been read. On a cold cache (first install, a version bump, after the
+updater clears the cache) that is most of a hook's allowance spent before the
+hook starts, and the user sees a hook error on their own prompt.
+
+Both now spend what is left of the budget, re-read per candidate, floored so a
+probe is never skipped outright and never handed `timeout: 0` (which node reads
+as no timeout at all). With no deadline armed — `doctor`, the statusline, the
+launcher, the CLI — the defaults are unchanged.
+
+### Not covered
+
+`refresh_result_set` re-dispatches with the caller's original arguments for
+every tool; only `node_id` is rewritten. `incremental-index.js` still runs its
+child on a hard-coded 8 seconds inside a 10-second budget. The JS "circular
+dependency" the metrics script reports remains a detector false positive —
+`require()` inside comments read as real edges.
+
 ## 0.139.0
 
 **Upgrading:** five things can change what your tooling reads.
