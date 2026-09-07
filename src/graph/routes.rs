@@ -123,6 +123,89 @@ mod tests {
     use super::*;
     use crate::storage::queries::helpers::test_db;
 
+    // Coverage owed from the round that added `RouteCallers` (2026-09-07): the
+    // `(true, true)` cause arm and the empty-callers early return were both
+    // written and never executed. Neither is reachable from a CLI surface today
+    // — `impact --depth` is clamped in `clamp_arg`, so `depth_capped` cannot
+    // co-occur with `limit_hit` there — and that is precisely why they are unit
+    // tests: this struct is the SHARED layer, and the comment above the early
+    // return says the next caller may not clamp its arguments.
+    fn route_callers(limit_hit: bool, depth_capped: bool) -> RouteCallers {
+        RouteCallers {
+            callers: vec![],
+            limit_hit,
+            depth_capped,
+        }
+    }
+
+    #[test]
+    fn truncation_note_names_both_causes_when_both_fired() {
+        let note = route_callers(true, true)
+            .truncation_note()
+            .expect("both flags set → truncated");
+        assert!(
+            note.contains("row traversal limit") && note.contains("depth cap"),
+            "a note that names one of two causes sends the reader to the wrong \
+             knob: {note}"
+        );
+    }
+
+    #[test]
+    fn truncation_note_names_exactly_one_cause_when_one_fired() {
+        let rows = route_callers(true, false).truncation_note().unwrap();
+        assert!(
+            rows.contains("row traversal limit") && !rows.contains("depth cap"),
+            "{rows}"
+        );
+        let depth = route_callers(false, true).truncation_note().unwrap();
+        assert!(
+            depth.contains("depth cap") && !depth.contains("row traversal limit"),
+            "{depth}"
+        );
+    }
+
+    #[test]
+    fn truncation_note_is_silent_when_nothing_was_cut() {
+        // The negative control for the three above, and the guard on the
+        // `unreachable!()` in the (false, false) arm: `truncated()` must return
+        // first, so that arm stays unreachable rather than panicking a user.
+        assert!(route_callers(false, false).truncation_note().is_none());
+    }
+
+    #[test]
+    fn an_empty_traversal_still_reports_a_complete_answer_as_complete() {
+        // Measured while writing this: the empty-nodes early return does NOT
+        // fire for "a symbol with no callers" — the traversal returns the target
+        // itself as a row, so an existing symbol always yields at least one. Its
+        // real trigger is a symbol that does not exist at all. The flags are
+        // still read off the traversal there, which is what keeps a capped
+        // request from being reported as a complete zero.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('e.ts', 'h', 0, 'typescript', 0)", []).unwrap();
+        conn.execute("INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content) VALUES (1, 'function', 'lonely', 'lonely', 1, 2, 'fn lonely()')", []).unwrap();
+
+        let missing = get_callers_with_route_info(conn, "no_such_symbol", None, 3, 0).unwrap();
+        assert!(
+            missing.callers.is_empty(),
+            "an absent symbol has no callers"
+        );
+        assert!(
+            !missing.truncated(),
+            "nothing was cut, so the empty set is a real total, not a floor"
+        );
+
+        // The contrast that names the trigger: an existing symbol with zero
+        // inbound edges takes the OTHER path and still answers with itself.
+        let present = get_callers_with_route_info(conn, "lonely", None, 3, 0).unwrap();
+        assert_eq!(
+            present.callers.len(),
+            1,
+            "the traversal seeds itself: {:?}",
+            present.callers.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_callers_with_routes() {
         let (db, _tmp) = test_db();

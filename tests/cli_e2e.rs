@@ -11234,3 +11234,88 @@ fn refs_with_file_re_gates_ambiguity_after_the_refresh() {
         "{first}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Coverage owed from the round that added `RefsTarget` (2026-09-07): the
+// `Orphan` arm was written and never executed.
+//
+// Reaching it takes BOTH halves, which is why the first version of this test was
+// vacuous — it orphaned the node and passed with the arm replaced by
+// `unreachable!()`. `RefsTarget::resolve` only runs when the query-time refresh
+// actually re-indexed something (`outcome.any_changed`), so the fixture needs a
+// target whose `files` row is gone AND a referencing file that is stale on disk.
+// ---------------------------------------------------------------------------
+#[test]
+fn refs_by_node_id_keeps_its_id_when_the_target_has_no_file_row_to_re_resolve_by() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("a.rs"),
+        "pub fn orphan_target() -> i32 {\n    7\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("b.rs"),
+        "use crate::a::orphan_target;\npub fn orphan_caller() -> i32 {\n    orphan_target()\n}\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (out, err, code) = run_cli(&project, &["show", "orphan_target", "--json"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let node_id = v[0]["node_id"]
+        .as_i64()
+        .expect("show must publish a node_id");
+
+    // Precondition: the joined lookup works and the reference is found, so the
+    // change below is the missing `files` row and not a fixture that never
+    // resolved.
+    let (out, err, code) = run_cli(
+        &project,
+        &["refs", "--node-id", &node_id.to_string(), "--json"],
+    );
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let before: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(before["symbol"].as_str(), Some("orphan_target"));
+    assert!(
+        before["total_references"].as_u64().unwrap_or(0) >= 1,
+        "fixture precondition: b.rs must reference the target: {before}"
+    );
+
+    // Half one: orphan the TARGET only. `nodes` survives (foreign_keys off), so
+    // the unjoined lookup still finds it and the joined one does not.
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    db.conn()
+        .execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM files WHERE path = 'a.rs';")
+        .unwrap();
+    drop(db);
+
+    // Half two: make the REFERENCING file stale on disk, so the query-time
+    // refresh re-indexes it and `RefsTarget::resolve` is actually called.
+    std::fs::write(
+        project.path().join("b.rs"),
+        "use crate::a::orphan_target;\n// touched\npub fn orphan_caller() -> i32 {\n    orphan_target()\n}\n",
+    )
+    .unwrap();
+
+    let (out, err, code) = run_cli(
+        &project,
+        &["refs", "--node-id", &node_id.to_string(), "--json"],
+    );
+    assert_eq!(
+        code, 0,
+        "an orphaned target has no identity to re-resolve by, so the original id \
+         is kept rather than the answer being dropped; stdout:\n{out}\nstderr:\n{err}"
+    );
+    let after: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        after["symbol"].as_str(),
+        Some("orphan_target"),
+        "the answer must still be about the symbol the id named: {after}"
+    );
+}
