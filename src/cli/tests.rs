@@ -2112,6 +2112,37 @@ fn test_normalize_grep_argv_attached_context() {
 }
 
 #[test]
+fn annotation_failure_advice_does_not_prescribe_a_rebuild_for_a_transient_lock() {
+    use crate::cli::grep::annotation_failure_advice;
+    // `rebuild-index --confirm` is a destructive drop-and-rebuild. The message it
+    // rides on also fires when a concurrent indexer holds the database — busy_timeout
+    // is 5 s — and telling that user to rebuild is the worst available advice.
+    for locked in [
+        "database is locked",
+        "database table is locked: nodes",
+        "Error code 5: The database file is locked (database is busy)",
+    ] {
+        let advice = annotation_failure_advice(locked);
+        assert!(
+            advice.contains("retry"),
+            "a transient lock must be told to wait, not to rebuild: {advice}"
+        );
+        assert!(
+            !advice.contains("rebuild-index"),
+            "and must not carry destructive advice: {advice}"
+        );
+    }
+
+    // The control: a real schema fault is exactly when the rebuild IS the answer.
+    let advice = annotation_failure_advice("no such column: n.param_types in SELECT …");
+    assert!(
+        advice.contains("rebuild-index --confirm"),
+        "a structural failure still names the repair: {advice}"
+    );
+    assert!(!advice.contains("retry"), "{advice}");
+}
+
+#[test]
 fn test_first_unsupported_grep_flag() {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     // Common grep flags we don't implement are flagged (would otherwise be

@@ -5,9 +5,6 @@ const path = require('path');
 const os = require('os');
 const { claudeHome } = require('./claude-config');
 const { hidden } = require('./proc-opts');
-// install-lock.js requires only fs/path, so this cannot re-enter lifecycle.js —
-// the module-load order pinned by lifecycle.test.js stays as it is.
-const { acquireLock } = require('./install-lock');
 
 const PLUGIN_ID = 'code-graph-mcp@code-graph-mcp';
 const OLD_PLUGIN_IDS = [
@@ -1975,61 +1972,7 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
 // here now. So the preservation belongs here, at the wipe, rather than at each
 // caller — the same "fix it at the shared layer, not per surface" the
 // <external> query filter needed.
-// Where the registry is parked while CACHE_DIR is wiped, and the lock that keeps
-// two of these from interleaving. Both live in CACHE_DIR's PARENT: a sibling of
-// the registry would be deleted by the very rmSync it is being protected from.
-// The stash name is FIXED, not pid-suffixed: a pid-unique name that outlives a
-// SIGKILL'd process is unrecoverable residue nobody looks for, whereas a fixed
-// one is picked up by the recovery step below when the live registry is gone.
-// When the registry is NOT gone — a project re-adopted after the kill — the
-// orphan is left alone and reported rather than overwritten; the two lists can
-// disagree and only the user can say which projects still carry a block.
-const REGISTRY_STASH = path.join(path.dirname(CACHE_DIR), '.code-graph-adopted-projects.stash');
-const RESIDUE_LOCK = path.join(path.dirname(CACHE_DIR), '.code-graph-residue.lock');
-
 function removeCacheResidue() {
-  // Serialize. A pre-ship review demonstrated the interleaving: process A
-  // renames the registry aside, B reads "nothing to preserve" from the now-empty
-  // path, A restores, B's rmSync deletes what A just put back — both return
-  // true, nothing on stderr, registry gone. Two Claude Code sessions starting at
-  // once is an ordinary event, so a stash alone is not enough; the read and the
-  // wipe have to be one critical section.
-  //
-  // `acquireLock` is the primitive auto-update.js already uses, with stale
-  // reclaim built in. Contended → the other process is doing this work, so
-  // return success without touching anything rather than racing it. That is
-  // honest: the residue IS being reclaimed, just not by us.
-  const lock = acquireLock(RESIDUE_LOCK);
-  if (!lock) {
-    // `acquireLock` returns null for two very different reasons and the first
-    // version of this treated them alike, which is worse than having no lock:
-    //
-    //   * the file EXISTS — a live peer holds it (or a fresh one is wedged until
-    //     `STALE_MS` lets it be reclaimed). Skipping is correct; the peer is
-    //     doing this work, and session-init calls us again next session.
-    //   * the file does NOT exist — we could not create it at all (read-only
-    //     ~/.cache, ENOSPC). There is no peer to race, and returning early left
-    //     the ~40MB binary in place while reporting success. Do the work
-    //     unlocked: that is exactly the behaviour that shipped before the lock
-    //     existed, so this branch can never be worse than its predecessor.
-    // `statSync().isFile()`, not `existsSync`: anything else occupying that path
-    // — a directory, most obviously — also makes `openSync(…,'wx')` fail, and
-    // `existsSync` answers true for it. A first version of this asked only
-    // whether something was there, so an uncreatable lock was still read as a
-    // peer and the reclaim was still skipped. Only a lock FILE means a peer.
-    let heldByPeer = false;
-    try { heldByPeer = fs.statSync(RESIDUE_LOCK).isFile(); } catch { /* absent */ }
-    if (heldByPeer) return true;
-    return removeCacheResidueLocked();
-  }
-  try {
-    return removeCacheResidueLocked();
-  } finally {
-    lock.release();
-  }
-}
-
-function removeCacheResidueLocked() {
   // Path comes from adopt.js rather than a second spelling of the basename —
   // a literal here would silently stop matching the day adopt.js renames it,
   // and the failure mode is exactly the data loss this guard exists to stop.
@@ -2041,18 +1984,6 @@ function removeCacheResidueLocked() {
   let registry = null;
   try {
     registryPath = require('./adopt').adoptedRegistryFile();
-    // Recover from a predecessor killed between its rename and its restore. The
-    // bytes are still on disk under the stash name and NOTHING else looks there,
-    // so without this step every reader — including `uninstall --unadopt-all` —
-    // sees the registry as absent and the managed blocks are stranded for good.
-    // Only when the real path is empty: a live registry always wins over a stale
-    // stash.
-    if (fs.existsSync(REGISTRY_STASH) && !fs.existsSync(registryPath)) {
-      try {
-        fs.mkdirSync(path.dirname(registryPath), { recursive: true });
-        fs.renameSync(REGISTRY_STASH, registryPath);
-      } catch { /* leave it parked; the next run tries again */ }
-    }
     const raw = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
     if (raw) {
       let parsed = null;
@@ -2068,91 +1999,15 @@ function removeCacheResidueLocked() {
       if (!usable || !Array.isArray(parsed) || parsed.length) registry = raw;
     }
   } catch { /* POSIX-only helper or an unreadable path — nothing to preserve */ }
-
-  // JS-33: move it ASIDE before the wipe rather than holding it only in memory.
-  // Read → destroy → write-back makes the restore the single point of failure
-  // for the whole registry: one ENOSPC/EACCES on that last write and the only
-  // record of which repos carry a managed block is gone, with `true` returned.
-  // A rename inside ~/.cache leaves the bytes on disk under a name the wipe
-  // cannot reach, so every failure after it is recoverable. The stash must live
-  // OUTSIDE CACHE_DIR — a sibling name in the same directory would be deleted by
-  // the very rmSync it is protecting the file from — and the rename is
-  // same-filesystem, so it is atomic and carries the file's mode with it.
-  let stashPath = null;
-  if (registryPath && registry) {
-    // Never rename ONTO an existing stash. The recovery above only fires when
-    // the live registry is absent, so a project re-adopted after a killed run
-    // leaves both files present — and renaming the live one over the orphan
-    // destroyed bytes that named projects the current registry does not. Keep
-    // both: fall back to the in-memory path this run and say where the orphan
-    // is, once, so it stops being invisible.
-    let orphan = false;
-    try { orphan = fs.statSync(REGISTRY_STASH).isFile(); } catch { /* absent */ }
-    if (orphan) {
-      try {
-        process.stderr.write(
-          `[code-graph] An earlier run left an adopted-projects registry at ` +
-          `${REGISTRY_STASH}. It names projects the current registry may not; ` +
-          'merge it by hand, or delete it once you have checked.\n',
-        );
-      } catch { /* stderr gone — the file still survives, which is the point */ }
-    }
-    try {
-      if (orphan) throw new Error('orphan stash present — not clobbering it');
-      fs.renameSync(registryPath, REGISTRY_STASH);
-      stashPath = REGISTRY_STASH;
-    } catch {
-      // Rename unavailable (a mount boundary, a read-only parent). Fall through
-      // holding `registry` in memory: that is exactly the old behaviour, so this
-      // path is never worse than what it replaces.
-      stashPath = null;
-    }
-  }
-
-  // Put the registry back however we saved it. Called on the failure path too:
-  // a `false` return that silently leaves the file parked under a dot-name
-  // would be a second, quieter version of the loss this is fixing.
-  const restoreRegistry = () => {
-    // Nothing to put back: return BEFORE the mkdirSync below, or a run with no
-    // registry to preserve re-creates CACHE_DIR empty and hands the user back
-    // the residue this function just reclaimed.
-    if (!registryPath || (!stashPath && !registry)) return;
-    try {
-      fs.mkdirSync(path.dirname(registryPath), { recursive: true });
-      if (stashPath) fs.renameSync(stashPath, registryPath);
-      else if (registry) fs.writeFileSync(registryPath, registry);
-      return;
-    } catch { /* fall through to the report below */ }
-    // The restore failed. Say so on BOTH paths, not just the stashed one: when
-    // the rename-aside was unavailable and the in-memory write-back then failed,
-    // the registry is gone and this used to return true in silence — the exact
-    // outcome this change was written to prevent, surviving in the branch nobody
-    // looked at.
-    try {
-      if (stashPath && fs.existsSync(stashPath)) {
-        process.stderr.write(
-          `[code-graph] Could not restore ${registryPath}; the adopted-projects ` +
-          `registry is preserved at ${stashPath} — it is picked up automatically ` +
-          'on the next session, or move it back by hand before `--unadopt-all`.\n',
-        );
-      } else {
-        process.stderr.write(
-          `[code-graph] Lost ${registryPath} while reclaiming the cache: the ` +
-          'record of which projects carry a code-graph block in CLAUDE.md is ' +
-          'gone. `uninstall --unadopt-all` will report nothing to clean; remove ' +
-          'any remaining blocks by hand.\n',
-        );
-      }
-    } catch { /* stderr gone too — nothing further to try */ }
-  };
-
   try {
     fs.rmSync(CACHE_DIR, { recursive: true, force: true });
-  } catch {
-    restoreRegistry();
-    return false;
+  } catch { return false; }
+  if (registryPath && registry) {
+    try {
+      fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+      fs.writeFileSync(registryPath, registry);
+    } catch { /* best-effort: the binary is still reclaimed */ }
   }
-  restoreRegistry();
   return true;
 }
 

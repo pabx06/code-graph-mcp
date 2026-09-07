@@ -147,6 +147,22 @@ pub(crate) fn split_attached_context(tok: &str) -> Option<(String, String)> {
     ))
 }
 
+/// What to tell the user after an AST-annotation lookup failed.
+///
+/// Split out so both arms are testable: a blanket `rebuild-index --confirm` is a
+/// destructive drop-and-rebuild, and this message also fires on a transient
+/// `database is locked` from a concurrent indexer (`busy_timeout` is 5 s), where
+/// the right move is to wait. Reads the FULL error, never the display-truncated
+/// copy — a long rusqlite message inlines the whole statement, so "locked" can
+/// fall past the 160-char cut.
+pub(crate) fn annotation_failure_advice(err: &str) -> &'static str {
+    if err.contains("locked") || err.contains("busy") {
+        " This reads like a concurrent indexer holding the database — retry before doing anything else."
+    } else {
+        " If it persists: code-graph-mcp rebuild-index --confirm"
+    }
+}
+
 /// Return the first single-dash short-flag cluster (pre-`--`) that contains a
 /// flag the `grep` subcommand does not implement — e.g. `-v`, `-c`, `-o`, `-e`,
 /// `-P`. The pattern positional's `allow_hyphen_values` would otherwise swallow
@@ -1013,10 +1029,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // blanket `rebuild-index --confirm` (a destructive drop-and-rebuild) is
         // the wrong advice for a transient `database is locked` from a concurrent
         // indexer, which this same message fires on: busy_timeout is 5 s.
-        // From the FULL error, not `reason`: that is truncated at 160 chars, so a
-        // long rusqlite message whose "database is locked" falls past the cut
-        // would otherwise be handed the destructive advice.
-        let transient = err.contains("locked") || err.contains("busy");
+        let advice = annotation_failure_advice(err);
         eprintln!(
             "[code-graph] AST annotation unavailable for {} of {} file(s) with matches — \
              the index query failed ({}: {}). Hits in those file(s) are plain grep \
@@ -1025,11 +1038,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             annotated_file_count,
             file,
             reason,
-            if transient {
-                " This reads like a concurrent indexer holding the database — retry before doing anything else."
-            } else {
-                " If it persists: code-graph-mcp rebuild-index --confirm"
-            }
+            advice
         );
     }
     if ctx.is_none() {

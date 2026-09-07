@@ -553,11 +553,17 @@ fn wants_subcommand_help(args: &[String]) -> bool {
 
 /// Refuse a flag-taking-no-flags subcommand any argument beyond `--help`.
 ///
-/// `adopt` / `unadopt` are JS-dispatched and `adopt.js` reads only `argv[2]` as
-/// the action — it parses no flags at all, so anything else was silently
-/// discarded and the command ran. `code-graph-mcp adopt --helpp` therefore WROTE
-/// the user's CLAUDE.md, one keystroke from the side effect the `--help`
-/// interception exists to prevent.
+/// `adopt` / `unadopt` are JS-dispatched, and `adopt.js` used to read only
+/// `argv[2]` as the action, parsing no flags at all — so anything else was
+/// silently discarded and the command ran. `code-graph-mcp adopt --helpp`
+/// therefore WROTE the user's CLAUDE.md, one keystroke from the side effect the
+/// `--help` interception exists to prevent.
+///
+/// `adopt.js` now refuses any argv it does not recognise (its `require.main`
+/// arm accepts `[]` or `["unadopt"]` and nothing else), because SessionStart
+/// hands users that entry point directly. This guard stays: it is the layer
+/// that turns a refusal into `--help` output rather than exit 2, and it keeps
+/// the binary's contract independent of the script's.
 ///
 /// Fifth site of this idiom, found by the pre-tag review after four others were
 /// closed: doctor.js, `lifecycle.js doctor`, main.rs's own doctor arm, and
