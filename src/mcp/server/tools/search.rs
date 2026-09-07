@@ -437,6 +437,11 @@ impl McpServer {
         // exhausted, or that lost nothing to filtering, retrieves exactly as
         // before — the retrieval benchmark path is untouched.
         let retry_fetch = crate::domain::search_retry_fetch_count(fetch_count);
+        // Did the WIDEST fetch we performed come back full? That, not the pool the
+        // answer happened to come from, is the question "were there rows nobody
+        // looked at". Tracked separately so the reported numbers can stay coupled
+        // to one pool while the flag still knows about the other fetch.
+        let mut widest_fetch_was_full = fused.len() >= fetch_count as usize;
         if candidates.len() < top_k as usize
             && fused.len() >= fetch_count as usize
             && (skipped_noise_count + dropped_by_filter) > 0
@@ -445,23 +450,29 @@ impl McpServer {
             let (fts_retry, vec_retry, _, _) = retrieve(retry_fetch)?;
             let fused_retry = fuse(&fts_retry, &vec_retry, retry_fetch as usize);
             let (retry_candidates, retry_dropped, retry_skipped) = build_candidates(&fused_retry)?;
-            // Adopt the retry WHOLESALE, on `>=` rather than `>`, so every number
-            // the response reports comes from one pool.
+            widest_fetch_was_full = fused_retry.len() >= retry_fetch as usize;
+            // Adoption stays on a STRICT improvement, and all five values move
+            // together. Three review rounds converged here, two of them on my own
+            // wrong fixes:
             //
-            // Two rounds of review landed here. Recording the pool size only on a
-            // strict improvement measured the superseded FIRST pool: at top_k=20
-            // on a 421-row index it announced "the candidate pool (320 rows) came
-            // back full" while the retry had just read all 421 and found nothing
-            // below any cut. Moving the size alone then split the envelope — the
-            // size came from the retry pool and the drop counts from the first, so
-            // a 400-row pool reported 99 rows dropped and the arithmetic did not
-            // close (rounds 2 and 3).
+            //   - recording the pool size only on adoption while judging fullness
+            //     on it announced "the candidate pool (320 rows) came back full"
+            //     at top_k=20 on a 421-row index the retry had just read out;
+            //   - moving the size alone split the envelope, so a 400-row pool
+            //     reported 99 rows dropped and the numbers did not add up;
+            //   - relaxing adoption to `>=` to re-couple them changed RESULT
+            //     SELECTION. `weighted_rrf_fusion` at a wider cap is neither a
+            //     superset nor order-preserving once the vector channel is
+            //     non-empty: a row in both channels just past the first cut
+            //     outscores a single-channel row and displaces it, and `max_rrf`
+            //     — the divisor of every `base_score` — changes with the pool. The
+            //     default build has no vector channel, so the whole test suite is
+            //     blind to it, while npm ships `embed-model`. Refuted by probe
+            //     tests against the real fusion function (round 4).
             //
-            // `>=` is safe because the retry pool is a superset: it fetches the
-            // same query at a strictly larger cap, so it cannot yield fewer
-            // survivors, and on equality the two candidate sets hold the same rows
-            // in the same rank order.
-            if retry_candidates.len() >= candidates.len() {
+            // So the answer's pool owns every number reported beside it, and
+            // `widest_fetch_was_full` above carries what the other fetch learned.
+            if retry_candidates.len() > candidates.len() {
                 candidates = retry_candidates;
                 dropped_by_filter = retry_dropped;
                 skipped_noise_count = retry_skipped;
@@ -497,6 +508,7 @@ impl McpServer {
             pool_len: final_pool_len,
             saturated: candidates.len() < top_k as usize
                 && final_pool_len >= final_fetch_count as usize
+                && widest_fetch_was_full
                 && (dropped_by_filter + skipped_noise_count) > 0,
             top_k,
         };
@@ -804,8 +816,11 @@ impl PoolShortfall {
     /// Kept short on purpose: `truncate_large_strings` (see `server/helpers.rs`'s
     /// `TRUNCATE_MIN_LEN = 200`) cuts longer strings mid-sentence on a large
     /// compact response, and an advisory that ends in "…" advises nothing.
-    /// Measured at 161 bytes after `trim()` for a four-digit pool size — an
-    /// earlier version of this line claimed 168 and had never been counted.
+    /// Measured after `trim()` at the largest reachable pool size (1600, the
+    /// filtered fetch at the top_k ceiling): 129 bytes on the ordinary arm and
+    /// 133 on the at-ceiling arm. This line has now been wrong twice — it claimed
+    /// 168 uncounted, then 161, which was the length of a clause deleted in the
+    /// same commit that kept the number. Re-count it when the wording changes.
     ///
     /// That margin protects the standalone `pool_saturated_note` only. On the
     /// two empty-result arms this sentence is APPENDED into `hint`, and the
@@ -1204,15 +1219,9 @@ mod tests {
             text.contains("test symbols") && text.contains("placeholder"),
             "the empty response must name the always-on filter that consumed the candidates; got: {out}"
         );
-        // 30, not the 20 this asserted before: the fixture holds thirty
-        // `widgetonly_*` helpers, and the count now covers the pool actually
-        // examined rather than the first fetch's cut of it. The retry reads all
-        // thirty and is adopted, so the sentence and the index agree (pre-ship
-        // review round 3 — the two numbers used to come from different pools).
         assert!(
-            text.contains("30"),
-            "and how many candidates it consumed — every one that exists, not the \
-             first fetch's cut; got: {out}"
+            text.contains("20"),
+            "and how many candidates it consumed; got: {out}"
         );
         assert!(
             !text.contains("check spelling"),
@@ -1532,8 +1541,9 @@ mod tests {
             "the retry recovered matches here, so widening is the remedy that WOULD \
              help and the note must say so; got {out}"
         );
-        // The note DOES contain the word "broadening" — in the clause saying it
-        // will not help. What must never appear is the instruction itself.
+        // The note speaks only about the pool now; the filter remedy lives on the
+        // arm that owns it. What must never appear here is the instruction to
+        // broaden a filter this note knows nothing about.
         assert!(
             !note.contains("Broaden or clear the filter"),
             "broadening the filter is the WRONG fix here — the filter is not what \
@@ -1694,15 +1704,22 @@ mod tests {
     ///
     /// Round 2 moved `pool_len` to the retry's pool while leaving the drop counts
     /// on the first pool's, so a 400-row pool reported 99 rows dropped by the
-    /// filter — a caller could not tell where the other 300 went. On a saturated
-    /// answer the identity is exact, because every fetched row is either returned
-    /// or dropped by one of the two filters:
+    /// filter — a caller could not tell where the other 300 went.
+    ///
+    /// On a saturated PLAIN answer the identity below holds, because every
+    /// fetched row is either returned or removed by one of the two filters:
     ///
     ///     pool_len == results + dropped_by_filter + skipped_noise
     ///
-    /// Asserting the identity rather than the three literals is deliberate: it
-    /// stays true if the fixture's rank order shifts, and it fails for the right
-    /// reason if any one number is ever sourced from a different fetch.
+    /// It is NOT exact on the compressed arms, where `results` can be one entry
+    /// per file or per directory rather than per node, nor in the presence of an
+    /// orphan row, which `build_candidates` drops into neither counter. Asserted
+    /// on the plain arm only, and said here rather than left for a maintainer to
+    /// discover (round 4).
+    ///
+    /// Asserting the identity rather than three literals is deliberate: it stays
+    /// true if the fixture's rank order shifts, and fails for the right reason if
+    /// any one number is ever sourced from a different fetch.
     #[test]
     fn every_disclosed_number_describes_the_same_pool() {
         let project = saturating_pool_project(420, &[("widget", 0)]);
@@ -1771,6 +1788,41 @@ mod tests {
              must survive — otherwise this test would pass on a note that never \
              advises anything; got {:?}",
             below.exhaustion_note()
+        );
+    }
+
+    /// The WIRING for the test above. Building `PoolShortfall` by hand leaves the
+    /// field's provenance untested: replacing `top_k` with a literal `1` in the
+    /// struct expression disabled the ceiling arm for every real caller and the
+    /// entire suite stayed green (round 4). This drives the tool.
+    ///
+    /// `top_k=100` is the clamp ceiling, so `fetch_count` is 1600 and
+    /// `search_retry_fetch_count` caps below it — no retry, and the pool is full
+    /// only because the fixture has 1601 matching rows.
+    #[test]
+    fn at_the_ceiling_the_tool_itself_stops_advising_a_bigger_top_k() {
+        let project = saturating_pool_project(1600, &[("widget", 0)]);
+        let server = indexed_server(&project);
+        let out = server
+            .tool_semantic_search(&json!({
+                "query": "widget", "language": "python", "top_k": 100, "skip_indexing": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out["pool_saturated"],
+            json!(true),
+            "fixture precondition: 1601 matching rows against a 1600-row fetch must \
+             leave the pool full and the answer short; got {out}"
+        );
+        let note = out["pool_saturated_note"].as_str().unwrap_or_default();
+        assert!(
+            !note.contains("Raise top_k"),
+            "top_k=100 IS the maximum — `top_k: 200` is clamped back to it, so this \
+             advice returns the same answer forever; got {out}"
+        );
+        assert!(
+            note.contains("Narrow the query"),
+            "and the remedy that still exists must be named; got {out}"
         );
     }
 
