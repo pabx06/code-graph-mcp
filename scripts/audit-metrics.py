@@ -339,7 +339,13 @@ def rust_module_graph(rust_src_files):
 
 
 REQUIRE_RE = re.compile(r"""require\(\s*['"](\.{1,2}/[^'"]+)['"]\s*\)""")
-REQUIRE_MAIN_RE = re.compile(r"\brequire\.main\s*===\s*module\b")
+# Anchored at the start of the line, and the `if (` is required. A bare
+# `\brequire.main === module\b` matched ANYWHERE on the line, which made rule 2
+# below able to drop a live require whose line merely MENTIONED the guard in a
+# trailing comment — and, because braces were then counted from that line,
+# everything after it too. Reviewed and measured: no such shape exists in the
+# tree today, but the rule advertised an invariant it did not have.
+REQUIRE_MAIN_RE = re.compile(r"^\s*if\s*\(\s*require\.main\s*===\s*module\s*\)")
 
 
 def js_import_lines(lines):
@@ -361,8 +367,15 @@ def js_import_lines(lines):
        in this repo three days ago.
     2. Skip the body of an `if (require.main === module)` arm. Those run only
        when the file is executed as a script, never on import, so they cannot
-       participate in an import cycle. Braces are counted from the guard line;
-       a brace-less single-line arm is skipped as just that one line.
+       participate in an import cycle. The guard must OPEN the line — see
+       REQUIRE_MAIN_RE — so a line that merely mentions `require.main` in a
+       trailing comment keeps its require. Braces are counted from the guard
+       line; a brace-less single-line arm is skipped as just that one line.
+
+    Both rules are line-oriented and do not track string or regex literals, so
+    the honest statement of the invariant is: a line whose FIRST characters open
+    a comment, and a line that BEGINS an entry-point guard, cannot carry a live
+    top-level require. Anything else is kept.
     """
     out = []
     depth = None

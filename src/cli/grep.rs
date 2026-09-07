@@ -842,6 +842,15 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         stale_files = outcome.stale_paths;
     }
     let stale_count = stale_files.len();
+    // Denominator for the annotation-failure disclosure: how many distinct
+    // files the matches span. "unavailable for 1 file(s)" without it reads as
+    // though the whole run lost its annotations.
+    let annotated_file_count = {
+        let mut v: Vec<&str> = matches.iter().map(|m| m.file.as_str()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.len()
+    };
     let mut node_cache: std::collections::HashMap<String, Vec<queries::NodeResult>> =
         std::collections::HashMap::new();
     // SURF-33: this lookup used to fold a failed query into an empty node list,
@@ -852,7 +861,11 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     // grep's 0/1/2), and the matches themselves come from ripgrep and are still
     // correct — so the failure is recorded and disclosed after the output,
     // alongside the truncation and staleness notes that already live there.
-    let mut annotation_failures: Vec<(String, String)> = Vec::new();
+    // A RefCell, not a plain Vec: the OUTPUT arms have to read this while the
+    // closure below still holds it, because the disclosure has to be in-band on
+    // the JSON side (see the entry flag) and not only prose on stderr.
+    let annotation_failures: std::cell::RefCell<Vec<(String, String)>> =
+        std::cell::RefCell::new(Vec::new());
     let mut lookup_container =
         |file: &str, line: u64| -> Option<(String, String, i64, i64, bool)> {
             let ctx = ctx.as_ref()?;
@@ -862,7 +875,9 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                     Err(e) => {
                         // Cached as empty so a broken index costs one failed query
                         // per file, not one per matching line.
-                        annotation_failures.push((file.to_string(), e.to_string()));
+                        annotation_failures
+                            .borrow_mut()
+                            .push((file.to_string(), e.to_string()));
                         Vec::new()
                     }
                 };
@@ -907,6 +922,18 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
                     // This file hit the per-file cap — results for it are truncated.
                     if capped_set.contains(m.file.as_str()) {
                         entry["truncated"] = serde_json::json!(true);
+                    }
+                    // SURF-33, in-band half: a machine consumer cannot tell "this
+                    // line has no containing node" from "the lookup failed" by the
+                    // ABSENCE of `container`. `stale` and `truncated` are per-entry
+                    // flags for exactly that reason; a stderr-only disclosure left
+                    // `--json 2>/dev/null` unable to see it at all.
+                    if annotation_failures
+                        .borrow()
+                        .iter()
+                        .any(|(f, _)| f == &m.file)
+                    {
+                        entry["container_unavailable"] = serde_json::json!(true);
                     }
                 }
                 json_results.push(entry);
@@ -969,23 +996,37 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
             stale_count
         );
     }
-    if !annotation_failures.is_empty() {
+    if !annotation_failures.borrow().is_empty() {
         // Name one error: "the index query failed" without the reason is the
         // same dead end as the empty list this replaces. Capped, because
         // rusqlite renders a failed `prepare` with the entire statement inlined
         // and this goes to a terminal that just printed the user's matches.
-        let (file, err) = &annotation_failures[0];
+        let failures = annotation_failures.borrow();
+        let (file, err) = &failures[0];
         let reason: String = if err.chars().count() > 160 {
             format!("{}…", err.chars().take(160).collect::<String>())
         } else {
             err.clone()
         };
+        // Scope both halves. "Matches above are plain grep output" was false
+        // whenever 1 of N files failed — the other N-1 ARE annotated. And a
+        // blanket `rebuild-index --confirm` (a destructive drop-and-rebuild) is
+        // the wrong advice for a transient `database is locked` from a concurrent
+        // indexer, which this same message fires on: busy_timeout is 5 s.
+        let transient = reason.contains("locked") || reason.contains("busy");
         eprintln!(
-            "[code-graph] AST annotation unavailable for {} file(s) — the index query failed ({}: {}). \
-             Matches above are plain grep output. Run: code-graph-mcp rebuild-index --confirm",
-            annotation_failures.len(),
+            "[code-graph] AST annotation unavailable for {} of {} file(s) with matches — \
+             the index query failed ({}: {}). Hits in those file(s) are plain grep \
+             output; the rest are annotated as usual.{}",
+            failures.len(),
+            annotated_file_count,
             file,
-            reason
+            reason,
+            if transient {
+                " This reads like a concurrent indexer holding the database — retry before doing anything else."
+            } else {
+                " If it persists: code-graph-mcp rebuild-index --confirm"
+            }
         );
     }
     if ctx.is_none() {

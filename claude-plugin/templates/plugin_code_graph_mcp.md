@@ -51,9 +51,17 @@ type: reference
 > `code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`。
 >
 > **裸名字不在 PATH 上时**（纯 `/plugin install`，没跑过 `npm i -g`）：插件自己
-> 下载的那份在 `~/.cache/code-graph/bin/code-graph-mcp`，子命令完全相同；
-> `npm i -g @sdsrs/code-graph` 则把裸名字放上 PATH。下面所有 `code-graph-mcp …`
-> 的写法两种都适用（issue #41）。
+> 下载的那份在 `~/.cache/code-graph/bin/code-graph-mcp`，本文下面所有查询类子命令
+> （callgraph / impact / overview / show / search / grep / refs / similar / deps /
+> dead-code / trace）都能直接用它跑；`npm i -g @sdsrs/code-graph` 则把裸名字放上
+> PATH（issue #41）。
+>
+> **三个例外**：`doctor` / `adopt` / `unadopt` 是 JS 派发的——二进制会去自己旁边
+> 找 `claude-plugin/scripts/adopt.js`，而缓存目录里没有那个邻居，所以从缓存路径
+> 调它们会报 `adopt.js not found`。这三个直接跑脚本：
+> `node <插件目录>/claude-plugin/scripts/adopt.js unadopt`（SessionStart 的提示行
+> 会印出这台机器上的完整路径）。
+>
 > `grep` 是 drop-in 替代：`-F` 字面 / `-i` / `-w` / `-l` / `-c` 计数 / `-t <lang>` 按语言筛 /
 > `-g <glob>` 路径过滤 / `-A/-B/-C N` 上下文 / `-M N` 行宽上限（默认 512，防长行刷屏）/
 > 多路径 / `-m 0` 取消每文件上限，退出码兼容 grep（0/1/2），召回达 git-grep 级

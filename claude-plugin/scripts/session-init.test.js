@@ -353,9 +353,8 @@ test('an unrecorded adoption warns that uninstall will not clean this project', 
 // was exactly as unrunnable as the feature the user wanted out of. stderr is
 // per-machine and ephemeral, so unlike the CLAUDE.md block it may (and must)
 // name the path this install actually resolved.
-test('the adoption remedies name a binary this install can run', (t) => {
+test('the adoption remedies name a command this install can actually run', (t) => {
   const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
-  const findBinary = JSON.stringify(path.join(__dirname, 'find-binary.js'));
   const { res } = runSessionInitHook(t, {
     prefix: 'cg-si-reverse-',
     preloadSrc: `
@@ -365,21 +364,49 @@ test('the adoption remedies name a binary this install can run', (t) => {
         reason: 'adopted',
         result: { ok: true, detailWritten: true, registryRecorded: false },
       });
-      const fb = require(${findBinary});
-      fb.findBinary = () => '/bin/true';
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /Reverse:\s+\/bin\/true unadopt/,
-    `the Reverse hint must be runnable as printed; stderr was:\n${res.stderr}`);
-  assert.match(res.stderr, /`\/bin\/true unadopt`/,
-    `the unrecorded-registry remedy must be runnable too; stderr was:\n${res.stderr}`);
+
+  // Pull the command out of the message and run it, rather than matching a
+  // shape. The first version of this test stubbed findBinary to `/bin/true` and
+  // asserted the string — it stayed green while the real command exited 1 with
+  // "adopt.js not found" on every install layout except a dev checkout.
+  const m = res.stderr.match(/Reverse:\s+(node "[^"]+" unadopt)/);
+  assert.ok(m, `the Reverse hint must be present and quoted; stderr was:\n${res.stderr}`);
+  const script = m[1].match(/"([^"]+)"/)[1];
+  assert.ok(fs.existsSync(script), `the hint points at a file that does not exist: ${script}`);
+  assert.equal(path.basename(script), 'adopt.js',
+    `unadopt is JS-dispatched — the hint must name adopt.js, not a binary that ` +
+    `re-execs it from a directory the plugin cache does not have: ${script}`);
+
+  const { spawnSync } = require('child_process');
+  const probeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-si-reverse-run-'));
+  t.after(() => fs.rmSync(probeHome, { recursive: true, force: true }));
+  const ran = spawnSync(process.execPath, [script, 'unadopt'], {
+    cwd: probeHome,
+    encoding: 'utf8',
+    // CLAUDE_CONFIG_DIR too, not just HOME: this probe runs a DESTRUCTIVE
+    // subcommand, and a developer who exports that variable would otherwise have
+    // it act on their real Claude config. The hardening guard caught exactly this.
+    env: {
+      ...process.env,
+      HOME: probeHome,
+      USERPROFILE: probeHome,
+      CLAUDE_CONFIG_DIR: path.join(probeHome, '.claude'),
+    },
+  });
+  assert.equal(ran.status, 0,
+    `the printed command must RUN, not just read well. stdout:\n${ran.stdout}\nstderr:\n${ran.stderr}`);
+
+  assert.match(res.stderr, /`node "[^"]+adopt\.js" unadopt`/,
+    `the unrecorded-registry remedy must be the same runnable command; stderr was:\n${res.stderr}`);
 });
 
-// Negative control for the test above: with no binary resolved there is no path
-// to print, and the hint must fall back to the bare name rather than to
-// `null unadopt` or an empty command.
-test('with no binary resolved the remedy falls back to the bare name', (t) => {
+// The hint must not depend on binary resolution at all — `unadopt` is dispatched
+// through adopt.js, which sits next to this hook in every install layout, so a
+// missing or unresolvable binary changes nothing about how you undo an adoption.
+test('the remedy does not change when no binary resolved', (t) => {
   const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
   const findBinary = JSON.stringify(path.join(__dirname, 'find-binary.js'));
   const { res } = runSessionInitHook(t, {
@@ -396,8 +423,8 @@ test('with no binary resolved the remedy falls back to the bare name', (t) => {
     `,
   });
   assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
-  assert.match(res.stderr, /Reverse:\s+code-graph-mcp unadopt/,
-    `no binary → bare name, not a null path; stderr was:\n${res.stderr}`);
+  assert.match(res.stderr, /Reverse:\s+node "[^"]+adopt\.js" unadopt/,
+    `no binary must not degrade the hint; stderr was:\n${res.stderr}`);
 });
 
 // Control for the two tests above: the same harness with NO stubbed failure

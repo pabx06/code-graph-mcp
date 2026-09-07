@@ -6547,6 +6547,68 @@ app.post('/api/login', handleLogin);
     /// `crate::resolve`, not a fifth hand-written wording — a caller comparing
     /// two tools' verdicts for one symbol must not have to tell a wording
     /// difference from a verdict difference.
+    /// SURF-34, round 2: every surface that RENDERS `ambiguity_message` must cap
+    /// its own list to match it.
+    ///
+    /// The message gained "Showing the first 5 of N." and four of the five MCP
+    /// sites go through `ambiguity_response`, which caps internally. The fifth —
+    /// `get_call_graph` — is hand-rolled because it also carries
+    /// `function`/`direction`, and it kept an uncapped `candidates_to_json`. So
+    /// the fix turned a truthful envelope into one that announced a cap it had
+    /// not applied: seven suggestions under a note claiming five, on the surface
+    /// an LLM reads. A pre-ship reviewer caught it on a 7-overload fixture.
+    ///
+    /// This asserts the INVARIANT rather than the one site: message says N, list
+    /// carries min(N, cap), for every tool that answers ambiguity.
+    #[test]
+    fn every_ambiguity_surface_lists_as_many_definitions_as_its_message_promises() {
+        let project = TempDir::new().unwrap();
+        let mut src = String::new();
+        for i in 0..7 {
+            src.push_str(&format!(
+                "pub struct S{i};\nimpl S{i} {{ pub fn surf34_dup(&self) {{}} }}\n"
+            ));
+        }
+        std::fs::write(project.path().join("a.rs"), src).unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        let cap = crate::resolve::SUGGESTION_CAP;
+        for (tool, args, list_key) in [
+            (
+                "get_call_graph",
+                json!({ "function_name": "surf34_dup", "direction": "callers" }),
+                "suggestions",
+            ),
+            (
+                "get_ast_node",
+                json!({ "symbol_name": "surf34_dup" }),
+                "suggestions",
+            ),
+            (
+                "find_references",
+                json!({ "symbol_name": "surf34_dup" }),
+                "suggestions",
+            ),
+        ] {
+            let out = server.dispatch_tool(tool, &args).unwrap();
+            let err = out["error"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("7 definitions") || err.contains("7 matches"),
+                "{tool}: fixture precondition — the message must report all seven: {out}"
+            );
+            assert!(
+                err.contains("Showing the first 5 of 7"),
+                "{tool}: the message must disclose the cap: {out}"
+            );
+            assert_eq!(
+                out[list_key].as_array().map(|a| a.len()),
+                Some(cap),
+                "{tool}: the list must carry exactly what the message promised: {out}"
+            );
+        }
+    }
+
     #[test]
     fn test_find_references_same_file_multi_def_uses_the_shared_ambiguity_envelope() {
         let project = TempDir::new().unwrap();

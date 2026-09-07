@@ -5,6 +5,9 @@ const path = require('path');
 const os = require('os');
 const { claudeHome } = require('./claude-config');
 const { hidden } = require('./proc-opts');
+// install-lock.js requires only fs/path, so this cannot re-enter lifecycle.js —
+// the module-load order pinned by lifecycle.test.js stays as it is.
+const { acquireLock } = require('./install-lock');
 
 const PLUGIN_ID = 'code-graph-mcp@code-graph-mcp';
 const OLD_PLUGIN_IDS = [
@@ -1972,7 +1975,37 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
 // here now. So the preservation belongs here, at the wipe, rather than at each
 // caller — the same "fix it at the shared layer, not per surface" the
 // <external> query filter needed.
+// Where the registry is parked while CACHE_DIR is wiped, and the lock that keeps
+// two of these from interleaving. Both live in CACHE_DIR's PARENT: a sibling of
+// the registry would be deleted by the very rmSync it is being protected from.
+// The stash name is FIXED, not pid-suffixed — a pid-unique name that outlives a
+// SIGKILL'd process is unrecoverable residue nobody looks for, whereas a fixed
+// one is found and restored by the next run (see the recovery step below).
+const REGISTRY_STASH = path.join(path.dirname(CACHE_DIR), '.code-graph-adopted-projects.stash');
+const RESIDUE_LOCK = path.join(path.dirname(CACHE_DIR), '.code-graph-residue.lock');
+
 function removeCacheResidue() {
+  // Serialize. A pre-ship review demonstrated the interleaving: process A
+  // renames the registry aside, B reads "nothing to preserve" from the now-empty
+  // path, A restores, B's rmSync deletes what A just put back — both return
+  // true, nothing on stderr, registry gone. Two Claude Code sessions starting at
+  // once is an ordinary event, so a stash alone is not enough; the read and the
+  // wipe have to be one critical section.
+  //
+  // `acquireLock` is the primitive auto-update.js already uses, with stale
+  // reclaim built in. Contended → the other process is doing this work, so
+  // return success without touching anything rather than racing it. That is
+  // honest: the residue IS being reclaimed, just not by us.
+  const lock = acquireLock(RESIDUE_LOCK);
+  if (!lock) return true;
+  try {
+    return removeCacheResidueLocked();
+  } finally {
+    lock.release();
+  }
+}
+
+function removeCacheResidueLocked() {
   // Path comes from adopt.js rather than a second spelling of the basename —
   // a literal here would silently stop matching the day adopt.js renames it,
   // and the failure mode is exactly the data loss this guard exists to stop.
@@ -1984,6 +2017,18 @@ function removeCacheResidue() {
   let registry = null;
   try {
     registryPath = require('./adopt').adoptedRegistryFile();
+    // Recover from a predecessor killed between its rename and its restore. The
+    // bytes are still on disk under the stash name and NOTHING else looks there,
+    // so without this step every reader — including `uninstall --unadopt-all` —
+    // sees the registry as absent and the managed blocks are stranded for good.
+    // Only when the real path is empty: a live registry always wins over a stale
+    // stash.
+    if (fs.existsSync(REGISTRY_STASH) && !fs.existsSync(registryPath)) {
+      try {
+        fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+        fs.renameSync(REGISTRY_STASH, registryPath);
+      } catch { /* leave it parked; the next run tries again */ }
+    }
     const raw = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
     if (raw) {
       let parsed = null;
@@ -2011,13 +2056,9 @@ function removeCacheResidue() {
   // same-filesystem, so it is atomic and carries the file's mode with it.
   let stashPath = null;
   if (registryPath && registry) {
-    const candidate = path.join(
-      path.dirname(CACHE_DIR),
-      `.code-graph-adopted-projects.${process.pid}.stash`,
-    );
     try {
-      fs.renameSync(registryPath, candidate);
-      stashPath = candidate;
+      fs.renameSync(registryPath, REGISTRY_STASH);
+      stashPath = REGISTRY_STASH;
     } catch {
       // Rename unavailable (a mount boundary, a read-only parent). Fall through
       // holding `registry` in memory: that is exactly the old behaviour, so this
@@ -2040,17 +2081,27 @@ function removeCacheResidue() {
       else if (registry) fs.writeFileSync(registryPath, registry);
       return;
     } catch { /* fall through to the report below */ }
-    // Both restores failed. With the stash the bytes still exist, so say where
-    // instead of dropping the only pointer to them on the floor.
-    if (stashPath && fs.existsSync(stashPath)) {
-      try {
+    // The restore failed. Say so on BOTH paths, not just the stashed one: when
+    // the rename-aside was unavailable and the in-memory write-back then failed,
+    // the registry is gone and this used to return true in silence — the exact
+    // outcome this change was written to prevent, surviving in the branch nobody
+    // looked at.
+    try {
+      if (stashPath && fs.existsSync(stashPath)) {
         process.stderr.write(
           `[code-graph] Could not restore ${registryPath}; the adopted-projects ` +
-          `registry is preserved at ${stashPath} — move it back by hand before ` +
-          'running `--unadopt-all`.\n',
+          `registry is preserved at ${stashPath} — it is picked up automatically ` +
+          'on the next session, or move it back by hand before `--unadopt-all`.\n',
         );
-      } catch { /* stderr gone too — nothing further to try */ }
-    }
+      } else {
+        process.stderr.write(
+          `[code-graph] Lost ${registryPath} while reclaiming the cache: the ` +
+          'record of which projects carry a code-graph block in CLAUDE.md is ' +
+          'gone. `uninstall --unadopt-all` will report nothing to clean; remove ' +
+          'any remaining blocks by hand.\n',
+        );
+      }
+    } catch { /* stderr gone too — nothing further to try */ }
   };
 
   try {

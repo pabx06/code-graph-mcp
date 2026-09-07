@@ -7,6 +7,11 @@ version: 2
 # and the pin sat there because the only thing that would have moved it was
 # somebody noticing.
 #
+# Scope, stated honestly: the github-actions ecosystem scans `.github/workflows/`
+# in this repo and nothing else. `claude-plugin/templates/code-graph-snapshot.yml`
+# — a workflow SHIPPED into users' repos, holding `contents: write` — is not
+# watched here; `tests/hardening.rs:2723` is what guards its pins.
+#
 # github-actions only. Cargo and npm updates are deliberately NOT enabled here:
 # `--locked` builds and the release pipeline's version gates mean a dependency
 # bump is a decision with a rebuild attached, not something to merge weekly.
@@ -25,3 +30,10 @@ updates:
       actions:
         patterns:
           - "*"
+    ignore:
+      # `dtolnay/rust-toolchain` is pinned to a VERSION BRANCH (1.95.0), not a
+      # release tag, and it selects the compiler that builds the published npm
+      # binaries — release.yml documents that pin as a supply-chain control.
+      # Moving it is a deliberate toolchain decision, not something to approve
+      # inside a routine grouped `chore(ci)` bump.
+      - dependency-name: dtolnay/rust-toolchain

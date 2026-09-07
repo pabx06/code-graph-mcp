@@ -4328,3 +4328,70 @@ fn editing_a_callee_still_refreshes_its_callers_context_string() {
         .unwrap();
     assert!(ctx.contains("calls: core12_first"), "precondition: {ctx:?}");
 }
+
+// The SECOND CORE-12 seeding site. `apply_file_refreshes` is the query-time
+// path — `resync_stale_files` and `ensure_file_indexed` both land here — and it
+// takes deletions as `drop_rows`. A pre-ship reviewer showed the site was
+// unpinned: reverting its seed to `[files]` alone left the whole suite green,
+// because the only CORE-12 test drives `run_incremental_index_cached` instead.
+// Called directly, since what needs pinning is the seeding, not the plumbing
+// that reaches it.
+#[test]
+fn the_query_time_refresh_also_treats_deletions_as_dirty() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("a.py"),
+        "def apply12_target():\n    return 1\n",
+    )
+    .unwrap();
+    // No import, for the same reason as the incremental test: an import would
+    // make b.py a structural dependent and Phase 0 would refresh it by another
+    // route entirely, hiding whether the dirty seed did anything.
+    fs::write(
+        project.path().join("b.py"),
+        "def apply12_caller():\n    return apply12_target()\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let caller_context = || -> String {
+        db.conn()
+            .query_row(
+                "SELECT COALESCE(context_string, '') FROM nodes WHERE name = 'apply12_caller'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let before = caller_context();
+    assert!(
+        before.contains("calls: apply12_target"),
+        "fixture precondition: {before:?}"
+    );
+
+    fs::remove_file(project.path().join("a.py")).unwrap();
+    code_graph_mcp::indexer::pipeline::apply_file_refreshes(
+        &db,
+        project.path(),
+        &["a.py".to_string()],
+        &[],
+        None,
+    )
+    .unwrap();
+
+    let after = caller_context();
+    assert!(
+        !after.contains("calls: apply12_target"),
+        "the query-time path must feed its deletions to the dirty set too, or a \
+         read command leaves the caller's embedding text naming a callee whose \
+         file it just removed: {after:?}"
+    );
+    assert!(
+        after.contains("apply12_caller"),
+        "regenerated, not blanked: {after:?}"
+    );
+}

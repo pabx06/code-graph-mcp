@@ -379,6 +379,77 @@ test('removeCacheResidue does not lose the registry when the restore write fails
   );
 });
 
+// The interleaving a pre-ship reviewer demonstrated against the first version of
+// JS-33: A renames the registry aside, B reads the now-empty path and concludes
+// "nothing to preserve", A restores, B's rmSync deletes what A just put back.
+// Both return true, stderr is empty, the registry is gone. The stash NAME was
+// pid-unique; the algorithm was not a critical section. Two sessions starting at
+// once is an ordinary event, so this is the case that decides whether JS-33 is a
+// net improvement or a net regression.
+test('two concurrent reclaims cannot destroy the registry between them', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'adopted-projects.json');
+  const adopted = [{ cwd: '/some/project' }];
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+  writeJson(registryPath, adopted);
+
+  // Force the interleaving deterministically rather than hoping for it: A holds
+  // still inside the window (after its stash, before its wipe) while B runs the
+  // whole function to completion.
+  const out = execFileSync(process.execPath, ['-e', `
+    const fs = require('fs');
+    const { execFileSync } = require('child_process');
+    const lc = require(${JSON.stringify(lifecyclePath)});
+    const realRm = fs.rmSync;
+    let armed = true;
+    fs.rmSync = (p, ...rest) => {
+      if (armed && String(p).endsWith('code-graph')) {
+        armed = false;
+        // B, start to finish, while A is parked mid-window.
+        execFileSync(process.execPath, ['-e',
+          'require(' + ${JSON.stringify(JSON.stringify(lifecyclePath))} + ').removeCacheResidue();'],
+          { env: process.env });
+      }
+      return realRm(p, ...rest);
+    };
+    lc.removeCacheResidue();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
+
+  assert.ok(
+    fs.existsSync(registryPath),
+    'a second concurrent reclaim must not be able to delete the registry the ' +
+    'first one parked; stdout: ' + out,
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(registryPath, 'utf8')), adopted,
+    'and it must come back with its contents',
+  );
+});
+
+// A predecessor killed between the rename and the restore leaves the bytes under
+// the stash name. Nothing else on the system looks there, so without recovery
+// every reader — including `uninstall --unadopt-all` — sees the registry as
+// absent and the managed blocks are stranded permanently.
+test('a stash left by a killed predecessor is recovered, not orphaned', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'adopted-projects.json');
+  const stashPath = path.join(homeDir, '.cache', '.code-graph-adopted-projects.stash');
+  const adopted = [{ cwd: '/stranded/project' }];
+  fs.mkdirSync(cacheDir, { recursive: true });
+  writeJson(stashPath, adopted);            // killed mid-window
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+
+  execFileSync(process.execPath, ['-e', `
+    require(${JSON.stringify(lifecyclePath)}).removeCacheResidue();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } });
+
+  assert.ok(fs.existsSync(registryPath), 'the orphaned stash must be adopted back');
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')), adopted);
+  assert.equal(fs.existsSync(stashPath), false, 'and not left duplicated at the stash name');
+});
+
 // Negative control: the ordinary path still preserves a non-empty registry and
 // still clears everything else, so the test above cannot be passing on a
 // preservation that simply never deletes anything.

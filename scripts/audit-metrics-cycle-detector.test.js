@@ -7,7 +7,9 @@
 //
 // The script has no gate of its own (it is not in ci.yml and `make metrics-*`
 // is a manual target), which is how the detector drifted unnoticed. This test
-// runs inside the JS suite, which CI does run on all three OS legs.
+// runs inside the JS suite — ci.yml's `plugin-tests` job, which is
+// ubuntu-latest ONLY. So the `python`-vs-`python3` fallback below is never
+// exercised on macOS or Windows by CI; it exists for local runs.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');

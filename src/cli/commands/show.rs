@@ -267,7 +267,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shape matches impact's `{"error", "symbol"}` miss contract.
                 let sugg: Vec<serde_json::Value> = candidates
                     .iter()
-                    .take(5)
+                    .take(crate::resolve::SUGGESTION_CAP)
                     .map(|c| {
                         serde_json::json!({
                             "name": c.name, "type": c.node_type, "file_path": c.file_path,
@@ -284,7 +284,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             eprintln!("[code-graph] Symbol not found: {}", symbol);
             if !candidates.is_empty() {
                 eprintln!("[code-graph] Did you mean:");
-                for c in candidates.iter().take(5) {
+                for c in candidates.iter().take(crate::resolve::SUGGESTION_CAP) {
                     eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
                 }
             } else {

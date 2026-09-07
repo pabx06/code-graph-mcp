@@ -561,19 +561,29 @@ function verifyBinary() {
  * The `unadopt` invocation to hand the user, spelled so their shell can run it.
  *
  * Issue #41: the reporter drives this plugin through `/plugin install` only and
- * has no `code-graph-mcp` on PATH — the plugin resolves its own download under
- * ~/.cache/code-graph/bin instead. Every remedy this hook printed spent the bare
- * name, so the way OUT of the adoption was as unrunnable as the feature.
+ * has no `code-graph-mcp` on PATH, so every remedy this hook printed spent a
+ * bare name their shell answers with "command not found".
  *
- * Unlike the CLAUDE.md block (git-tracked, must stay machine-independent), this
- * text is stderr for one session on one machine, so the resolved path is exactly
- * the right thing to print. `verifyBinary()` already resolved it — no second
- * probe, no new require. Falls back to the bare name when nothing resolved:
- * `null unadopt` would be worse than a command that at least reads correctly.
+ * The obvious repair — print the binary `verifyBinary()` resolved — is WRONG,
+ * and a pre-ship review caught it as a net regression. `unadopt` is one of the
+ * three JS-dispatched subcommands (`main.rs`: doctor / adopt / unadopt): the
+ * native binary re-execs `claude-plugin/scripts/adopt.js`, which it locates via
+ * `$_FIND_BINARY_ROOT` or a path relative to its own exe. The plugin's cached
+ * binary at ~/.cache/code-graph/bin has no such neighbour, so
+ * `<cache>/code-graph-mcp unadopt` exits 1 with "adopt.js not found" —
+ * reproduced. Worse, npm-global users reach adopt.js today through the
+ * `bin/cli.js` shim that sets `_FIND_BINARY_ROOT`, so printing a resolved
+ * platform-package binary would BREAK a path that currently works.
+ *
+ * So point at the script itself. `adopt.js` carries its own
+ * `require.main === module` arm (`node adopt.js unadopt`), and this file is its
+ * neighbour in every install layout — plugin cache, npm package, dev checkout —
+ * because both are shipped inside `claude-plugin/scripts/`. `__dirname` is
+ * therefore the one locator that cannot be wrong. Quoted, since a plugin cache
+ * path under a home directory with a space is otherwise not runnable as printed.
  */
-function unadoptCommand(binaryCheck) {
-  const bin = binaryCheck && binaryCheck.available && binaryCheck.binary;
-  return `${bin || 'code-graph-mcp'} unadopt`;
+function unadoptCommand() {
+  return `node ${JSON.stringify(path.join(__dirname, 'adopt.js'))} unadopt`;
 }
 
 /**
@@ -825,7 +835,7 @@ function runSessionInit({ source } = {}) {
         '[code-graph] Installed code-graph block into project CLAUDE.md (plugin install → knowing consent).\n' +
         '            Detail table: .claude/plugin_code_graph_mcp.md (generated; safe to gitignore)\n' +
         '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
-        `            Reverse:    ${unadoptCommand(binaryCheck)}\n`
+        `            Reverse:    ${unadoptCommand()}\n`
       );
     }
     // `adopt()` has returned `registryRecorded` since it stopped throwing on a
@@ -839,7 +849,7 @@ function runSessionInit({ source } = {}) {
       process.stderr.write(
         '[code-graph] Note: this project could not be recorded in the adopted-projects registry,\n' +
         '            so `/plugin uninstall` will NOT strip the block from this CLAUDE.md.\n' +
-        `            Remove it by hand with \`${unadoptCommand(binaryCheck)}\` before uninstalling.\n`
+        `            Remove it by hand with \`${unadoptCommand()}\` before uninstalling.\n`
       );
     }
   }

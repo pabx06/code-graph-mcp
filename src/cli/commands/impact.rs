@@ -90,7 +90,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         let candidates = queries::find_functions_by_fuzzy_name(conn, symbol)?;
         if !candidates.is_empty() {
             eprintln!("[code-graph] Did you mean:");
-            for c in candidates.iter().take(5) {
+            for c in candidates.iter().take(crate::resolve::SUGGESTION_CAP) {
                 eprintln!("  {} ({}) in {}", c.name, c.node_type, c.file_path);
             }
         } else {
@@ -136,7 +136,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 // caller can correct the path instead of re-querying.
                 let candidates: Vec<serde_json::Value> = symbol_nodes
                     .iter()
-                    .take(5)
+                    .take(crate::resolve::SUGGESTION_CAP)
                     .map(|n| {
                         serde_json::json!({
                             "name": n.name,
@@ -169,7 +169,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             let defined_in: Vec<String> = symbol_nodes
                 .iter()
                 .filter_map(|n| queries::get_file_path(conn, n.file_id).ok().flatten())
-                .take(5)
+                .take(crate::resolve::SUGGESTION_CAP)
                 .collect();
             if !defined_in.is_empty() {
                 eprintln!("[code-graph] Defined in: {}", defined_in.join(", "));

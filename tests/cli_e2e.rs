@@ -4109,6 +4109,27 @@ fn test_cli_fuzzy_ambiguity_discloses_its_cap_after_the_suffix() {
         Some(5),
         "candidates stay capped at 5; got: {v}"
     );
+
+    // The HUMAN arm builds its disclosure separately — a trailing eprintln after
+    // the list, not a suffix on the message — so a `--json`-only assertion says
+    // nothing about it. Dropping its `if !capped.is_empty()` guard would print a
+    // bare `[code-graph]` line and no test would notice.
+    let (_o, stderr, code) = run_cli(&project, &["callgraph", "buil"]);
+    assert_eq!(code, 1, "stderr={stderr:?}");
+    assert!(
+        stderr.contains("7 matches"),
+        "the true count must survive on the human arm too; got: {stderr:?}"
+    );
+    assert!(
+        stderr.trim_end().ends_with("Showing the first 5 of 7."),
+        "the human arm prints the note AFTER the candidate list, so the reader \
+         learns the list was cut where it ended; got: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches("[node_id ").count(),
+        5,
+        "and the list itself stays capped; got: {stderr:?}"
+    );
 }
 
 // Negative control for both tests above: five definitions are fully listed, so
@@ -11053,13 +11074,39 @@ fn grep_says_so_when_it_could_not_annotate_instead_of_looking_like_plain_grep() 
         "precondition for the real assertion: the annotation is in fact gone; got:\n{out}"
     );
     assert!(
-        err.contains("AST annotation unavailable for 1 file(s)"),
-        "the lost annotation must be disclosed, not silently absent; stderr:\n{err}"
+        err.contains("AST annotation unavailable for 1 of 1 file(s)"),
+        "the lost annotation must be disclosed with a denominator — \"1 file(s)\" \
+         alone reads as though the whole run lost its annotations; stderr:\n{err}"
+    );
+    assert!(
+        !err.contains("Matches above are plain grep output"),
+        "that claim is false whenever 1 of N files failed; the other N-1 are \
+         annotated: {err}"
     );
     assert!(
         err.contains("no such column"),
         "the disclosure must name the reason, or it is the same dead end as the \
          empty list it replaces; stderr:\n{err}"
+    );
+
+    // The machine-readable half. `stale` and `truncated` are per-entry flags for
+    // exactly this reason: the ABSENCE of `container` cannot distinguish "no
+    // containing node here" from "the lookup failed", and a consumer running
+    // `--json 2>/dev/null` never sees the prose above.
+    let (out, _e, code) = run_cli(&project, &["grep", "needle_here", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let entries = v.as_array().expect("grep --json is an array");
+    assert!(!entries.is_empty(), "matches must still be reported: {out}");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e["container_unavailable"].as_bool() == Some(true)),
+        "every hit from the broken file must carry the in-band flag: {out}"
+    );
+    assert!(
+        entries.iter().all(|e| e.get("container").is_none()),
+        "and none of them may claim a container: {out}"
     );
 }
 
@@ -11084,6 +11131,17 @@ fn grep_stays_silent_about_annotations_it_did_not_lose() {
     assert!(
         !err.contains("AST annotation unavailable"),
         "nothing failed, so nothing may be claimed; stderr:\n{err}"
+    );
+
+    let (out, _e, code) = run_cli(&project, &["grep", "needle_here", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        v.as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("container_unavailable").is_none()),
+        "a healthy index must not flag anything in-band either: {out}"
     );
 }
 

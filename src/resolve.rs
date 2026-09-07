@@ -124,8 +124,10 @@ pub const SUGGESTION_CAP: usize = 5;
 
 /// The clause that keeps a capped `suggestions` list honest.
 ///
-/// Empty at or below the cap: a note on a complete list would be a lie, and the
-/// ≤5 wording is pinned byte-for-byte by the MCP metrics classifier fixture.
+/// Empty at or below the cap: a note on a complete list would be a lie. The
+/// conditional is NOT there to protect the MCP metrics classifier — an earlier
+/// version of this comment claimed that, and it is false: `ErrKind::classify`
+/// matches `contains("Ambiguous symbol")` and its fixture passes either way.
 pub fn suggestion_cap_note(n: usize) -> String {
     if n > SUGGESTION_CAP {
         format!(" Showing the first {SUGGESTION_CAP} of {n}.")
@@ -161,8 +163,14 @@ pub fn candidates_to_json(cands: &[NameCandidate]) -> Vec<serde_json::Value> {
 pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) -> String {
     let n = cands.len();
     // SURF-34: `n` counts the definitions; the list under this message carries at
-    // most SUGGESTION_CAP of them. Empty below the cap, so the ≤5 wording every
-    // fixture pins stays byte-identical.
+    // most SUGGESTION_CAP of them. Empty below the cap, so the ≤5 wording is
+    // unchanged for every caller that was already truthful.
+    //
+    // Every site that renders this message owes the matching `.take()` — the
+    // note promises a cap the MESSAGE cannot apply. `get_call_graph` rendered it
+    // over an uncapped list and announced "first 5 of 7" above seven entries;
+    // `every_ambiguity_surface_lists_as_many_definitions_as_its_message_promises`
+    // in mcp::server::tests is what now holds that pairing.
     let capped = suggestion_cap_note(n);
     if spans_multiple_files(cands) {
         match surface {

@@ -89,13 +89,11 @@ pub fn get_callers_with_route_info(
     // exists to prevent.
     let limit_hit = callers.limit_hit;
     let depth_capped = callers.depth_capped;
-    if callers.nodes.is_empty() {
-        return Ok(RouteCallers {
-            callers: vec![],
-            limit_hit,
-            depth_capped,
-        });
-    }
+    // No early return for the empty case: `fetch_route_metadata_map`
+    // short-circuits on an empty id list and the map below yields an empty Vec,
+    // so the tail already produces a byte-identical `RouteCallers`. A guard here
+    // was dead code that read like a safety property — deleting the whole block
+    // left every test green, which is how a pre-ship reviewer found it.
     let caller_ids: Vec<i64> = callers.nodes.iter().map(|c| c.node_id).collect();
     let route_map = fetch_route_metadata_map(conn, &caller_ids)?;
     let results = callers
@@ -174,12 +172,13 @@ mod tests {
 
     #[test]
     fn an_empty_traversal_still_reports_a_complete_answer_as_complete() {
-        // Measured while writing this: the empty-nodes early return does NOT
-        // fire for "a symbol with no callers" — the traversal returns the target
-        // itself as a row, so an existing symbol always yields at least one. Its
-        // real trigger is a symbol that does not exist at all. The flags are
-        // still read off the traversal there, which is what keeps a capped
-        // request from being reported as a complete zero.
+        // Two measured facts, both of which corrected an earlier version of this
+        // test: the traversal SEEDS ITSELF, so an existing symbol always returns
+        // at least one row and "a symbol with no callers" never produces an empty
+        // set — only an absent symbol does. And the empty case has no branch of
+        // its own to guard (see the note in the function); what this pins is the
+        // OUTCOME, that an empty answer is reported as complete rather than as a
+        // truncated floor.
         let (db, _tmp) = test_db();
         let conn = db.conn();
         conn.execute("INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) VALUES ('e.ts', 'h', 0, 'typescript', 0)", []).unwrap();

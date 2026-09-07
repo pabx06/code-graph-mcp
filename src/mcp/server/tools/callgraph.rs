@@ -146,7 +146,18 @@ impl McpServer {
                     "function": function_name,
                     "direction": direction,
                     "error": crate::resolve::ambiguity_message(function_name, &cands, crate::resolve::Surface::Mcp),
-                    "suggestions": crate::resolve::candidates_to_json(&cands),
+                    // MUST stay capped in step with `ambiguity_message`, which
+                    // now says "Showing the first 5 of N" whenever it hides
+                    // something. This site renders the message but built its own
+                    // uncapped list, so SURF-34 turned a truthful envelope into
+                    // one that announced a cap it had not applied — 7 suggestions
+                    // under a note claiming 5. `ambiguity_response` (the other
+                    // four MCP sites) caps internally; this arm is hand-rolled
+                    // because it also carries `function`/`direction`.
+                    "suggestions": crate::resolve::candidates_to_json(&cands)
+                        .into_iter()
+                        .take(crate::resolve::SUGGESTION_CAP)
+                        .collect::<Vec<_>>(),
                 }));
             }
         }
@@ -194,8 +205,21 @@ impl McpServer {
                         "direction": direction,
                         "callees": [],
                         "callers": [],
-                        "suggestion": format!("No exact match for '{}'. Did you mean one of these?", function_name),
-                        "candidates": crate::resolve::candidates_to_json(&cands),
+                        // Capped and disclosed like the CLI's fuzzy arm
+                        // (`cli::symbols::emit_fuzzy_ambiguity`). This list was
+                        // unbounded while the CLI's was `take(5)`, so the same
+                        // query answered with a different number of candidates
+                        // depending on which surface asked — the "same input,
+                        // two verdicts" shape SURF-17 and audit #6 both were.
+                        "suggestion": format!(
+                            "No exact match for '{}'. Did you mean one of these?{}",
+                            function_name,
+                            crate::resolve::suggestion_cap_note(cands.len()),
+                        ),
+                        "candidates": crate::resolve::candidates_to_json(&cands)
+                            .into_iter()
+                            .take(crate::resolve::SUGGESTION_CAP)
+                            .collect::<Vec<_>>(),
                     }));
                 }
                 FuzzyResolution::NotFound => {
