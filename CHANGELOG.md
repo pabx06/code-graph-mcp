@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.141.0
+
+**Upgrading:** two MCP response fields narrow. `get_call_graph`'s `suggestions`
+(the same-name ambiguity envelope) and its fuzzy `candidates` list were both
+UNBOUNDED and are now capped at 5, matching every other ambiguity surface and
+the CLI twin that has capped all along. When either list is cut, the message
+beside it now says so — `"Showing the first 5 of 7."` — where before the count in
+the prose and the length of the list could simply disagree. If you counted
+entries in those arrays, pin `0.140.0`.
+
+Everything else is additive or a message change: CLI ambiguity messages gain the
+same disclosure clause when they hide something (identical text at or below 5),
+`grep --json` entries gain `container_unavailable` when the index lookup for that
+file failed, and `grep` prints one stderr line in the same case.
+
+The steering block this plugin writes into your `CLAUDE.md` gains one line, so
+every adopted project rewrites it on its next SessionStart. That is the existing
+drift-refresh path; lock it with `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`.
+
+### The plugin told you to run commands it had not installed
+
+Reported as issue #41, open since 2026-08-27. A `/plugin install` never puts
+`code-graph-mcp` on your PATH — the plugin downloads its own binary to
+`~/.cache/code-graph/bin/` and resolves it internally. The block injected into
+CLAUDE.md nonetheless spent the bare name in all six of its rows, so an agent
+following it ran a command the shell answered with "command not found" and fell
+back to Grep. The block now names where the binary actually is.
+
+The way OUT was no better: the `Reverse:` hint printed at adoption said
+`code-graph-mcp unadopt`, equally unrunnable. It now names the script directly —
+`node "<plugin>/claude-plugin/scripts/adopt.js" unadopt` — because `unadopt` is
+one of three JS-dispatched subcommands and the cached binary has no `adopt.js`
+beside it to re-exec. That script's entry point now also refuses arguments it
+does not recognise: it used to treat anything that was not `unadopt` as `adopt`,
+so `--help` performed an unadopt and a typo adopted the project.
+
+CLI-first routing is unchanged. It was measured, and the defect was the
+invocation string, not the ranking.
+
+### Envelopes that hid what they dropped
+
+`refs`, `callgraph`, `impact`, `show` and the MCP ambiguity tools count every
+definition in the message and list at most five. Nothing said the list was cut,
+so two of seven overloads read as nonexistent. The cap is now one named constant
+with one disclosure clause, applied on every surface that renders it.
+
+`grep`'s container lookup folded a failed index query into an empty node list —
+indistinguishable from "no containing node here". A broken index therefore
+removed the fn/class annotation from every hit, which is the whole difference
+between this command and plain grep, and exited 0 in silence. Failures are now
+disclosed per entry in `--json` and once on stderr, naming the file and the
+reason. Matches themselves are ripgrep's and were never affected.
+
+`show --refs` / `show --impact` keep their 0.140.0 behaviour; this release adds
+the same treatment to `grep`.
+
+### A deleted file's callers are dirty too
+
+Deleting a file cascade-deletes the edges into it, but its callers live in files
+nobody touched, so their embedding text kept naming a callee whose file was gone
+until those files happened to be edited. Both refresh paths now seed the dirty
+set with deletions. `INDEX_VERSION` is NOT bumped: no node, edge, qualifier,
+confidence or metadata value changes for already-indexed source, and forcing
+every user to rebuild to repair derived text that self-heals on the next edit is
+the trade this project has refused before.
+
+Measured while fixing it: a caller that IMPORTS from the deleted file was
+already covered by the structural-dependent pass. What was exposed is a call
+that binds by bare name with no import edge.
+
+### Hooks, CI, tooling
+
+`incremental-index.js` spent a literal 8 s on its child regardless of how much
+of its 10 s hook deadline `findBinary()` had already used; it now consumes the
+budget, which completes that property across every registered hook.
+`release.yml` drops to `contents: read` at the workflow level — only `publish`
+writes, and it declares its own. Nine `Swatinem/rust-cache` pins move from a
+March 2026 master commit that is on no tag to the v2.9.2 commit, and a
+`dependabot.yml` now watches for the next drift. The audit script's JS cycle
+detector no longer counts `require()` calls written inside comments.
+
+### Not covered
+
+**JS-33 is not in this release.** `removeCacheResidue()` preserves the
+adopted-projects registry by reading it into memory, deleting the cache
+directory, and writing it back; a failure on that last write loses the record of
+which repos carry a managed block, and the function still returns success. A fix
+was written and withdrawn: three independent review rounds each found a new
+defect in the previous round's repair, including a concurrency regression worse
+than the window it replaced. The durable fix needs an atomic lock that
+distinguishes "a peer holds this" from "the lock could not be created" at the
+syscall rather than by a later `stat`, and that is its own round of work. The
+behaviour is unchanged from 0.140.0.
+
+`RefsTarget::Orphan`, `truncation_note`'s both-causes arm, and the empty
+traversal in `get_callers_with_route_info` were recorded as untested in 0.140.0
+and now have tests; the third turned out to be dead code and was deleted. Tree
+coverage 87.49% → 87.66%.
+
 ## 0.140.0
 
 **Upgrading:** four behaviours change for a caller who was relying on the old

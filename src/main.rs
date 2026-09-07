@@ -559,11 +559,13 @@ fn wants_subcommand_help(args: &[String]) -> bool {
 /// therefore WROTE the user's CLAUDE.md, one keystroke from the side effect the
 /// `--help` interception exists to prevent.
 ///
-/// `adopt.js` now refuses any argv it does not recognise (its `require.main`
-/// arm accepts `[]` or `["unadopt"]` and nothing else), because SessionStart
-/// hands users that entry point directly. This guard stays: it is the layer
-/// that turns a refusal into `--help` output rather than exit 2, and it keeps
-/// the binary's contract independent of the script's.
+/// `adopt.js` now refuses any argv it does not recognise — its `require.main`
+/// arm takes `[]`, `["adopt"]` or `["unadopt"]` and nothing else — because
+/// SessionStart hands users that entry point directly. This guard stays anyway:
+/// it keeps the binary's contract independent of the script's, and it is what
+/// makes `code-graph-mcp adopt --helpp` an error here rather than two layers
+/// down. (`--help` itself never reaches this function; `wants_subcommand_help`
+/// answers it first.)
 ///
 /// Fifth site of this idiom, found by the pre-tag review after four others were
 /// closed: doctor.js, `lifecycle.js doctor`, main.rs's own doctor arm, and
