@@ -49,7 +49,10 @@ function runPy(bin, snippet) {
     'am = importlib.util.module_from_spec(spec)',
     'spec.loader.exec_module(am)',
   ].join('\n');
-  const res = spawnSync(bin, ['-c', prelude + '\n' + snippet], { encoding: 'utf8' });
+  // `-B`: importing the script writes scripts/__pycache__/ otherwise, and a test
+  // that leaves build residue in a tracked directory is how a .pyc ends up
+  // committed — the exact ENG-23 class this round removed from vendor/.
+  const res = spawnSync(bin, ['-B', '-c', prelude + '\n' + snippet], { encoding: 'utf8' });
   assert.equal(res.status, 0, `python failed:\n${res.stderr}`);
   return res.stdout.trim();
 }
