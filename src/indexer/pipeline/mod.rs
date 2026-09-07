@@ -362,7 +362,12 @@ pub fn apply_file_refreshes(
 
     // Cross-file edges into these files' nodes need their context strings rebuilt
     // *after* the node IDs are replaced — capture the dirty set BEFORE re-indexing.
-    let dirty_node_ids = collect_dirty_node_ids(db, &files)?;
+    // `drop_rows` is in the seed for the same reason as in
+    // `run_incremental_index_cached` (CORE-12): a caller in an untouched file is
+    // just as stale when the callee's file was DELETED as when it changed, and
+    // the rows it is looked up by still exist until `index_files` runs below.
+    let dirty_seed: Vec<String> = [files.as_slice(), drop_rows].concat();
+    let dirty_node_ids = collect_dirty_node_ids(db, &dirty_seed)?;
 
     // `index_files` clears the interrupted-run marker when it finishes, which is
     // right for a run that covered the whole diff and wrong for this one: a
@@ -463,8 +468,17 @@ pub fn run_incremental_index_cached(
         &current_hashes,
     )?;
 
-    let dirty_node_ids = if !to_index.is_empty() {
-        collect_dirty_node_ids(db, &to_index)?
+    // CORE-12: deletions are dirty too. A file's removal cascade-deletes the
+    // edges INTO it, but the callers live in files nobody touched, so their
+    // `context_string` — and therefore `nodes_fts` and `node_vectors` — kept
+    // naming a callee that no longer exists until those files were edited for
+    // some unrelated reason. Phase 0's `existence_change_dependents` does not
+    // cover it: `get_structural_dependent_files` excludes `calls` in SQL.
+    // Safe to ask for here because the rows still exist — `index_files` below is
+    // what deletes them.
+    let dirty_seed: Vec<String> = [to_index.as_slice(), deleted_files.as_slice()].concat();
+    let dirty_node_ids = if !dirty_seed.is_empty() {
+        collect_dirty_node_ids(db, &dirty_seed)?
     } else {
         HashSet::new()
     };

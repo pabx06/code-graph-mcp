@@ -4210,3 +4210,121 @@ fn test_find_references_type_note_survives_a_node_whose_file_row_is_gone() {
          missing file row is not an answer about the symbol's type; got {after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CORE-12 (audit 2026-09-07, P1): the delete channel never fed the dirty set.
+//
+// `collect_dirty_node_ids` was called with `to_index` (new + changed) only, so a
+// caller in an UNTOUCHED file kept a `context_string` naming a callee whose
+// defining file had just been deleted — and `nodes_fts` / `node_vectors` kept
+// serving it until that caller was edited for some unrelated reason. Phase 0's
+// `existence_change_dependents` does not cover this: it re-extracts STRUCTURAL
+// dependents and `get_structural_dependent_files` excludes `calls` outright.
+//
+// This is the only remaining P1 that makes the index CONTENT stale rather than
+// a disclosure incomplete, which is why it is worth a fixture of its own.
+//
+// Measured blast radius, narrower than the report assumed: a caller that IMPORTS
+// from the deleted file is a structural dependent and Phase 0 re-extracts it
+// anyway, so its context string was already being rebuilt. What was exposed is a
+// call that binds by bare name with no import edge — the first fixture here had
+// the import and stayed green against a reverted fix.
+// ---------------------------------------------------------------------------
+#[test]
+fn deleting_a_file_refreshes_the_context_strings_of_its_callers() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("a.py"),
+        "def core12_target():\n    return 1\n",
+    )
+    .unwrap();
+    // NO import statement. An import would make b.py a STRUCTURAL dependent of
+    // a.py, and Phase 0's `existence_change_dependents` re-extracts those on a
+    // delete — which regenerates the context string by a route that has nothing
+    // to do with the dirty set. A bare-name call still binds (the resolver works
+    // off a global name table), so this is a `calls` edge with no `imports` edge:
+    // exactly the shape `get_structural_dependent_files` excludes in SQL.
+    fs::write(
+        project.path().join("b.py"),
+        "def core12_caller():\n    return core12_target()\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let caller_context = |db: &code_graph_mcp::storage::db::Database| -> String {
+        db.conn()
+            .query_row(
+                "SELECT COALESCE(context_string, '') FROM nodes WHERE name = 'core12_caller'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    // Precondition: the caller's embedding text really does name the callee, so
+    // the assertion after the delete is about staleness and not about a fixture
+    // that never had the string to begin with.
+    // The assertion is on the `calls:` RELATION line, not on the bare name: the
+    // `code:` section quotes the function body, which contains the call site
+    // verbatim and always will. A first version of this test asserted on the
+    // name and stayed red against a working fix.
+    let before = caller_context(&db);
+    assert!(
+        before.contains("calls: core12_target"),
+        "fixture precondition: the caller's context_string must carry the callee \
+         as a graph relation; got {before:?}"
+    );
+
+    fs::remove_file(project.path().join("a.py")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_incremental_index(&db, project.path(), None, None)
+        .unwrap();
+
+    let after = caller_context(&db);
+    assert!(
+        !after.contains("calls: core12_target"),
+        "the callee's file is gone and its edge was cascade-deleted, but the \
+         caller's context_string — the text that feeds nodes_fts and \
+         node_vectors — still publishes the relation: {after:?}"
+    );
+    assert!(
+        after.contains("core12_caller") && after.contains("code:"),
+        "the context string must have been REGENERATED, not blanked: {after:?}"
+    );
+}
+
+// Negative control for the test above: an ordinary edit to the callee's file
+// must keep the caller's context string in sync too. Without it, a "fix" that
+// simply cleared every context string on delete would pass.
+#[test]
+fn editing_a_callee_still_refreshes_its_callers_context_string() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("a.py"),
+        "def core12_first():\n    return 1\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("b.py"),
+        "from a import core12_first\n\n\ndef core12_caller():\n    return core12_first()\n",
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let ctx: String = db
+        .conn()
+        .query_row(
+            "SELECT COALESCE(context_string, '') FROM nodes WHERE name = 'core12_caller'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(ctx.contains("calls: core12_first"), "precondition: {ctx:?}");
+}
