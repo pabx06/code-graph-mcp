@@ -339,13 +339,57 @@ def rust_module_graph(rust_src_files):
 
 
 REQUIRE_RE = re.compile(r"""require\(\s*['"](\.{1,2}/[^'"]+)['"]\s*\)""")
+REQUIRE_MAIN_RE = re.compile(r"\brequire\.main\s*===\s*module\b")
+
+
+def js_import_lines(lines):
+    """The lines of a JS file that can actually create a module edge.
+
+    ENG-27: the detector matched `require(...)` over the whole file text, so a
+    `require('./lifecycle')` written INSIDE A COMMENT counted as an edge. Three
+    such phantom edges — two prose comments and one entry-point arm — were the
+    entire 4-node SCC this script reported; the real top-level graph is a DAG.
+
+    Two rules, both chosen so they can only ever drop a phantom edge and never a
+    live one (a detector that under-reports a cycle is worse than one that
+    over-reports):
+
+    1. Skip a line only when its FIRST non-space characters open or continue a
+       comment. A trailing `// ...` after code is left alone — parsing that
+       correctly means tracking strings and regex literals, and a single-pass
+       stripper doing exactly that is what put a 36-line blind spot into a guard
+       in this repo three days ago.
+    2. Skip the body of an `if (require.main === module)` arm. Those run only
+       when the file is executed as a script, never on import, so they cannot
+       participate in an import cycle. Braces are counted from the guard line;
+       a brace-less single-line arm is skipped as just that one line.
+    """
+    out = []
+    depth = None
+    for line in lines:
+        stripped = line.strip()
+        if depth is not None:
+            depth += line.count("{") - line.count("}")
+            if depth <= 0:
+                depth = None
+            continue
+        if stripped.startswith(("//", "*", "/*")):
+            continue
+        if REQUIRE_MAIN_RE.search(line):
+            opens = line.count("{") - line.count("}")
+            # `if (require.main === module) { …` opens a block to skip; the
+            # one-liner form has nothing left to skip after this line.
+            depth = opens if opens > 0 else None
+            continue
+        out.append(line)
+    return out
 
 
 def js_file_graph(js_prod_files):
     known = set(js_prod_files)
     graph = defaultdict(set)
     for p in js_prod_files:
-        text = "\n".join(read_lines(p))
+        text = "\n".join(js_import_lines(read_lines(p)))
         for spec in REQUIRE_RE.findall(text):
             target = os.path.normpath(os.path.join(os.path.dirname(p), spec))
             if not target.endswith(".js"):
