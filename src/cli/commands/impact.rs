@@ -75,19 +75,33 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let conn = ctx.db.conn();
 
     let (base_symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-    let qualified_match_count = if raw_symbol.contains('.') {
-        queries::get_node_ids_by_qualified_name(conn, raw_symbol)?.len()
+    let qualified_matches = if raw_symbol.contains('.') {
+        queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
+            .into_iter()
+            .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
+            .collect::<Vec<_>>()
     } else {
-        0
+        Vec::new()
     };
-    let symbol = if qualified_match_count == 1 { raw_symbol } else { base_symbol };
-    let file_filter = explicit_file.or(resolved_file.as_deref());
+    let is_qualified_target = qualified_matches.len() == 1;
+    let (symbol, file_filter) = if is_qualified_target {
+        let target_file = explicit_file
+            .map(|s| s.to_string())
+            .or_else(|| Some(qualified_matches[0].1.clone()));
+        (raw_symbol, target_file)
+    } else {
+        (
+            base_symbol,
+            explicit_file.map(|s| s.to_string()).or(resolved_file),
+        )
+    };
+    let file_filter = file_filter.as_deref();
 
     let fetch_nodes = |sym: &str| -> Result<Vec<queries::NodeResult>> {
-        if qualified_match_count == 1 {
-            Ok(queries::get_node_ids_by_qualified_name(conn, sym)?
-                .into_iter()
-                .filter_map(|(id, _)| queries::get_node_by_id(conn, id).ok().flatten())
+        if is_qualified_target {
+            Ok(qualified_matches
+                .iter()
+                .filter_map(|(id, _)| queries::get_node_by_id(conn, *id).ok().flatten())
                 .collect())
         } else {
             queries::get_nodes_by_name(conn, sym)
@@ -136,7 +150,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         // and answered `"risk":"LOW"` exit 0 for a class that does not exist —
         // the same safety-endorsement-for-a-typo shape P1-9 fixed for paths,
         // still reachable through the qualifier (audit 2026-08-16 Minor tail).
-        let qualified_input = raw_symbol != symbol;
+        let qualified_input = raw_symbol.contains('.');
         let present = if qualified_input {
             in_file
                 .iter()
@@ -193,28 +207,32 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             }
             std::process::exit(1);
         }
-        // The qualifier gates ENTRY but not the traversal: `get_callers_with_route_info`
-        // is name+file based, so when the file defines the bare name more than
-        // once the blast radius still covers every one of them. Say so rather
-        // than reporting a number that silently means "…and its namesakes".
-        if qualified_input {
-            let same_name = in_file.iter().filter(|n| n.name == symbol).count();
-            if same_name > 1 {
-                eprintln!(
-                    "[code-graph] Note: '{}' defines {} symbols named '{}'; the caller set below \
-                     covers all of them (the qualifier narrows the lookup, not the traversal).",
-                    fp, same_name, symbol
-                );
-            }
-        }
     }
 
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge callers across
     // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
-    if file_filter.is_none() && qualified_match_count != 1 {
-        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
-            emit_exact_ambiguity(symbol, &cands, json_mode);
+    if file_filter.is_none() {
+        if qualified_matches.len() > 1 {
+            let cands: Vec<queries::NameCandidate> = qualified_matches
+                .iter()
+                .filter_map(|(id, fp)| {
+                    queries::get_node_by_id(conn, *id).ok().flatten().map(|n| {
+                        queries::NameCandidate {
+                            name: n.name,
+                            file_path: fp.clone(),
+                            node_type: n.node_type,
+                            node_id: n.id,
+                            start_line: n.start_line,
+                        }
+                    })
+                })
+                .collect();
+            emit_exact_ambiguity(raw_symbol, &cands, json_mode);
+        } else if !is_qualified_target {
+            if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+                emit_exact_ambiguity(symbol, &cands, json_mode);
+            }
         }
     }
 

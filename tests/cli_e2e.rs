@@ -97,6 +97,9 @@ class Beta:
 def static_call():
     return Alpha.helper(None)
 
+def beta_static_call():
+    return Beta.helper(None)
+
 def unknown_receiver(alpha):
     return alpha.helper()
 "#,
@@ -11478,6 +11481,10 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
         "qualified refs should include static caller, got: {names:?}"
     );
     assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified refs must exclude Beta caller, got: {names:?}"
+    );
+    assert!(
         !names.contains(&"unknown_receiver"),
         "qualified refs must exclude unknown receiver, got: {names:?}"
     );
@@ -11509,6 +11516,10 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
         "qualified callgraph should include static caller, got: {names:?}"
     );
     assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified callgraph must exclude Beta caller, got: {names:?}"
+    );
+    assert!(
         !names.contains(&"unknown_receiver"),
         "qualified callgraph must exclude unknown receiver, got: {names:?}"
     );
@@ -11518,4 +11529,85 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
     let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(impact["symbol"], "Alpha.helper");
     assert_eq!(impact["direct_callers"], 2);
+}
+#[test]
+fn test_cli_python_qualified_method_file_disambiguation_and_ambiguity() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("one.py"),
+        r#"
+class Alpha:
+    def helper(self):
+        return 1
+
+def caller_one():
+    return Alpha.helper(None)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("two.py"),
+        r#"
+class Alpha:
+    def helper(self):
+        return 2
+
+class Beta:
+    def helper(self):
+        return 3
+
+def caller_two():
+    return Alpha.helper(None)
+
+def beta_caller():
+    return Beta.helper(None)
+"#,
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    // 1. Without --file, Alpha.helper is ambiguous across one.py and two.py
+    let (_, stderr, code) = run_cli(&project, &["refs", "Alpha.helper"]);
+    assert_ne!(code, 0, "ambiguous qualified refs without --file must fail");
+    assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
+
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "Alpha.helper"]);
+    assert_ne!(code, 0, "ambiguous qualified callgraph without --file must fail");
+    assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
+
+    let (_, stderr, code) = run_cli(&project, &["impact", "Alpha.helper"]);
+    assert_ne!(code, 0, "ambiguous qualified impact without --file must fail");
+    assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
+
+    // 2. With --file two.py, Alpha.helper disambiguates to two.py:
+    // It must NOT merge with one.py and must NOT traverse Beta.helper
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["callgraph", "Alpha.helper", "--file", "two.py", "--direction", "callers", "--json"],
+    );
+    assert_eq!(code, 0);
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let names: Vec<&str> = graph["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(names.contains(&"caller_two"), "should include caller_two: {names:?}");
+    assert!(!names.contains(&"caller_one"), "must exclude caller_one from other file: {names:?}");
+    assert!(!names.contains(&"beta_caller"), "must exclude beta_caller: {names:?}");
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "Alpha.helper", "--file", "two.py", "--json"],
+    );
+    assert_eq!(code, 0);
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "Alpha.helper");
+    assert_eq!(impact["direct_callers"], 1); // only caller_two, not caller_one, not beta_caller
 }

@@ -35,6 +35,168 @@ pub(super) struct PythonImportBinding {
 }
 
 pub(super) type PythonImportBindings = HashMap<(String, String), PythonImportBinding>;
+pub(super) type PythonLocalBindings = HashMap<String, HashSet<String>>;
+
+fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
+    &source[node.start_byte()..node.end_byte()]
+}
+
+/// Collect names bound in function scopes (parameters, local assignments, and
+/// nested definitions) to prevent module-level imports from binding to shadowed names.
+pub(super) fn collect_python_local_bindings(
+    tree: &tree_sitter::Tree,
+    source: &str,
+) -> PythonLocalBindings {
+    let mut out: PythonLocalBindings = HashMap::new();
+    walk_python_scopes(&tree.root_node(), source, None, &mut out);
+    out
+}
+
+fn walk_python_scopes(
+    node: &tree_sitter::Node,
+    source: &str,
+    current_class: Option<&str>,
+    out: &mut PythonLocalBindings,
+) {
+    match node.kind() {
+        "class_definition" => {
+            let class_name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, source));
+            if let Some(body) = node.child_by_field_name("body") {
+                for i in 0..body.named_child_count() {
+                    if let Some(child) = body.named_child(i) {
+                        walk_python_scopes(&child, source, class_name, out);
+                    }
+                }
+            }
+        }
+        "function_definition" | "async_function_definition" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let fn_name = node_text(&name_node, source);
+                let qualified_name = current_class
+                    .map(|cls| format!("{}.{}", cls, fn_name))
+                    .unwrap_or_else(|| fn_name.to_string());
+
+                let mut locals = HashSet::new();
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    collect_py_param_idents(&params, source, &mut locals);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    collect_py_body_bindings(&body, source, &mut locals, 0);
+                }
+
+                out.entry(qualified_name.clone()).or_default().extend(locals.clone());
+                if fn_name != qualified_name {
+                    out.entry(fn_name.to_string()).or_default().extend(locals);
+                }
+
+                // Recurse into body to collect nested functions/classes
+                if let Some(body) = node.child_by_field_name("body") {
+                    for i in 0..body.named_child_count() {
+                        if let Some(child) = body.named_child(i) {
+                            walk_python_scopes(&child, source, None, out);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    walk_python_scopes(&child, source, current_class, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_py_param_idents(node: &tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            match child.kind() {
+                "identifier" => {
+                    out.insert(node_text(&child, source).to_string());
+                }
+                "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        if name.kind() == "identifier" {
+                            out.insert(node_text(&name, source).to_string());
+                        }
+                    }
+                }
+                "list_splat_pattern" | "dictionary_splat_pattern" => {
+                    for j in 0..child.named_child_count() {
+                        if let Some(sub) = child.named_child(j) {
+                            if sub.kind() == "identifier" {
+                                out.insert(node_text(&sub, source).to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn collect_py_body_bindings(
+    node: &tree_sitter::Node,
+    source: &str,
+    out: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > 50 {
+        return;
+    }
+    match node.kind() {
+        "function_definition" | "async_function_definition" | "class_definition" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.insert(node_text(&name, source).to_string());
+            }
+            return;
+        }
+        "assignment" | "augmented_assignment" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_idents(&left, source, out);
+            }
+        }
+        "for_statement" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_idents(&left, source, out);
+            }
+        }
+        "with_item" | "as_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                collect_idents(&alias, source, out);
+            } else if let Some(target) = node.child_by_field_name("target") {
+                collect_idents(&target, source, out);
+            }
+        }
+        "named_expression" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_idents(&name, source, out);
+            }
+        }
+        _ => {}
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_py_body_bindings(&child, source, out, depth + 1);
+        }
+    }
+}
+
+fn collect_idents(node: &tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, source).to_string());
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_idents(&child, source, out);
+        }
+    }
+}
 
 /// Map `(lexical_scope, local_name)` to the imported Python symbol. Module-level
 /// bindings are fallback-visible from function scopes; function-local imports
@@ -72,11 +234,21 @@ pub(super) fn build_python_import_bindings(relations: &[ParsedRelation]) -> Pyth
 
 pub(super) fn find_python_import_binding<'a>(
     bindings: &'a PythonImportBindings,
+    local_bindings: &PythonLocalBindings,
     scope: &str,
     local_name: &str,
 ) -> Option<&'a PythonImportBinding> {
-    bindings.get(&(scope.to_string(), local_name.to_string()))
-        .or_else(|| bindings.get(&("<module>".to_string(), local_name.to_string())))
+    if let Some(binding) = bindings.get(&(scope.to_string(), local_name.to_string())) {
+        return Some(binding);
+    }
+    if scope != "<module>" {
+        if let Some(locals) = local_bindings.get(scope) {
+            if locals.contains(local_name) {
+                return None;
+            }
+        }
+    }
+    bindings.get(&("<module>".to_string(), local_name.to_string()))
 }
 
 

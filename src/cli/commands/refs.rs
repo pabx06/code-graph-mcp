@@ -272,12 +272,14 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             Vec::new()
         };
         if !qualified_ids.is_empty() {
+            let target = RefsTarget::QualifiedName {
+                file_path: explicit_file.map(|s| s.to_string()),
+            };
+            target.reject_if_ambiguous(conn, raw_symbol, json_mode)?;
             (
                 qualified_ids,
                 raw_symbol.to_string(),
-                RefsTarget::QualifiedName {
-                    file_path: explicit_file.map(|s| s.to_string()),
-                },
+                target,
             )
         } else {
             let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);

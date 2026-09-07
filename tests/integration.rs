@@ -4415,6 +4415,9 @@ class Beta:
 def static_call():
     return Alpha.helper(None)
 
+def beta_static_call():
+    return Beta.helper(None)
+
 def unknown_receiver(alpha):
     return alpha.helper()
 "#,
@@ -4446,6 +4449,11 @@ def unknown_receiver(alpha):
     assert!(
         names.contains(&"static_call"),
         "Alpha.helper should include static caller, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"beta_static_call"),
+        "Alpha.helper must not include Beta caller beta_static_call, got: {:?}",
         names
     );
     assert!(
@@ -4481,6 +4489,11 @@ def unknown_receiver(alpha):
         names
     );
     assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified call graph must not include Beta caller beta_static_call, got: {:?}",
+        names
+    );
+    assert!(
         !names.contains(&"unknown_receiver"),
         "qualified call graph must not include unknown receiver, got: {:?}",
         names
@@ -4513,6 +4526,11 @@ def unknown_receiver(alpha):
         names
     );
     assert!(
+        !names.contains(&"beta_static_call"),
+        "qualified AST lookup must not include Beta caller beta_static_call, got: {:?}",
+        names
+    );
+    assert!(
         !names.contains(&"unknown_receiver"),
         "qualified AST lookup must not include unknown receiver, got: {:?}",
         names
@@ -4530,4 +4548,99 @@ def unknown_receiver(alpha):
     let resp = server.handle_message(&ast).unwrap();
     let result = parse_tool_result(&resp);
     assert_eq!(result["qualified_name"], "Alpha.helper");
+}
+#[test]
+fn test_python_module_alias_call_resolution() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("api.py"),
+        r#"
+def execute():
+    return 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("main.py"),
+        r#"
+import api as a
+
+def invoke():
+    return a.execute()
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "execute",
+            "relation": "calls"
+        }),
+    );
+    let resp = server.handle_message(&refs).unwrap();
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    let names: Vec<&str> = refs
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"invoke"),
+        "aliased module import call a.execute() should resolve to execute, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_python_shadowed_local_import_not_resolved() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("api.py"),
+        r#"
+def execute():
+    return 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("consumer.py"),
+        r#"
+from api import execute as run
+
+def wrapper(run):
+    return run()
+
+def normal_caller():
+    return run()
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "execute",
+            "relation": "calls"
+        }),
+    );
+    let resp = server.handle_message(&refs).unwrap();
+    let result = parse_tool_result(&resp);
+    let refs = result["references"].as_array().unwrap();
+    let names: Vec<&str> = refs
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"normal_caller"),
+        "unshadowed caller should resolve to execute, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"wrapper"),
+        "shadowed parameter in wrapper(run) must not resolve to execute, got: {:?}",
+        names
+    );
 }

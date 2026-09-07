@@ -50,8 +50,8 @@ use super::js_modules::{
     resolve_php_include_path,
 };
 use super::python_modules::{
-    build_python_import_bindings, build_python_module_map, find_python_import_binding,
-    project_module_files, resolve_python_module_targets,
+    build_python_import_bindings, build_python_module_map, collect_python_local_bindings,
+    find_python_import_binding, project_module_files, resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
@@ -1164,7 +1164,7 @@ fn resolve_batch_relations(
     let mut unresolved_externals: Vec<(i64, String, String)> = Vec::new();
 
     for pf in batch_parsed {
-        let relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
+        let mut relations = extract_relations_from_tree(&pf.tree, &pf.source, &pf.language);
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
 
         // Pre-scan this file's require-namespace bindings
@@ -1202,8 +1202,13 @@ fn resolve_batch_relations(
         } else {
             HashMap::new()
         };
+        let python_local_bindings = if pf.language == "python" {
+            collect_python_local_bindings(&pf.tree, &pf.source)
+        } else {
+            HashMap::new()
+        };
 
-        for rel in &relations {
+        for rel in &mut relations {
             // Contract: extract_relations_from_tree stamps every relation with
             // source_language equal to the language argument. The
             // same-language resolution at line 811+ depends on it. Hard
@@ -1354,17 +1359,30 @@ fn resolve_batch_relations(
             // precisely than global name matching. Internal imports bind to
             // the imported module only; aliased imports bind to the original
             // exported name.
-            if rel.relation == REL_CALLS && pf.language == "python" && rel.metadata.is_none() {
-                if let Some(binding) = find_python_import_binding(
-                    &python_import_bindings,
-                    &rel.source_name,
-                    &rel.target_name,
-                ) {
-                    // Relative imports need package context that the current
-                    // module map does not model. Keep their existing pending
-                    // behavior until that resolution is implemented.
-                    if !binding.module.is_empty() && !binding.module.starts_with('.') {
-                        if !binding.is_module_import {
+            if rel.relation == REL_CALLS && pf.language == "python" {
+                use super::resolve::{parse_callee_metadata, CalleeMeta};
+                if rel.metadata.is_none() {
+                    // If the function scope shadows target_name (via parameter, assignment,
+                    // or nested definition), it is a dynamic invocation of a local, not a call
+                    // to any imported or global symbol.
+                    if let Some(locals) = python_local_bindings.get(&rel.source_name) {
+                        if locals.contains(&rel.target_name) {
+                            continue;
+                        }
+                    }
+                    if let Some(binding) = find_python_import_binding(
+                        &python_import_bindings,
+                        &python_local_bindings,
+                        &rel.source_name,
+                        &rel.target_name,
+                    ) {
+                        // Relative imports need package context that the current
+                        // module map does not model. Keep their existing pending
+                        // behavior until that resolution is implemented.
+                        if !binding.module.is_empty()
+                            && !binding.module.starts_with('.')
+                            && !binding.is_module_import
+                        {
                             if let Some(module_files) = project_module_files(&binding.module, python_module_map) {
                                 if let Some(module_targets) = resolve_python_module_targets(
                                     &module_files, false, &binding.imported_name,
@@ -1402,6 +1420,29 @@ fn resolve_batch_relations(
                                     }
                                 }
                                 continue;
+                            }
+                        }
+                    }
+                } else if let Some(CalleeMeta::Path(segments)) = parse_callee_metadata(rel.metadata.as_deref()) {
+                    // For aliased module imports (e.g. `import api as a; a.execute()`),
+                    // rewrite the leading path segment to the imported module's path
+                    // before candidate filtering/deferral so it resolves against the
+                    // actual module path.
+                    if let Some(first) = segments.first() {
+                        if let Some(binding) = find_python_import_binding(
+                            &python_import_bindings,
+                            &python_local_bindings,
+                            &rel.source_name,
+                            first,
+                        ) {
+                            if binding.is_module_import {
+                                let mod_segments: Vec<String> = binding.module.split('.').map(String::from).collect();
+                                let mut new_segments = mod_segments;
+                                new_segments.extend(segments.iter().skip(1).cloned());
+                                rel.metadata = Some(serde_json::json!({
+                                    "q": "path",
+                                    "v": new_segments.join("::"),
+                                }).to_string());
                             }
                         }
                     }
