@@ -332,6 +332,75 @@ test('removeCacheResidue deletes ~/.cache/code-graph and is idempotent', (t) => 
   assert.equal(run(), 'true', 'second call is a no-op success (idempotent force-rm)');
 });
 
+// JS-33 (v0.140.0 pre-ship review): the preservation was read-into-memory →
+// destroy → write back. The window between the second and third step is the
+// whole registry: if the write-back throws, the only record of which repos
+// carry a managed CLAUDE.md block is gone, and the function still returns true.
+// The review judged it non-blocking because routing uninstall() through here is
+// strictly better than the unconditional rmSync it replaced — but the window
+// predates JS-17 and is reachable from cleanupDisabledStatusline and
+// session-init too.
+test('removeCacheResidue does not lose the registry when the restore write fails', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'adopted-projects.json');
+  const adopted = [{ cwd: '/some/project', at: '2026-09-07T00:00:00.000Z' }];
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+  writeJson(registryPath, adopted);
+
+  const out = execFileSync(process.execPath, ['-e', `
+    const fs = require('fs');
+    const realWrite = fs.writeFileSync;
+    // Inject at the exact step the review named — a write that fails after the
+    // wipe has already happened (ENOSPC, EACCES, a full quota).
+    fs.writeFileSync = (p, ...rest) => {
+      if (String(p).endsWith('adopted-projects.json')) {
+        throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      }
+      return realWrite(p, ...rest);
+    };
+    const { removeCacheResidue } = require(${JSON.stringify(lifecyclePath)});
+    process.stdout.write(JSON.stringify(removeCacheResidue()));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
+
+  assert.equal(out, 'true', 'the disk is still reclaimed');
+  assert.equal(
+    fs.existsSync(path.join(cacheDir, 'bin', 'marker.json')), false,
+    'the residue this function exists for must still be gone',
+  );
+  assert.ok(
+    fs.existsSync(registryPath),
+    'the registry must survive a failed restore — it is the only record of which ' +
+    'repos still carry a managed block',
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(registryPath, 'utf8')), adopted,
+    'and survive with its contents, not as an empty stub',
+  );
+});
+
+// Negative control: the ordinary path still preserves a non-empty registry and
+// still clears everything else, so the test above cannot be passing on a
+// preservation that simply never deletes anything.
+test('removeCacheResidue keeps a non-empty registry and drops the rest', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'adopted-projects.json');
+  const adopted = [{ cwd: '/some/project' }];
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+  writeJson(registryPath, adopted);
+
+  execFileSync(process.execPath, ['-e', `
+    require(${JSON.stringify(lifecyclePath)}).removeCacheResidue();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } });
+
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, 'utf8')), adopted);
+  assert.deepEqual(
+    fs.readdirSync(cacheDir), ['adopted-projects.json'],
+    'the registry is the ONLY thing allowed to survive',
+  );
+});
+
 function legacyHooksFromPlugin() {
   return {
     SessionStart: [{

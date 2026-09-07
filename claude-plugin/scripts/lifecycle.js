@@ -1999,15 +1999,67 @@ function removeCacheResidue() {
       if (!usable || !Array.isArray(parsed) || parsed.length) registry = raw;
     }
   } catch { /* POSIX-only helper or an unreadable path — nothing to preserve */ }
-  try {
-    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
-  } catch { return false; }
+
+  // JS-33: move it ASIDE before the wipe rather than holding it only in memory.
+  // Read → destroy → write-back makes the restore the single point of failure
+  // for the whole registry: one ENOSPC/EACCES on that last write and the only
+  // record of which repos carry a managed block is gone, with `true` returned.
+  // A rename inside ~/.cache leaves the bytes on disk under a name the wipe
+  // cannot reach, so every failure after it is recoverable. The stash must live
+  // OUTSIDE CACHE_DIR — a sibling name in the same directory would be deleted by
+  // the very rmSync it is protecting the file from — and the rename is
+  // same-filesystem, so it is atomic and carries the file's mode with it.
+  let stashPath = null;
   if (registryPath && registry) {
+    const candidate = path.join(
+      path.dirname(CACHE_DIR),
+      `.code-graph-adopted-projects.${process.pid}.stash`,
+    );
+    try {
+      fs.renameSync(registryPath, candidate);
+      stashPath = candidate;
+    } catch {
+      // Rename unavailable (a mount boundary, a read-only parent). Fall through
+      // holding `registry` in memory: that is exactly the old behaviour, so this
+      // path is never worse than what it replaces.
+      stashPath = null;
+    }
+  }
+
+  // Put the registry back however we saved it. Called on the failure path too:
+  // a `false` return that silently leaves the file parked under a dot-name
+  // would be a second, quieter version of the loss this is fixing.
+  const restoreRegistry = () => {
+    // Nothing to put back: return BEFORE the mkdirSync below, or a run with no
+    // registry to preserve re-creates CACHE_DIR empty and hands the user back
+    // the residue this function just reclaimed.
+    if (!registryPath || (!stashPath && !registry)) return;
     try {
       fs.mkdirSync(path.dirname(registryPath), { recursive: true });
-      fs.writeFileSync(registryPath, registry);
-    } catch { /* best-effort: the binary is still reclaimed */ }
+      if (stashPath) fs.renameSync(stashPath, registryPath);
+      else if (registry) fs.writeFileSync(registryPath, registry);
+      return;
+    } catch { /* fall through to the report below */ }
+    // Both restores failed. With the stash the bytes still exist, so say where
+    // instead of dropping the only pointer to them on the floor.
+    if (stashPath && fs.existsSync(stashPath)) {
+      try {
+        process.stderr.write(
+          `[code-graph] Could not restore ${registryPath}; the adopted-projects ` +
+          `registry is preserved at ${stashPath} — move it back by hand before ` +
+          'running `--unadopt-all`.\n',
+        );
+      } catch { /* stderr gone too — nothing further to try */ }
+    }
+  };
+
+  try {
+    fs.rmSync(CACHE_DIR, { recursive: true, force: true });
+  } catch {
+    restoreRegistry();
+    return false;
   }
+  restoreRegistry();
   return true;
 }
 
