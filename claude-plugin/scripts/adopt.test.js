@@ -176,6 +176,55 @@ test('the block stays machine-independent — no resolved home path', () => {
   }
 });
 
+// SessionStart now hands users this file's raw entry point (`node adopt.js
+// unadopt`) instead of the binary, which validates arguments in main.rs before
+// dispatching. The arm used to read `argv[2] === 'unadopt' ? … : 'adopt'`, so
+// anything else — `--help`, a mistyped verb — fell through to ADOPT and wrote to
+// the user's CLAUDE.md. Both binary call sites are preserved: `["unadopt"]` for
+// unadopt, no arguments at all for adopt.
+test('the adopt.js entry point refuses anything but its two verbs', (t) => {
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+  const run = (args) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-adopt-argv-'));
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    // The project must NOT be $HOME itself: `isNonProjectCwd` refuses to adopt a
+    // home directory, so a fixture that conflates them tests the wrong refusal.
+    const proj = path.join(home, 'proj');
+    fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(proj, 'package.json'), '{"name":"p"}');
+    const res = spawnSync(process.execPath, [path.join(__dirname, 'adopt.js'), ...args], {
+      cwd: proj,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+      },
+    });
+    return { res, proj };
+  };
+
+  for (const args of [['--help'], ['unadpot'], ['unadopt', '--force'], ['adopt', 'extra']]) {
+    const { res, proj } = run(args);
+    assert.equal(res.status, 2, `${args.join(' ')} must be refused; stderr: ${res.stderr}`);
+    assert.match(res.stderr, /Usage: node adopt\.js/);
+    assert.equal(
+      fs.existsSync(path.join(proj, 'CLAUDE.md')), false,
+      `${args.join(' ')} must not have written a block on the way to being refused`,
+    );
+  }
+
+  // Control: the two real invocations still work, or the guard above is just a
+  // way of breaking the command.
+  const { res: unadopted } = run(['unadopt']);
+  assert.equal(unadopted.status, 0, `unadopt still works; stderr: ${unadopted.stderr}`);
+  const { res: adopted, proj } = run([]);
+  assert.equal(adopted.status, 0, `bare invocation still adopts; stderr: ${adopted.stderr}`);
+  assert.ok(fs.existsSync(path.join(proj, 'CLAUDE.md')), 'and it wrote the block');
+});
+
 // ── adopt — installs CLAUDE.md block + .claude/ detail ──────────────────────
 
 test('adopt creates CLAUDE.md with the block when none exists', () => {

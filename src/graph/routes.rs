@@ -121,13 +121,14 @@ mod tests {
     use super::*;
     use crate::storage::queries::helpers::test_db;
 
-    // Coverage owed from the round that added `RouteCallers` (2026-09-07): the
-    // `(true, true)` cause arm and the empty-callers early return were both
-    // written and never executed. Neither is reachable from a CLI surface today
-    // — `impact --depth` is clamped in `clamp_arg`, so `depth_capped` cannot
-    // co-occur with `limit_hit` there — and that is precisely why they are unit
-    // tests: this struct is the SHARED layer, and the comment above the early
-    // return says the next caller may not clamp its arguments.
+    // Coverage owed from the round that added `RouteCallers` (2026-09-07). The
+    // `(true, true)` cause arm was written and never executed, and it is not
+    // reachable from a CLI surface today — `impact --depth` is clamped in
+    // `clamp_arg`, so `depth_capped` cannot co-occur with `limit_hit` there.
+    // That is precisely why it is a unit test: this struct is the SHARED layer
+    // and the next caller need not clamp its arguments. (The empty-callers early
+    // return that used to be listed here turned out to be dead code and was
+    // deleted; what remains is the outcome test below.)
     fn route_callers(limit_hit: bool, depth_capped: bool) -> RouteCallers {
         RouteCallers {
             callers: vec![],

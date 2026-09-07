@@ -33,8 +33,18 @@ function acquireLock(lockPath, { staleMs = STALE_MS } = {}) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-      fs.closeSync(fd);
+      try {
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+        fs.closeSync(fd);
+      } catch (writeErr) {
+        // The file exists but has no payload. `lockIsStale` JSON.parses it, so an
+        // empty husk reads as "held by someone" for the whole stale window — a
+        // lock nobody owns that nobody can reclaim. Clean it up and report the
+        // failure honestly instead.
+        try { fs.closeSync(fd); } catch { /* already closed */ }
+        try { fs.unlinkSync(lockPath); } catch { /* best effort */ }
+        return null;
+      }
       return { release: () => { try { fs.unlinkSync(lockPath); } catch { /* ok */ } } };
     } catch (e) {
       if (!e || e.code !== 'EEXIST') return null;

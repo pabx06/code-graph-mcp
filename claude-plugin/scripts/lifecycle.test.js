@@ -427,6 +427,88 @@ test('two concurrent reclaims cannot destroy the registry between them', (t) => 
   );
 });
 
+// Round 2 of the pre-ship review: `if (!lock) return true` conflated "a peer is
+// doing this" with "we could not create a lock file at all". In the second case
+// there is no peer, and the function reported success while leaving the ~40MB
+// binary in place — the exact outcome it exists to prevent.
+test('a reclaim that cannot take a lock still reclaims', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+
+  // Make the lock UNCREATABLE without touching the cache dir: a directory where
+  // the lock file wants to be. `openSync(..., 'wx')` fails, and `existsSync` is
+  // true for it — which is the trap. Only a lock FILE means a peer holds it,
+  // and this test is what caught the first version asking the weaker question.
+  const lockPath = path.join(homeDir, '.cache', '.code-graph-residue.lock');
+  fs.mkdirSync(lockPath, { recursive: true });
+
+  const out = execFileSync(process.execPath, ['-e', `
+    process.stdout.write(String(require(${JSON.stringify(lifecyclePath)}).removeCacheResidue()));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
+
+  assert.equal(out, 'true');
+  assert.equal(
+    fs.existsSync(path.join(cacheDir, 'bin', 'marker.json')), false,
+    'an unobtainable lock must not turn the reclaim into a silent no-op that ' +
+    'still reports success',
+  );
+});
+
+// The counterpart: when the lock file is genuinely held by a peer, skipping IS
+// correct — that is what keeps the two of them from destroying the registry
+// between them. Without this control the fix above would just be "never lock".
+test('a reclaim defers to a peer that already holds the lock', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+  const lockPath = path.join(homeDir, '.cache', '.code-graph-residue.lock');
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+
+  const out = execFileSync(process.execPath, ['-e', `
+    process.stdout.write(String(require(${JSON.stringify(lifecyclePath)}).removeCacheResidue()));
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir } }).toString();
+
+  assert.equal(out, 'true');
+  assert.ok(
+    fs.existsSync(path.join(cacheDir, 'bin', 'marker.json')),
+    'a live peer holds the lock — this process must not race it',
+  );
+});
+
+// Also round 2: the recovery only fires when the live registry is ABSENT, so a
+// project re-adopted after a killed run left both files present and the
+// rename-aside renamed the live registry OVER the orphan, destroying bytes that
+// named projects the current registry does not.
+test('an orphan stash is not clobbered when a live registry also exists', (t) => {
+  const homeDir = mkHome(t);
+  const cacheDir = path.join(homeDir, '.cache', 'code-graph');
+  const registryPath = path.join(cacheDir, 'adopted-projects.json');
+  const stashPath = path.join(homeDir, '.cache', '.code-graph-adopted-projects.stash');
+  const orphaned = [{ cwd: '/a' }, { cwd: '/b' }];
+  const live = [{ cwd: '/newly-adopted' }];
+  writeJson(stashPath, orphaned);
+  writeJson(registryPath, live);
+  writeJson(path.join(cacheDir, 'bin', 'marker.json'), { v: 1 });
+
+  const res = execFileSync(process.execPath, ['-e', `
+    require(${JSON.stringify(lifecyclePath)}).removeCacheResidue();
+  `], { env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir }, encoding: 'utf8' });
+
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(registryPath, 'utf8')), live,
+    'the live registry still survives the wipe',
+  );
+  assert.ok(
+    fs.existsSync(stashPath),
+    'and the orphan is NOT destroyed by the rename-aside: it names projects ' +
+    'the live registry does not, and only the user can reconcile them',
+  );
+  assert.deepEqual(JSON.parse(fs.readFileSync(stashPath, 'utf8')), orphaned);
+  assert.equal(res, '', 'the report goes to stderr, not stdout');
+});
+
 // A predecessor killed between the rename and the restore leaves the bytes under
 // the stash name. Nothing else on the system looks there, so without recovery
 // every reader — including `uninstall --unadopt-all` — sees the registry as

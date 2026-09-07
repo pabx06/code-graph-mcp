@@ -1978,9 +1978,12 @@ function isPluginUninstalled(settings = readJson(settingsPath()) || {}) {
 // Where the registry is parked while CACHE_DIR is wiped, and the lock that keeps
 // two of these from interleaving. Both live in CACHE_DIR's PARENT: a sibling of
 // the registry would be deleted by the very rmSync it is being protected from.
-// The stash name is FIXED, not pid-suffixed — a pid-unique name that outlives a
+// The stash name is FIXED, not pid-suffixed: a pid-unique name that outlives a
 // SIGKILL'd process is unrecoverable residue nobody looks for, whereas a fixed
-// one is found and restored by the next run (see the recovery step below).
+// one is picked up by the recovery step below when the live registry is gone.
+// When the registry is NOT gone — a project re-adopted after the kill — the
+// orphan is left alone and reported rather than overwritten; the two lists can
+// disagree and only the user can say which projects still carry a block.
 const REGISTRY_STASH = path.join(path.dirname(CACHE_DIR), '.code-graph-adopted-projects.stash');
 const RESIDUE_LOCK = path.join(path.dirname(CACHE_DIR), '.code-graph-residue.lock');
 
@@ -1997,7 +2000,28 @@ function removeCacheResidue() {
   // return success without touching anything rather than racing it. That is
   // honest: the residue IS being reclaimed, just not by us.
   const lock = acquireLock(RESIDUE_LOCK);
-  if (!lock) return true;
+  if (!lock) {
+    // `acquireLock` returns null for two very different reasons and the first
+    // version of this treated them alike, which is worse than having no lock:
+    //
+    //   * the file EXISTS — a live peer holds it (or a fresh one is wedged until
+    //     `STALE_MS` lets it be reclaimed). Skipping is correct; the peer is
+    //     doing this work, and session-init calls us again next session.
+    //   * the file does NOT exist — we could not create it at all (read-only
+    //     ~/.cache, ENOSPC). There is no peer to race, and returning early left
+    //     the ~40MB binary in place while reporting success. Do the work
+    //     unlocked: that is exactly the behaviour that shipped before the lock
+    //     existed, so this branch can never be worse than its predecessor.
+    // `statSync().isFile()`, not `existsSync`: anything else occupying that path
+    // — a directory, most obviously — also makes `openSync(…,'wx')` fail, and
+    // `existsSync` answers true for it. A first version of this asked only
+    // whether something was there, so an uncreatable lock was still read as a
+    // peer and the reclaim was still skipped. Only a lock FILE means a peer.
+    let heldByPeer = false;
+    try { heldByPeer = fs.statSync(RESIDUE_LOCK).isFile(); } catch { /* absent */ }
+    if (heldByPeer) return true;
+    return removeCacheResidueLocked();
+  }
   try {
     return removeCacheResidueLocked();
   } finally {
@@ -2056,7 +2080,25 @@ function removeCacheResidueLocked() {
   // same-filesystem, so it is atomic and carries the file's mode with it.
   let stashPath = null;
   if (registryPath && registry) {
+    // Never rename ONTO an existing stash. The recovery above only fires when
+    // the live registry is absent, so a project re-adopted after a killed run
+    // leaves both files present — and renaming the live one over the orphan
+    // destroyed bytes that named projects the current registry does not. Keep
+    // both: fall back to the in-memory path this run and say where the orphan
+    // is, once, so it stops being invisible.
+    let orphan = false;
+    try { orphan = fs.statSync(REGISTRY_STASH).isFile(); } catch { /* absent */ }
+    if (orphan) {
+      try {
+        process.stderr.write(
+          `[code-graph] An earlier run left an adopted-projects registry at ` +
+          `${REGISTRY_STASH}. It names projects the current registry may not; ` +
+          'merge it by hand, or delete it once you have checked.\n',
+        );
+      } catch { /* stderr gone — the file still survives, which is the point */ }
+    }
     try {
+      if (orphan) throw new Error('orphan stash present — not clobbering it');
       fs.renameSync(registryPath, REGISTRY_STASH);
       stashPath = REGISTRY_STASH;
     } catch {

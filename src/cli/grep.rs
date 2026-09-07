@@ -1013,7 +1013,10 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         // blanket `rebuild-index --confirm` (a destructive drop-and-rebuild) is
         // the wrong advice for a transient `database is locked` from a concurrent
         // indexer, which this same message fires on: busy_timeout is 5 s.
-        let transient = reason.contains("locked") || reason.contains("busy");
+        // From the FULL error, not `reason`: that is truncated at 160 chars, so a
+        // long rusqlite message whose "database is locked" falls past the cut
+        // would otherwise be handed the destructive advice.
+        let transient = err.contains("locked") || err.contains("busy");
         eprintln!(
             "[code-graph] AST annotation unavailable for {} of {} file(s) with matches — \
              the index query failed ({}: {}). Hits in those file(s) are plain grep \

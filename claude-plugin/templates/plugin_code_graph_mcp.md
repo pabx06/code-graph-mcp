@@ -57,10 +57,10 @@ type: reference
 > PATH（issue #41）。
 >
 > **三个例外**：`doctor` / `adopt` / `unadopt` 是 JS 派发的——二进制会去自己旁边
-> 找 `claude-plugin/scripts/adopt.js`，而缓存目录里没有那个邻居，所以从缓存路径
-> 调它们会报 `adopt.js not found`。这三个直接跑脚本：
+> 找对应脚本（前者 `doctor.js`，后两者 `adopt.js`），而缓存目录里没有那些邻居，
+> 所以从缓存路径调它们会报 `<脚本名> not found`。直接跑脚本即可：
 > `node <插件目录>/claude-plugin/scripts/adopt.js unadopt`（SessionStart 的提示行
-> 会印出这台机器上的完整路径）。
+> 会印出这台机器上的完整路径）、`node <插件目录>/claude-plugin/scripts/doctor.js`。
 >
 > `grep` 是 drop-in 替代：`-F` 字面 / `-i` / `-w` / `-l` / `-c` 计数 / `-t <lang>` 按语言筛 /
 > `-g <glob>` 路径过滤 / `-A/-B/-C N` 上下文 / `-M N` 行宽上限（默认 512，防长行刷屏）/

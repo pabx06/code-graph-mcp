@@ -6609,6 +6609,48 @@ app.post('/api/login', handleLogin);
         }
     }
 
+    /// The FUZZY arm of `get_call_graph` — "no exact match, here are near
+    /// misses" — was the one changed surface with no coverage at all: nothing
+    /// under src/ or tests/ matched "No exact match for". It shipped a new cap
+    /// AND new wording untested, while the CLI's twin has been capping at five
+    /// all along, so the same query answered with a different number of
+    /// candidates depending on which surface asked.
+    #[test]
+    fn the_fuzzy_call_graph_arm_caps_and_discloses_like_its_cli_twin() {
+        let project = TempDir::new().unwrap();
+        let mut src = String::new();
+        for i in 0..7 {
+            src.push_str(&format!(
+                "pub struct F{i};\nimpl F{i} {{ pub fn surf34_fuzzy_hit(&self) {{}} }}\n"
+            ));
+        }
+        std::fs::write(project.path().join("a.rs"), src).unwrap();
+        let server = McpServer::new_test_with_project(project.path());
+        server.ensure_indexed().unwrap();
+
+        // A partial name: no exact match, seven near misses.
+        let out = server
+            .dispatch_tool(
+                "get_call_graph",
+                &json!({ "function_name": "surf34_fuzzy_hi", "direction": "callers" }),
+            )
+            .unwrap();
+        let suggestion = out["suggestion"].as_str().unwrap_or_default();
+        assert!(
+            suggestion.starts_with("No exact match for"),
+            "fixture precondition: this must take the fuzzy arm, not the exact one: {out}"
+        );
+        assert!(
+            suggestion.contains("Showing the first 5 of 7"),
+            "the fuzzy arm hides two candidates and must say so, like the CLI's: {out}"
+        );
+        assert_eq!(
+            out["candidates"].as_array().map(|a| a.len()),
+            Some(crate::resolve::SUGGESTION_CAP),
+            "and cap the list it disclosed: {out}"
+        );
+    }
+
     #[test]
     fn test_find_references_same_file_multi_def_uses_the_shared_ambiguity_envelope() {
         let project = TempDir::new().unwrap();

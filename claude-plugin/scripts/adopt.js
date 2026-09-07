@@ -909,7 +909,25 @@ function formatResult(action, result) {
 }
 
 if (require.main === module) {
-  const action = process.argv[2] === 'unadopt' ? 'unadopt' : 'adopt';
+  // Strict, because SessionStart now hands users this entry point directly
+  // (`node <…>/adopt.js unadopt`) rather than the binary, which validates its
+  // arguments in main.rs before dispatching here. The old `argv[2] === 'unadopt'
+  // ? … : 'adopt'` fell back to ADOPT for anything else, so `--help` performed
+  // an unadopt where the binary prints help, and a mistyped verb silently
+  // adopted the current project — the footgun main.rs's `reject_extra_args`
+  // exists to prevent.
+  //
+  // Both binary call sites stay valid: main.rs passes `["unadopt"]` for unadopt
+  // and no arguments at all for adopt.
+  const argv = process.argv.slice(2);
+  const action = argv.length === 0 ? 'adopt' : argv[0];
+  if (argv.length > 1 || (action !== 'adopt' && action !== 'unadopt')) {
+    process.stderr.write(
+      `[code-graph] Usage: node ${path.basename(__filename)} [adopt|unadopt]\n` +
+      '  Exactly one verb and no flags. No argument means `adopt`.\n' +
+      '  Refusing rather than guessing: both verbs write to your CLAUDE.md.\n');
+    process.exit(2);
+  }
   const result = action === 'unadopt' ? unadopt() : adopt();
   process.stdout.write(formatResult(action, result) + '\n');
   process.exit(result.ok === false ? 1 : 0);
