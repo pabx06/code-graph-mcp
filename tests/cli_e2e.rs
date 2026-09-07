@@ -4025,6 +4025,120 @@ pub fn make_them() {
     project
 }
 
+/// Seven non-test definitions of one name in one file — two more than an
+/// ambiguity envelope will list (`resolve::SUGGESTION_CAP`).
+fn setup_overflowing_overload_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let mut src = String::new();
+    for i in 0..7 {
+        src.push_str(&format!(
+            "pub struct S{i};\nimpl S{i} {{\n    pub fn build() -> Self {{ S{i} }}\n}}\n"
+        ));
+    }
+    std::fs::write(project.path().join("lib.rs"), src).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+// SURF-34: the envelope counted seven definitions and listed five, with nothing
+// saying the list was cut — a caller that trusts it reads the two it never saw
+// as nonexistent. Both CLI arms are checked here because the human arm prints
+// the note after the list and the JSON arm inside `error`; and `emit_exact_
+// ambiguity` (this test) and `emit_fuzzy_ambiguity` (the next) build their
+// message in DIFFERENT places, so one passing proves nothing about the other.
+#[test]
+fn test_cli_ambiguity_discloses_that_its_suggestion_list_was_capped() {
+    let project = setup_overflowing_overload_project();
+
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "build"]);
+    assert_eq!(code, 1, "seven overloads must error; stderr={stderr:?}");
+    assert!(
+        stderr.contains("7 definitions"),
+        "the true count must survive; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Showing the first 5 of 7"),
+        "the human arm must say the list below it is capped; got: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches("[node_id ").count(),
+        5,
+        "the cap itself is unchanged; got: {stderr:?}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "build", "--json"]);
+    assert_eq!(code, 1, "the JSON arm exits 1 too; stdout={stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("7 definitions") && err.contains("Showing the first 5 of 7"),
+        "the JSON error must carry both numbers; got: {err:?}"
+    );
+    assert_eq!(
+        v["suggestions"].as_array().map(|a| a.len()),
+        Some(5),
+        "suggestions stay capped at 5; got: {v}"
+    );
+}
+
+// The fuzzy arm builds its message from a local `stem` + a caller-supplied
+// suffix rather than through `resolve::ambiguity_message`, so it needs its own
+// proof. `buil` is a substring of all seven `build` definitions.
+#[test]
+fn test_cli_fuzzy_ambiguity_discloses_its_cap_after_the_suffix() {
+    let project = setup_overflowing_overload_project();
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "buil", "--json"]);
+    assert_eq!(code, 1, "fuzzy multi-match must error; stdout={stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("7 matches"),
+        "the true count must survive; got: {err:?}"
+    );
+    assert!(
+        err.ends_with("Showing the first 5 of 7."),
+        "the note goes AFTER the suffix — spliced in front it breaks the \
+         sentence the suffix continues; got: {err:?}"
+    );
+    assert_eq!(
+        v["candidates"].as_array().map(|a| a.len()),
+        Some(5),
+        "candidates stay capped at 5; got: {v}"
+    );
+}
+
+// Negative control for both tests above: five definitions are fully listed, so
+// no note may appear. Without this, an unconditional note passes them.
+#[test]
+fn test_cli_ambiguity_stays_silent_when_it_hid_nothing() {
+    let project = TempDir::new().unwrap();
+    let mut src = String::new();
+    for i in 0..5 {
+        src.push_str(&format!(
+            "pub struct S{i};\nimpl S{i} {{\n    pub fn build() -> Self {{ S{i} }}\n}}\n"
+        ));
+    }
+    std::fs::write(project.path().join("lib.rs"), src).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (_, stderr, code) = run_cli(&project, &["callgraph", "build"]);
+    assert_eq!(
+        code, 1,
+        "five overloads are still ambiguous; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("5 definitions") && !stderr.contains("Showing the first"),
+        "nothing was hidden, so nothing may be claimed; got: {stderr:?}"
+    );
+}
+
 // Regression (audit #6): a bare name with ≥2 non-test definitions in the SAME
 // file must be flagged ambiguous, matching MCP `get_call_graph`. Before the fix
 // the CLI gated ambiguity on distinct *files*, so same-file overloads silently
@@ -10850,6 +10964,128 @@ fn impact_stays_silent_when_the_traversal_was_complete() {
 // the typo path, reappearing on the DB-error path of the sibling command.
 // `cmd_impact` runs the identical query with `?`.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// SURF-33 (audit 2026-09-07, registered by the v0.140.0 pre-ship review):
+// `grep`'s container lookup folded a failed node query into an empty node list.
+// Empty is also what "this file has no indexed nodes" looks like, so a broken
+// index removed the one thing this command has over plain grep — the fn/class
+// annotation on every hit — and said nothing, with exit 0.
+// ---------------------------------------------------------------------------
+
+/// Break `get_nodes_by_file_path` and nothing else `grep` needs. `files` stays
+/// intact (the resync pass and the match set both read it), and the decoy keeps
+/// every column except the one the node SELECT names last.
+///
+/// Opened through `Database::open` rather than `rusqlite::Connection::open`:
+/// `nodes` carries a `vec0` trigger (`nodes_vectors_ad`), so a bare rusqlite
+/// handle cannot ALTER the table at all — it fails with "no such module: vec0"
+/// before touching anything, which would have made this a test of the fixture.
+fn break_node_lookup(project: &TempDir) {
+    let db_path = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    db.conn()
+        .execute_batch(
+            "ALTER TABLE nodes RENAME TO nodes_moved_by_test;\n\
+             CREATE TABLE nodes (\n\
+                 id INTEGER PRIMARY KEY,\n\
+                 file_id INTEGER NOT NULL,\n\
+                 type TEXT NOT NULL,\n\
+                 name TEXT NOT NULL,\n\
+                 qualified_name TEXT,\n\
+                 start_line INTEGER NOT NULL,\n\
+                 end_line INTEGER NOT NULL,\n\
+                 code_content TEXT NOT NULL,\n\
+                 signature TEXT,\n\
+                 doc_comment TEXT,\n\
+                 context_string TEXT,\n\
+                 name_tokens TEXT,\n\
+                 return_type TEXT,\n\
+                 param_types_renamed_by_test TEXT,\n\
+                 is_test INTEGER NOT NULL DEFAULT 0\n\
+             );",
+        )
+        .unwrap();
+}
+
+#[test]
+fn grep_says_so_when_it_could_not_annotate_instead_of_looking_like_plain_grep() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("lib.rs"),
+        "pub fn alpha_target() -> i32 {\n    let needle_here = 41;\n    needle_here + 1\n}\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    // Precondition: with the index intact every hit carries its container, so
+    // the absence below is the injected breakage and not an unindexed fixture.
+    let (out, err, code) = run_cli(&project, &["grep", "needle_here"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("needle_here") && out.contains('→'),
+        "fixture precondition: hits must be annotated; got:\n{out}"
+    );
+
+    break_node_lookup(&project);
+
+    let (out, err, code) = run_cli(&project, &["grep", "needle_here"]);
+    // Scoped control: the matches come from ripgrep, not the index, so they must
+    // survive untouched. If they vanished, the injection broke the command
+    // rather than the lookup and the assertion below would prove nothing.
+    assert_eq!(
+        code, 0,
+        "grep's exit codes are contracted to grep's; stdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        out.contains("lib.rs:2") && out.contains("lib.rs:3"),
+        "both matches must still be reported; got:\n{out}"
+    );
+    assert!(
+        !out.contains('→'),
+        "precondition for the real assertion: the annotation is in fact gone; got:\n{out}"
+    );
+    assert!(
+        err.contains("AST annotation unavailable for 1 file(s)"),
+        "the lost annotation must be disclosed, not silently absent; stderr:\n{err}"
+    );
+    assert!(
+        err.contains("no such column"),
+        "the disclosure must name the reason, or it is the same dead end as the \
+         empty list it replaces; stderr:\n{err}"
+    );
+}
+
+// Negative control: a healthy index must never print the disclosure. Without
+// this, an unconditional eprintln passes the test above.
+#[test]
+fn grep_stays_silent_about_annotations_it_did_not_lose() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("lib.rs"),
+        "pub fn alpha_target() -> i32 {\n    let needle_here = 41;\n    needle_here + 1\n}\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+
+    let (out, err, code) = run_cli(&project, &["grep", "needle_here"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        !err.contains("AST annotation unavailable"),
+        "nothing failed, so nothing may be claimed; stderr:\n{err}"
+    );
+}
 
 /// Break the edge queries without touching anything symbol resolution needs:
 /// `nodes` and `files` stay intact, so `show` still resolves the symbol and

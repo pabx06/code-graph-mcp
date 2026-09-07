@@ -34,7 +34,7 @@ pub(crate) fn emit_exact_ambiguity(
     if json_mode {
         let sugg: Vec<serde_json::Value> = crate::resolve::candidates_to_json(cands)
             .into_iter()
-            .take(5)
+            .take(crate::resolve::SUGGESTION_CAP)
             .collect();
         println!(
             "{}",
@@ -45,7 +45,7 @@ pub(crate) fn emit_exact_ambiguity(
         );
     } else {
         eprintln!("[code-graph] {}", message);
-        for c in cands.iter().take(5) {
+        for c in cands.iter().take(crate::resolve::SUGGESTION_CAP) {
             eprintln!(
                 "  {} ({}) in {} [node_id {}]",
                 c.name, c.node_type, c.file_path, c.node_id
@@ -87,12 +87,18 @@ pub(crate) fn emit_fuzzy_ambiguity(
     human_suffix: &str,
 ) -> ! {
     let stem = format!("Ambiguous symbol '{}': {} matches", symbol, cands.len());
+    // SURF-34: this stem is built here rather than through `ambiguity_message`,
+    // so it needs the same cap disclosure — the list below it is
+    // `take(SUGGESTION_CAP)` on both arms. It goes AFTER the suffix, never
+    // between: both suffixes continue the sentence (". Did you mean:"), so a
+    // note spliced in front of them reads as a broken one.
+    let capped = crate::resolve::suggestion_cap_note(cands.len());
     if json_mode {
         let sugg: Vec<serde_json::Value> = crate::resolve::candidates_to_json(cands)
             .into_iter()
-            .take(5)
+            .take(crate::resolve::SUGGESTION_CAP)
             .collect();
-        let error = format!("{stem}{json_suffix}");
+        let error = format!("{stem}{json_suffix}{capped}");
         let payload = match envelope {
             FuzzyEnvelope::ResultsAndCandidates => serde_json::json!({
                 "results": [],
@@ -107,11 +113,16 @@ pub(crate) fn emit_fuzzy_ambiguity(
         println!("{}", payload);
     } else {
         eprintln!("[code-graph] {}{}", stem, human_suffix);
-        for c in cands.iter().take(5) {
+        for c in cands.iter().take(crate::resolve::SUGGESTION_CAP) {
             eprintln!(
                 "  {} ({}) in {} [node_id {}]",
                 c.name, c.node_type, c.file_path, c.node_id
             );
+        }
+        // After the list, not before it: on this arm the reader learns the list
+        // was cut at the point where it ended.
+        if !capped.is_empty() {
+            eprintln!("[code-graph]{}", capped);
         }
     }
     std::process::exit(1);

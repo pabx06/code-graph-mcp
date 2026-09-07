@@ -844,18 +844,34 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
     let stale_count = stale_files.len();
     let mut node_cache: std::collections::HashMap<String, Vec<queries::NodeResult>> =
         std::collections::HashMap::new();
-    let mut lookup_container = |file: &str,
-                                line: u64|
-     -> Option<(String, String, i64, i64, bool)> {
-        let ctx = ctx.as_ref()?;
-        if !node_cache.contains_key(file) {
-            let nodes = queries::get_nodes_by_file_path(ctx.db.conn(), file).unwrap_or_default();
-            node_cache.insert(file.to_string(), nodes);
-        }
-        let nodes = node_cache.get(file)?;
-        let stale = stale_files.contains(file);
-        find_containing_node_in(nodes, line).map(|(t, n, s, e)| (t, n, s, e, stale))
-    };
+    // SURF-33: this lookup used to fold a failed query into an empty node list,
+    // which is indistinguishable from "this file has no nodes" — the whole
+    // difference between this command and plain grep silently disappears, and
+    // the exit code still says everything went fine. `?` is not available here
+    // (the closure answers `Option`, and grep's exit codes are contracted to
+    // grep's 0/1/2), and the matches themselves come from ripgrep and are still
+    // correct — so the failure is recorded and disclosed after the output,
+    // alongside the truncation and staleness notes that already live there.
+    let mut annotation_failures: Vec<(String, String)> = Vec::new();
+    let mut lookup_container =
+        |file: &str, line: u64| -> Option<(String, String, i64, i64, bool)> {
+            let ctx = ctx.as_ref()?;
+            if !node_cache.contains_key(file) {
+                let nodes = match queries::get_nodes_by_file_path(ctx.db.conn(), file) {
+                    Ok(nodes) => nodes,
+                    Err(e) => {
+                        // Cached as empty so a broken index costs one failed query
+                        // per file, not one per matching line.
+                        annotation_failures.push((file.to_string(), e.to_string()));
+                        Vec::new()
+                    }
+                };
+                node_cache.insert(file.to_string(), nodes);
+            }
+            let nodes = node_cache.get(file)?;
+            let stale = stale_files.contains(file);
+            find_containing_node_in(nodes, line).map(|(t, n, s, e)| (t, n, s, e, stale))
+        };
 
     // Output. EPIPE (reader hung up, e.g. `| head`) is not an error — finish
     // silently with exit 0 like grep instead of spraying "Broken pipe".
@@ -951,6 +967,25 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         eprintln!(
             "[code-graph] {} file(s) changed since last index; annotations marked [stale] — run: code-graph-mcp incremental-index",
             stale_count
+        );
+    }
+    if !annotation_failures.is_empty() {
+        // Name one error: "the index query failed" without the reason is the
+        // same dead end as the empty list this replaces. Capped, because
+        // rusqlite renders a failed `prepare` with the entire statement inlined
+        // and this goes to a terminal that just printed the user's matches.
+        let (file, err) = &annotation_failures[0];
+        let reason: String = if err.chars().count() > 160 {
+            format!("{}…", err.chars().take(160).collect::<String>())
+        } else {
+            err.clone()
+        };
+        eprintln!(
+            "[code-graph] AST annotation unavailable for {} file(s) — the index query failed ({}: {}). \
+             Matches above are plain grep output. Run: code-graph-mcp rebuild-index --confirm",
+            annotation_failures.len(),
+            file,
+            reason
         );
     }
     if ctx.is_none() {

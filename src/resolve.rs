@@ -115,6 +115,25 @@ pub fn spans_multiple_files(cands: &[NameCandidate]) -> bool {
     files.len() > 1
 }
 
+/// How many candidate definitions an ambiguity envelope lists.
+///
+/// Five sites took `.take(5)` off their own literal. The number is a rendering
+/// budget, not a fact about the symbol, so [`ambiguity_message`] must disclose it
+/// whenever it hides something — see [`suggestion_cap_note`].
+pub const SUGGESTION_CAP: usize = 5;
+
+/// The clause that keeps a capped `suggestions` list honest.
+///
+/// Empty at or below the cap: a note on a complete list would be a lie, and the
+/// ≤5 wording is pinned byte-for-byte by the MCP metrics classifier fixture.
+pub fn suggestion_cap_note(n: usize) -> String {
+    if n > SUGGESTION_CAP {
+        format!(" Showing the first {SUGGESTION_CAP} of {n}.")
+    } else {
+        String::new()
+    }
+}
+
 /// Render candidate definitions as the canonical JSON suggestion shape shared by
 /// every tool's ambiguity response (`name` / `file_path` / `type` / `node_id` /
 /// `start_line`). Single-sourced so CLI `--json` and MCP stay byte-identical.
@@ -141,13 +160,17 @@ pub fn candidates_to_json(cands: &[NameCandidate]) -> Vec<serde_json::Value> {
 /// selector would be a dead end. `surface` only swaps flag/tool names.
 pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) -> String {
     let n = cands.len();
+    // SURF-34: `n` counts the definitions; the list under this message carries at
+    // most SUGGESTION_CAP of them. Empty below the cap, so the ≤5 wording every
+    // fixture pins stays byte-identical.
+    let capped = suggestion_cap_note(n);
     if spans_multiple_files(cands) {
         match surface {
             Surface::Cli => format!(
-                "Ambiguous symbol '{name}': {n} matches in different files. Specify --file to disambiguate."
+                "Ambiguous symbol '{name}': {n} matches in different files. Specify --file to disambiguate.{capped}"
             ),
             Surface::Mcp => format!(
-                "Ambiguous symbol '{name}': {n} matches in different files. Specify file_path to disambiguate."
+                "Ambiguous symbol '{name}': {n} matches in different files. Specify file_path to disambiguate.{capped}"
             ),
         }
     } else {
@@ -156,12 +179,12 @@ pub fn ambiguity_message(name: &str, cands: &[NameCandidate], surface: Surface) 
             Surface::Cli => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \
                  callgraph/impact resolve by name and can't split same-file overloads — \
-                 inspect a specific one with `show --node-id <N>` (node_ids below)."
+                 inspect a specific one with `show --node-id <N>` (node_ids below).{capped}"
             ),
             Surface::Mcp => format!(
                 "Ambiguous symbol '{name}': {n} definitions in the same file ({file}). \
                  get_call_graph resolves by name and can't split same-file \
-                 overloads — pass a node_id below to get_ast_node or find_references."
+                 overloads — pass a node_id below to get_ast_node or find_references.{capped}"
             ),
         }
     }
@@ -179,7 +202,7 @@ pub fn ambiguity_response(name: &str, cands: &[NameCandidate]) -> serde_json::Va
     serde_json::json!({
         "symbol": name,
         "error": ambiguity_message(name, cands, Surface::Mcp),
-        "suggestions": candidates_to_json(cands).into_iter().take(5).collect::<Vec<_>>(),
+        "suggestions": candidates_to_json(cands).into_iter().take(SUGGESTION_CAP).collect::<Vec<_>>(),
     })
 }
 
@@ -276,6 +299,57 @@ mod tests {
             !cli.contains("--node-id"),
             "cross-file: callgraph/impact have no --node-id"
         );
+    }
+
+    // SURF-34: the message counts every definition, `suggestions` carries five.
+    // A pre-ship reviewer measured it on a 7-overload fixture: "7 definitions in
+    // the same file", then five entries. Nothing said the list was cut, so a
+    // caller that trusts the envelope reads the two missing overloads as
+    // nonexistent. v0.140.0 put MCP `find_references` on this path for the first
+    // time, where its `suggestions` had been unbounded.
+    #[test]
+    fn an_overflowing_suggestion_list_says_so_in_the_message() {
+        let cands: Vec<NameCandidate> = (1..=7).map(|i| cand("new", "lib.rs", i, i * 10)).collect();
+        for surface in [Surface::Cli, Surface::Mcp] {
+            let msg = ambiguity_message("new", &cands, surface);
+            assert!(
+                msg.contains("7 definitions"),
+                "the true count must survive: {msg}"
+            );
+            assert!(
+                msg.contains("first 5"),
+                "the message must disclose that the list below it is capped: {msg}"
+            );
+        }
+        let resp = ambiguity_response("new", &cands);
+        assert_eq!(
+            resp["suggestions"].as_array().map(|a| a.len()),
+            Some(SUGGESTION_CAP),
+            "the cap itself is unchanged — this is a disclosure fix, not a widening"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("first 5")),
+            "the MCP envelope carries the same disclosure as the message: {resp}"
+        );
+    }
+
+    // Negative control: at or below the cap nothing is hidden, so nothing may be
+    // said. Without this, the assertion above passes on an unconditional note.
+    #[test]
+    fn a_complete_suggestion_list_stays_silent() {
+        for n in 2..=SUGGESTION_CAP as i64 {
+            let cands: Vec<NameCandidate> =
+                (1..=n).map(|i| cand("new", "lib.rs", i, i * 10)).collect();
+            for surface in [Surface::Cli, Surface::Mcp] {
+                let msg = ambiguity_message("new", &cands, surface);
+                assert!(
+                    !msg.contains("first"),
+                    "n={n} is fully listed; a cap note would be a lie: {msg}"
+                );
+            }
+        }
     }
 
     #[test]
