@@ -80,33 +80,13 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (base_symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-    let qualified_matches = if raw_symbol.contains('.') {
-        queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
+    let is_qualified = raw_symbol.contains('.');
+    let (symbol, file_filter) = if is_qualified {
+        let qualified_matches = queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
             .into_iter()
             .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let is_qualified_target = qualified_matches.len() == 1;
-    let (symbol, file_filter) = if is_qualified_target {
-        let target_file = explicit_file
-            .map(|s| s.to_string())
-            .or_else(|| Some(qualified_matches[0].1.clone()));
-        (raw_symbol, target_file)
-    } else {
-        (
-            base_symbol,
-            explicit_file.map(|s| s.to_string()).or(resolved_file),
-        )
-    };
-    let file_filter = file_filter.as_deref();
+            .collect::<Vec<_>>();
 
-    // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
-    // (cross-file OR same-file overloads) would silently merge call graphs.
-    // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
-    if file_filter.is_none() {
         if qualified_matches.len() > 1 {
             let cands: Vec<queries::NameCandidate> = qualified_matches
                 .iter()
@@ -123,10 +103,28 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 })
                 .collect();
             emit_exact_ambiguity(raw_symbol, &cands, json_mode);
-        } else if !is_qualified_target {
-            if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
-                emit_exact_ambiguity(symbol, &cands, json_mode);
-            }
+        }
+
+        let target_file = explicit_file
+            .map(|s| s.to_string())
+            .or_else(|| qualified_matches.first().map(|(_, fp)| fp.clone()));
+        (raw_symbol, target_file)
+    } else {
+        let (base_symbol, resolved_file) =
+            resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+        (
+            base_symbol,
+            explicit_file.map(|s| s.to_string()).or(resolved_file),
+        )
+    };
+    let file_filter = file_filter.as_deref();
+
+    // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
+    // (cross-file OR same-file overloads) would silently merge call graphs.
+    // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
+    if file_filter.is_none() && !is_qualified {
+        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+            emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }
 
@@ -217,10 +215,16 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         // refs. Gated on the symbol being genuinely ABSENT — a symbol that
         // exists with zero edges also reaches this branch, and hinting at
         // reindexing there would send the user chasing a non-problem.
-        if queries::get_nodes_by_name(conn, symbol)
-            .map(|nodes| nodes.is_empty())
-            .unwrap_or(false)
-        {
+        let absent = if is_qualified {
+            queries::get_node_ids_by_qualified_name(conn, symbol)
+                .map(|nodes| nodes.is_empty())
+                .unwrap_or(false)
+        } else {
+            queries::get_nodes_by_name(conn, symbol)
+                .map(|nodes| nodes.is_empty())
+                .unwrap_or(false)
+        };
+        if absent {
             hint_symbol_maybe_unindexed(symbol);
         }
         std::process::exit(1);

@@ -11610,4 +11610,49 @@ def beta_caller():
     let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(impact["symbol"], "Alpha.helper");
     assert_eq!(impact["direct_callers"], 1); // only caller_two, not caller_one, not beta_caller
+
+    // 3. Qualified miss must NOT downgrade to bare name
+    // Even though `helper` exists (bare name), `Gamma.helper` does not exist:
+    let (stdout, _, code) = run_cli(&project, &["impact", "Gamma.helper", "--json"]);
+    assert_ne!(code, 0, "non-existent qualified target in impact must fail");
+    let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    assert_eq!(err["error"], "Symbol not found");
+    assert_eq!(err["symbol"], "Gamma.helper");
+
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "Gamma.helper", "--json"]);
+    assert_ne!(code, 0, "non-existent qualified target in callgraph must fail");
+    let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    assert_eq!(err["symbol"], "Gamma.helper");
+
+    let (stdout, _, code) = run_cli(&project, &["refs", "Gamma.helper", "--json"]);
+    assert_ne!(code, 0, "non-existent qualified target in refs must fail");
+    let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    assert_eq!(err["error"], "Symbol not found");
+    assert_eq!(err["symbol"], "Gamma.helper");
+
+    // 4. Stale file refresh for qualified target in impact re-queries node IDs
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        project.path().join("two.py"),
+        r#"
+class Alpha:
+    @staticmethod
+    def helper(x):
+        return x
+
+def caller_two():
+    return Alpha.helper(1)
+
+def caller_three():
+    return Alpha.helper(2)
+"#,
+    ).unwrap();
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["impact", "Alpha.helper", "--file", "two.py", "--json"],
+    );
+    assert_eq!(code, 0);
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "Alpha.helper");
+    assert_eq!(impact["direct_callers"], 2);
 }

@@ -262,25 +262,34 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
-        let qualified_ids = if raw_symbol.contains('.') {
-            queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
+        let is_qualified = raw_symbol.contains('.');
+        if is_qualified {
+            let qualified_ids = queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
                 .into_iter()
                 .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
                 .map(|(id, _)| id)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        if !qualified_ids.is_empty() {
-            let target = RefsTarget::QualifiedName {
-                file_path: explicit_file.map(|s| s.to_string()),
-            };
-            target.reject_if_ambiguous(conn, raw_symbol, json_mode)?;
-            (
-                qualified_ids,
-                raw_symbol.to_string(),
-                target,
-            )
+                .collect::<Vec<_>>();
+            if !qualified_ids.is_empty() {
+                let target = RefsTarget::QualifiedName {
+                    file_path: explicit_file.map(|s| s.to_string()),
+                };
+                target.reject_if_ambiguous(conn, raw_symbol, json_mode)?;
+                (
+                    qualified_ids,
+                    raw_symbol.to_string(),
+                    target,
+                )
+            } else {
+                if json_mode {
+                    print_refs_notfound_json(raw_symbol);
+                }
+                if let Some(fp) = explicit_file {
+                    eprintln!("[code-graph] Symbol '{}' not found in file '{}'.", raw_symbol, fp);
+                } else {
+                    eprintln!("[code-graph] Symbol '{}' not found in index.", raw_symbol);
+                }
+                std::process::exit(1);
+            }
         } else {
             let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
             let file_path = explicit_file.or(resolved_file.as_deref());

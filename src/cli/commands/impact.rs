@@ -74,22 +74,38 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (base_symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-    let qualified_matches = if raw_symbol.contains('.') {
-        queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
+    let is_qualified = raw_symbol.contains('.');
+    let (symbol, file_filter) = if is_qualified {
+        let qualified_matches = queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
             .into_iter()
             .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let is_qualified_target = qualified_matches.len() == 1;
-    let (symbol, file_filter) = if is_qualified_target {
+            .collect::<Vec<_>>();
+
+        if qualified_matches.len() > 1 {
+            let cands: Vec<queries::NameCandidate> = qualified_matches
+                .iter()
+                .filter_map(|(id, fp)| {
+                    queries::get_node_by_id(conn, *id).ok().flatten().map(|n| {
+                        queries::NameCandidate {
+                            name: n.name,
+                            file_path: fp.clone(),
+                            node_type: n.node_type,
+                            node_id: n.id,
+                            start_line: n.start_line,
+                        }
+                    })
+                })
+                .collect();
+            emit_exact_ambiguity(raw_symbol, &cands, json_mode);
+        }
+
         let target_file = explicit_file
             .map(|s| s.to_string())
-            .or_else(|| Some(qualified_matches[0].1.clone()));
+            .or_else(|| qualified_matches.first().map(|(_, fp)| fp.clone()));
         (raw_symbol, target_file)
     } else {
+        let (base_symbol, resolved_file) =
+            resolve_qualified_symbol(conn, raw_symbol, explicit_file);
         (
             base_symbol,
             explicit_file.map(|s| s.to_string()).or(resolved_file),
@@ -98,10 +114,15 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let file_filter = file_filter.as_deref();
 
     let fetch_nodes = |sym: &str| -> Result<Vec<queries::NodeResult>> {
-        if is_qualified_target {
-            Ok(qualified_matches
-                .iter()
-                .filter_map(|(id, _)| queries::get_node_by_id(conn, *id).ok().flatten())
+        if is_qualified {
+            let ids = queries::get_node_ids_by_qualified_name(conn, sym)?
+                .into_iter()
+                .filter(|(_, fp)| file_filter.is_none_or(|wanted| wanted == fp))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            Ok(ids
+                .into_iter()
+                .filter_map(|id| queries::get_node_by_id(conn, id).ok().flatten())
                 .collect())
         } else {
             queries::get_nodes_by_name(conn, sym)
@@ -212,27 +233,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge callers across
     // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
-    if file_filter.is_none() {
-        if qualified_matches.len() > 1 {
-            let cands: Vec<queries::NameCandidate> = qualified_matches
-                .iter()
-                .filter_map(|(id, fp)| {
-                    queries::get_node_by_id(conn, *id).ok().flatten().map(|n| {
-                        queries::NameCandidate {
-                            name: n.name,
-                            file_path: fp.clone(),
-                            node_type: n.node_type,
-                            node_id: n.id,
-                            start_line: n.start_line,
-                        }
-                    })
-                })
-                .collect();
-            emit_exact_ambiguity(raw_symbol, &cands, json_mode);
-        } else if !is_qualified_target {
-            if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
-                emit_exact_ambiguity(symbol, &cands, json_mode);
-            }
+    if file_filter.is_none() && !is_qualified {
+        if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
+            emit_exact_ambiguity(symbol, &cands, json_mode);
         }
     }
 
