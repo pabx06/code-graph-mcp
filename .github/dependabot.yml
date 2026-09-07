@@ -1,0 +1,27 @@
+version: 2
+
+# ENG-18. Every third-party action in this repo is pinned to a 40-hex SHA, which
+# `hardening.rs` enforces — a good posture that quietly becomes a bad one with
+# nobody advancing the pins. It had already happened: nine sites pinned
+# `Swatinem/rust-cache` to a March 2026 master commit that is on no tag at all,
+# and the pin sat there because the only thing that would have moved it was
+# somebody noticing.
+#
+# github-actions only. Cargo and npm updates are deliberately NOT enabled here:
+# `--locked` builds and the release pipeline's version gates mean a dependency
+# bump is a decision with a rebuild attached, not something to merge weekly.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(ci)
+    groups:
+      # One PR for the whole set: the drift guard requires release.yml and
+      # cache-warm.yml to pin rust-cache to the SAME sha, so per-action PRs
+      # would land a red intermediate state.
+      actions:
+        patterns:
+          - "*"

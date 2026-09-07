@@ -15,8 +15,14 @@ on:
         required: true
         type: string
 
+# ENG-14: least privilege at the workflow level. `publish` declares its own
+# `contents: write` (+ `id-token: write`) at the job, and it holds the only write
+# in this file — the `action-gh-release` step. `gate`, `build` and `smoke-verify`
+# only check out, compile and download, so a workflow-level write handed a token
+# that can push to this repo to every third-party action they run and to every
+# build script they compile. The other four workflows are already `read`.
 permissions:
-  contents: write
+  contents: read
 
 # Serialize releases for the same ref so a tag-push run and a workflow_dispatch
 # re-run on the same tag don't race (both build + publish the same version).
@@ -79,7 +85,7 @@ jobs:
       #     on entries that are readable. Only the main-branch warm job writes.
       # If warm-gate has not run recently the restore simply misses and this job
       # compiles cold (~5-9 min), which is what it did before caching existed.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-gate
           save-if: false
@@ -339,7 +345,7 @@ jobs:
       # built cold ("No cache found" on all 5 targets) despite a green priming
       # run. shared-key replaces the job-bound portion, making the main-branch
       # warm cache restorable here. Must stay identical in cache-warm.yml.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-${{ matrix.target }}
 
