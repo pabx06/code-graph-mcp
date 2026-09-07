@@ -427,7 +427,6 @@ impl McpServer {
         // and reports a truncation that did not happen (a first pool is full far
         // more often than the 4× wider retry pool).
         let mut final_pool_len = fused.len();
-        let mut final_fetch_count = fetch_count;
 
         // Pool-exhaustion retry: when the first pool came back FULL and the
         // post-fetch filters still left top_k unfilled, matches may sit just
@@ -465,10 +464,21 @@ impl McpServer {
             //     superset nor order-preserving once the vector channel is
             //     non-empty: a row in both channels just past the first cut
             //     outscores a single-channel row and displaces it, and `max_rrf`
-            //     — the divisor of every `base_score` — changes with the pool. The
-            //     default build has no vector channel, so the whole test suite is
-            //     blind to it, while npm ships `embed-model`. Refuted by probe
-            //     tests against the real fusion function (round 4).
+            //     — the divisor of every `base_score` — changes with the pool.
+            //     Refuted by probe tests against the real fusion function
+            //     (round 4).
+            //
+            // No test in this module can see that class of change, and REBUILDING
+            // WITH `--features embed-model` DOES NOT HELP — round 5 measured
+            // `vector_available=false` on that leg. The blindness is the harness,
+            // not the build: `McpServer::new_test_with_project` hard-codes
+            // `embedding_model: None` and `indexed_server` indexes with
+            // `model: None`, so `vec_search` is empty here on every leg. Covering
+            // the vector path needs a fixture with real weights loaded AND
+            // embeddings written to the index. Round 4's "18/18 on the shipped
+            // feature leg" was a compile-and-still-pass check offered as evidence
+            // about a path it never reached — the same mis-citation one level
+            // down from the one it was correcting.
             //
             // So the answer's pool owns every number reported beside it, and
             // `widest_fetch_was_full` above carries what the other fetch learned.
@@ -477,7 +487,6 @@ impl McpServer {
                 dropped_by_filter = retry_dropped;
                 skipped_noise_count = retry_skipped;
                 final_pool_len = fused_retry.len();
-                final_fetch_count = retry_fetch;
             }
         }
 
@@ -499,15 +508,20 @@ impl McpServer {
         // top_k=27 returns the match the retry never reached — the advice steered
         // the caller away from the remedy that works.
         //
-        // What was actually broken is above: the pool being measured. With the
-        // retry's own pool recorded, a widening that read the index to its end
-        // leaves `final_pool_len < final_fetch_count` and no flag is raised at all.
+        // What was actually broken is which FETCH the flag asks about.
+        // `widest_fetch_was_full` answers that directly, and it is the ONLY
+        // suppressor: a widening that read the index to its end leaves it false
+        // and no flag is raised. An earlier version also required
+        // `final_pool_len >= final_fetch_count`, which round 5 proved dead in
+        // every reachable state — the retry guard has already established that the
+        // first pool was full, so on the non-adopted path that clause is
+        // unconditionally true. It read as load-bearing and was not; the variable
+        // it was the last reader of is gone with it.
         let shortfall = PoolShortfall {
             dropped_by_filter,
             skipped_noise: skipped_noise_count,
             pool_len: final_pool_len,
             saturated: candidates.len() < top_k as usize
-                && final_pool_len >= final_fetch_count as usize
                 && widest_fetch_was_full
                 && (dropped_by_filter + skipped_noise_count) > 0,
             top_k,
@@ -796,8 +810,12 @@ struct PoolShortfall {
     dropped_by_filter: usize,
     /// Rows the always-on module/external/test filter removed.
     skipped_noise: usize,
-    /// Size of the WIDEST pool actually fetched — the retry's whenever the retry
-    /// ran, adopted or not, since those rows were examined either way.
+    /// Size of the pool the RETURNED candidates came from — the retry's only when
+    /// the retry was adopted. On a retry that ran and was not adopted this names
+    /// a pool up to 4x smaller than the one actually read; that is deliberate, so
+    /// this number and the two counts beside it describe one fetch and add up.
+    /// Whether the wider fetch came back full is carried separately, by
+    /// `widest_fetch_was_full` at the call site.
     pool_len: usize,
     /// That pool came back FULL and was still consumed before `top_k` was
     /// filled, so rows below the fetch cut were never examined.
@@ -1808,6 +1826,13 @@ mod tests {
                 "query": "widget", "language": "python", "top_k": 100, "skip_indexing": true
             }))
             .unwrap();
+        assert_eq!(
+            out["results"].as_array().map(|a| a.len()),
+            Some(1),
+            "fixture precondition: the Python row must survive INSIDE the 1600-row \
+             cut. Without this the flag also holds via the empty-result arm, and \
+             the short-answer ceiling wiring goes uncovered silently; got {out}"
+        );
         assert_eq!(
             out["pool_saturated"],
             json!(true),

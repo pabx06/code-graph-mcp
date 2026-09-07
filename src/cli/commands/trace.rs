@@ -170,8 +170,8 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
     // on a synthetic repo of 200 routes over 200 distinct handlers whose call
     // chains REACH 60 nodes each at the default depth (a shared 60-function
     // fan-out pool, not a 60-deep linear chain — that shape only visits 3 nodes
-    // at depth 3 and runs a fraction as long, which is how two measurements of
-    // "the same" fixture disagreed), `trace /api` costs a median of
+    // at depth 3 — 3 of 60 — which is how two measurements of "the same" fixture
+    // disagreed), `trace /api` costs a median of
     // 91 ms (release binary, 11 runs after 2 warm-ups, 2026-09-07; the handler
     // count and chain length were asserted from the JSON, not assumed).
     //
