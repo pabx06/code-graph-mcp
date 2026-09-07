@@ -80,13 +80,19 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let (base_symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let qualified_match_count = if raw_symbol.contains('.') {
+        queries::get_node_ids_by_qualified_name(conn, raw_symbol)?.len()
+    } else {
+        0
+    };
+    let symbol = if qualified_match_count == 1 { raw_symbol } else { base_symbol };
     let file_filter = explicit_file.or(resolved_file.as_deref());
 
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge call graphs.
     // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
-    if file_filter.is_none() {
+    if file_filter.is_none() && qualified_match_count != 1 {
         if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }

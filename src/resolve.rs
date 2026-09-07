@@ -69,7 +69,7 @@ pub fn reresolve_node_by_identity(
 /// refuses to and then offers `<external>` as the disambiguator — see
 /// [`is_selectable_definition`].
 pub fn detect_ambiguity(conn: &Connection, name: &str) -> Result<Option<Vec<NameCandidate>>> {
-    let with_files = queries::get_nodes_with_files_by_name(conn, name)?;
+    let with_files = queries::get_nodes_with_files_by_symbol(conn, name)?;
     let non_test: Vec<NameCandidate> = with_files
         .iter()
         .filter(|nf| is_selectable_definition(&nf.file_path))

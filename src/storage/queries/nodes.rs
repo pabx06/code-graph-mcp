@@ -82,6 +82,9 @@ pub struct NodeWithFile {
 /// Entry in a global name→node lookup: `(node_id, file_path, language)`.
 pub type NameEntry = (i64, String, Option<String>);
 
+/// Cross-file edge saved while a target file's nodes are replaced.
+pub type InboundCrossFileEdge = (i64, i64, String, Option<String>, String, Option<String>);
+
 // --- Node CRUD ---
 
 pub fn insert_node(conn: &Connection, node: &NodeRecord) -> Result<i64> {
@@ -180,17 +183,37 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
     Ok(results)
 }
 
+/// Match either a bare node name or an exact qualified name.
+pub fn get_nodes_with_files_by_symbol(conn: &Connection, symbol: &str) -> Result<Vec<NodeWithFile>> {
+    let sql = format!(
+        "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'",
+        NODE_SELECT_ALIASED
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([symbol], |row| {
+        Ok(NodeWithFile {
+            node: map_node_row(row)?,
+            file_path: row.get(15)?,
+            language: row.get(16)?,
+        })
+    })?;
+    let results = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 /// Collect cross-file inbound edges before deleting a file's nodes.
-/// Returns (source_id, target_name, relation, metadata) for edges where:
+/// Returns (source_id, source_file_id, target_name, target_qualified_name,
+/// relation, metadata) for edges where:
 /// - target is in the given file (will be deleted)
 /// - source is NOT in the given file (would lose edge on cascade delete)
 #[allow(clippy::type_complexity)]
 pub fn get_inbound_cross_file_edges(
     conn: &Connection,
     file_id: i64,
-) -> Result<Vec<(i64, i64, String, String, Option<String>)>> {
+) -> Result<Vec<InboundCrossFileEdge>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT e.source_id, ns.file_id, nt.name, e.relation, e.metadata
+        "SELECT e.source_id, ns.file_id, nt.name, nt.qualified_name, e.relation, e.metadata
          FROM edges e
          JOIN nodes nt ON nt.id = e.target_id
          JOIN nodes ns ON ns.id = e.source_id
@@ -201,8 +224,9 @@ pub fn get_inbound_cross_file_edges(
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -510,6 +534,17 @@ pub fn get_node_ids_by_name(conn: &Connection, name: &str) -> Result<Vec<(i64, S
         "SELECT n.id, COALESCE(f.path, '') FROM nodes n LEFT JOIN files f ON f.id = n.file_id WHERE n.name = ?1"
     )?;
     let rows = stmt.query_map([name], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Get all node IDs matching an exact qualified name, with file paths for filtering.
+pub fn get_node_ids_by_qualified_name(conn: &Connection, qualified_name: &str) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, COALESCE(f.path, '') FROM nodes n LEFT JOIN files f ON f.id = n.file_id WHERE n.qualified_name = ?1"
+    )?;
+    let rows = stmt.query_map([qualified_name], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

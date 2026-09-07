@@ -1275,9 +1275,42 @@ pub fn is_cross_file_call_noise(name: &str, language: &str) -> bool {
         "javascript" | "typescript" | "tsx" => {
             !JS_CALL_NOISE_EXEMPT.contains(&name) && CROSS_FILE_CALL_NOISE.contains(&name)
         }
+        "python" => {
+            CROSS_FILE_CALL_NOISE.contains(&name) || is_python_builtin_call_target(name)
+        }
         _ => CROSS_FILE_CALL_NOISE.contains(&name),
     }
 }
+
+/// Callable names provided by Python's builtins module.
+pub fn is_python_builtin_call_target(name: &str) -> bool {
+    PYTHON_BUILTIN_CALL_TARGETS.contains(&name)
+}
+
+pub const PYTHON_BUILTIN_CALL_TARGETS: &[&str] = &[
+    "ArithmeticError", "AssertionError", "AttributeError", "BaseException", "BaseExceptionGroup",
+    "BlockingIOError", "BrokenPipeError", "BufferError", "BytesWarning", "ChildProcessError",
+    "ConnectionAbortedError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "DeprecationWarning", "EOFError", "EncodingWarning", "EnvironmentError", "Exception",
+    "ExceptionGroup", "FileExistsError", "FileNotFoundError", "FloatingPointError", "FutureWarning",
+    "GeneratorExit", "IOError", "ImportError", "ImportWarning", "IndentationError", "IndexError",
+    "InterruptedError", "IsADirectoryError", "KeyError", "KeyboardInterrupt", "LookupError",
+    "MemoryError", "ModuleNotFoundError", "NameError", "NotADirectoryError", "NotImplementedError",
+    "OSError", "OverflowError", "PendingDeprecationWarning", "PermissionError", "ProcessLookupError",
+    "RecursionError", "ReferenceError", "ResourceWarning", "RuntimeError", "RuntimeWarning",
+    "StopAsyncIteration", "StopIteration", "SyntaxError", "SyntaxWarning", "SystemError",
+    "SystemExit", "TabError", "TimeoutError", "TypeError", "UnboundLocalError", "UnicodeDecodeError",
+    "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError", "UnicodeWarning", "UserWarning",
+    "ValueError", "Warning", "ZeroDivisionError", "__build_class__", "__import__", "__loader__",
+    "abs", "aiter", "all", "anext", "any", "ascii", "bin", "bool", "breakpoint", "bytearray",
+    "bytes", "callable", "chr", "classmethod", "compile", "complex", "copyright", "credits",
+    "delattr", "dict", "dir", "divmod", "enumerate", "eval", "exec", "exit", "filter", "float",
+    "format", "frozenset", "getattr", "globals", "hasattr", "hash", "help", "hex", "id",
+    "input", "int", "isinstance", "issubclass", "iter", "len", "license", "list", "locals",
+    "map", "max", "memoryview", "min", "next", "object", "oct", "open", "ord", "pow", "print",
+    "property", "quit", "range", "repr", "reversed", "round", "set", "setattr", "slice", "sorted",
+    "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip",
+];
 
 // -- Python type-annotation noise filter --
 // Builtin types + `typing` generics that appear in annotation positions but

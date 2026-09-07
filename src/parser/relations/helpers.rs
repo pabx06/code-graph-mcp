@@ -155,6 +155,66 @@ pub(crate) fn extract_callee(
     }
 }
 
+/// Python calls use `attribute` nodes for dotted references. Preserve paths
+/// that can be resolved statically (`Alpha.helper()`, `myutils.helper()`) and
+/// attach direct `self` / `cls` calls to the enclosing class. Runtime instance
+/// receivers such as `alpha.helper()` are represented as a path too: if no
+/// matching class/module path exists, the resolver drops the edge instead of
+/// attaching it to every same-named method in the project.
+pub(crate) fn extract_python_callee(
+    node: &tree_sitter::Node,
+    source: &str,
+    current_class: Option<&str>,
+) -> Option<(String, CalleeQualifier)> {
+    let function = node.child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+
+    if function.kind() != "attribute" {
+        return extract_callee_name(node, source).map(|n| (n, CalleeQualifier::Bare));
+    }
+
+    let attribute = function.child_by_field_name("attribute")?;
+    let name = node_text(&attribute, source).to_string();
+    let object = function.child_by_field_name("object")?;
+
+    if object.kind() == "identifier" {
+        let receiver = node_text(&object, source);
+        if matches!(receiver, "self" | "cls") {
+            return Some((
+                name,
+                current_class
+                    .map(|class| CalleeQualifier::SelfRecv(class.to_string()))
+                    .unwrap_or_else(|| CalleeQualifier::Receiver(receiver.to_string())),
+            ));
+        }
+    }
+
+    if let Some(path) = collect_python_attribute_segments(&object, source) {
+        if !path.is_empty() {
+            return Some((name, CalleeQualifier::Path(path)));
+        }
+    }
+
+    Some((name, CalleeQualifier::Chain))
+}
+
+fn collect_python_attribute_segments(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> Option<Vec<String>> {
+    match node.kind() {
+        "identifier" => Some(vec![node_text(node, source).to_string()]),
+        "attribute" => {
+            let object = node.child_by_field_name("object")?;
+            let attribute = node.child_by_field_name("attribute")?;
+            let mut segments = collect_python_attribute_segments(&object, source)?;
+            segments.push(node_text(&attribute, source).to_string());
+            Some(segments)
+        }
+        _ => None,
+    }
+}
+
 /// Walk a scoped_identifier collecting all path segments + final name.
 /// `crate::a::b::foo` → segments=["crate","a","b"], name="foo"
 fn collect_scoped_path_segments(node: &tree_sitter::Node, source: &str, out: &mut Vec<String>) {

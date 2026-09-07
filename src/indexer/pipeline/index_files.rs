@@ -50,7 +50,8 @@ use super::js_modules::{
     resolve_php_include_path,
 };
 use super::python_modules::{
-    build_python_module_map, project_module_files, resolve_python_module_targets,
+    build_python_import_bindings, build_python_module_map, find_python_import_binding,
+    project_module_files, resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
@@ -558,7 +559,7 @@ struct BatchInserted {
     /// every same-name node in the batch (which fanned out cross-file /
     /// cross-language).
     #[allow(clippy::type_complexity)]
-    saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)>,
+    saved_inbound_edges: Vec<(i64, i64, i64, String, Option<String>, String, Option<String>)>,
     /// File ids in this batch, so Phase 2c can skip intra-batch edges.
     file_ids: HashSet<i64>,
     nodes_created: usize,
@@ -579,7 +580,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
     // re-binds ONLY to the new same-name node in THAT file, not every same-name
     // node in the batch (which fanned out cross-file / cross-language).
     #[allow(clippy::type_complexity)]
-    let mut saved_inbound_edges: Vec<(i64, i64, i64, String, String, Option<String>)> = Vec::new();
+    let mut saved_inbound_edges: Vec<(i64, i64, i64, String, Option<String>, String, Option<String>)> = Vec::new();
     // Track file_ids in this batch to filter intra-batch edges in Phase 2c
     let mut batch_file_ids: HashSet<i64> = HashSet::new();
 
@@ -600,8 +601,8 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         saved_inbound_edges.extend(
             get_inbound_cross_file_edges(db.conn(), file_id)?
                 .into_iter()
-                .map(|(src, src_file, tname, rel, meta)| {
-                    (src, src_file, file_id, tname, rel, meta)
+                .map(|(src, src_file, tname, tqn, rel, meta)| {
+                    (src, src_file, file_id, tname, tqn, rel, meta)
                 }),
         );
         batch_file_ids.insert(file_id);
@@ -1196,6 +1197,12 @@ fn resolve_batch_relations(
             }
         }
 
+        let python_import_bindings = if pf.language == "python" {
+            build_python_import_bindings(&relations)
+        } else {
+            HashMap::new()
+        };
+
         for rel in &relations {
             // Contract: extract_relations_from_tree stamps every relation with
             // source_language equal to the language argument. The
@@ -1340,6 +1347,64 @@ fn resolve_batch_relations(
                         ));
                     }
                     continue;
+                }
+            }
+
+            // A bare Python call to an imported binding can be resolved more
+            // precisely than global name matching. Internal imports bind to
+            // the imported module only; aliased imports bind to the original
+            // exported name.
+            if rel.relation == REL_CALLS && pf.language == "python" && rel.metadata.is_none() {
+                if let Some(binding) = find_python_import_binding(
+                    &python_import_bindings,
+                    &rel.source_name,
+                    &rel.target_name,
+                ) {
+                    // Relative imports need package context that the current
+                    // module map does not model. Keep their existing pending
+                    // behavior until that resolution is implemented.
+                    if !binding.module.is_empty() && !binding.module.starts_with('.') {
+                        if !binding.is_module_import {
+                            if let Some(module_files) = project_module_files(&binding.module, python_module_map) {
+                                if let Some(module_targets) = resolve_python_module_targets(
+                                    &module_files, false, &binding.imported_name,
+                                    &node_id_to_path, &name_to_ids,
+                                ) {
+                                    edges_created += insert_relation_edges(
+                                        db,
+                                        &source_ids,
+                                        &module_targets,
+                                        &rel.relation,
+                                        rel.metadata.as_deref(),
+                                        false,
+                                    )?;
+                                    continue;
+                                }
+                            }
+                            // If this was an aliased import (`import X as Y`), the
+                            // callee `Y` is a local alias, so it must not fall through
+                            // to bare name matching. Buffer for later batches if the
+                            // module is part of the project.
+                            if binding.imported_name != rel.target_name {
+                                if python_module_map.contains_key(&binding.module) {
+                                    let metadata = serde_json::json!({
+                                        "q": "python_import",
+                                        "v": binding.module,
+                                    }).to_string();
+                                    for &src_id in &source_ids {
+                                        crate::storage::queries::insert_pending_unresolved_call(
+                                            db.conn(),
+                                            src_id,
+                                            &binding.imported_name,
+                                            &pf.language,
+                                            Some(&metadata),
+                                        )?;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2391,21 +2456,6 @@ pub(super) fn index_files(
         || deferred_edges > 0;
     if graph_changed {
         finalize_tick();
-        // The post-passes below are the first big correlated-subquery joins over
-        // the graph this run just wrote, and on a fresh index there is no
-        // `sqlite_stat1` for the planner to use — `run_optimize()` only runs at
-        // the very END of the run, after they are done. Measured on a real
-        // 2,052-file TypeScript repo: prune took 5.14 s of a 13.5 s full index
-        // without statistics and 0.187 s with them. Paying ~30 ms here to make
-        // them available is the whole difference (13.16 s -> 8.52 s end to end, as
-        // shipped; 8.58 s was the ungated variant this gate replaced).
-        //
-        // Gated by size because `ensure_file_indexed` reaches this same block on
-        // every query that touches an edited file: an unconditional ANALYZE cost
-        // that path ~10 ms of its ~70 ms (measured on this repo), for no gain —
-        // a one-file refresh inherits perfectly good statistics from whatever
-        // run last crossed the threshold, and its own edge delta is far too
-        // small to shift them.
         if all_indexed.len() + delete_paths.len() >= STATS_REFRESH_MIN_FILES {
             db.refresh_query_stats();
         }
@@ -2455,13 +2505,6 @@ pub(super) fn index_files(
         total_edges_created = total_edges_created.saturating_sub(post.pruned);
     }
 
-    // Reap `<external>` sentinel nodes that no edge points at any more. Pruning
-    // and deferred re-resolution can orphan them, and nothing else ever deleted
-    // them — a lingering orphan stays in the name-resolution pool and makes an
-    // incrementally-grown node set diverge from a fresh rebuild forever (audit
-    // 2026-08-02 P1-9). Shares `graph_changed` with the post-passes above: the
-    // prune that runs there is one of the two orphan sources, so anything that
-    // lets the prune run must also let the reaper run.
     if graph_changed {
         finalize_tick();
         let reaped = crate::storage::queries::reap_orphan_external_nodes(db.conn())?;
@@ -2712,7 +2755,7 @@ fn restore_inbound_edges(
     db: &Database,
     batch_parsed: &[FileParsed],
     batch_file_ids: &HashSet<i64>,
-    saved_inbound_edges: &[(i64, i64, i64, String, String, Option<String>)],
+    saved_inbound_edges: &[(i64, i64, i64, String, Option<String>, String, Option<String>)],
     run_file_paths: &HashSet<&str>,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<usize> {
@@ -2728,12 +2771,19 @@ fn restore_inbound_edges(
         // batch) can no longer steal the edge. A genuinely-removed symbol yields
         // no match → the edge drops, exactly as a full rebuild would.
         let mut batch_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
+        let mut batch_qualified_name_to_ids: HashMap<(i64, &str), Vec<i64>> = HashMap::new();
         for pf in batch_parsed {
-            for (id, name) in pf.node_ids.iter().zip(pf.node_names.iter()) {
+            for ((id, name), qualified_name) in pf.node_ids.iter().zip(pf.node_names.iter()).zip(pf.node_qualified_names.iter()) {
                 batch_name_to_ids
                     .entry((pf.file_id, name.as_str()))
                     .or_default()
                     .push(*id);
+                if let Some(qualified_name) = qualified_name.as_deref() {
+                    batch_qualified_name_to_ids
+                        .entry((pf.file_id, qualified_name))
+                        .or_default()
+                        .push(*id);
+                }
             }
         }
 
@@ -2743,7 +2793,7 @@ fn restore_inbound_edges(
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
         let mut requeued = 0usize;
-        for (source_id, source_file_id, target_file_id, target_name, relation, metadata) in
+        for (source_id, source_file_id, target_file_id, target_name, target_qualified_name, relation, metadata) in
             saved_inbound_edges
         {
             // Source file is also in this batch — source_id is stale (deleted + re-created).
@@ -2752,9 +2802,11 @@ fn restore_inbound_edges(
                 skipped_intra_batch += 1;
                 continue;
             }
-            if let Some(new_target_ids) =
-                batch_name_to_ids.get(&(*target_file_id, target_name.as_str()))
-            {
+            let new_target_ids = match target_qualified_name.as_deref() {
+                Some(qualified_name) => batch_qualified_name_to_ids.get(&(*target_file_id, qualified_name)),
+                None => batch_name_to_ids.get(&(*target_file_id, target_name.as_str())),
+            };
+            if let Some(new_target_ids) = new_target_ids {
                 for &new_tgt_id in new_target_ids {
                     if *source_id != new_tgt_id
                         && insert_edge_cached(

@@ -74,11 +74,28 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let (symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let (base_symbol, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+    let qualified_match_count = if raw_symbol.contains('.') {
+        queries::get_node_ids_by_qualified_name(conn, raw_symbol)?.len()
+    } else {
+        0
+    };
+    let symbol = if qualified_match_count == 1 { raw_symbol } else { base_symbol };
     let file_filter = explicit_file.or(resolved_file.as_deref());
 
+    let fetch_nodes = |sym: &str| -> Result<Vec<queries::NodeResult>> {
+        if qualified_match_count == 1 {
+            Ok(queries::get_node_ids_by_qualified_name(conn, sym)?
+                .into_iter()
+                .filter_map(|(id, _)| queries::get_node_by_id(conn, id).ok().flatten())
+                .collect())
+        } else {
+            queries::get_nodes_by_name(conn, sym)
+        }
+    };
+
     // Verify symbol exists before running impact analysis
-    let mut symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
+    let mut symbol_nodes = fetch_nodes(symbol)?;
     if symbol_nodes.is_empty() {
         if json_mode {
             println!(
@@ -195,7 +212,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge callers across
     // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
-    if file_filter.is_none() {
+    if file_filter.is_none() && qualified_match_count != 1 {
         if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
@@ -230,7 +247,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 depth,
                 min_conf_rank,
             )?;
-            symbol_nodes = queries::get_nodes_by_name(conn, symbol)?;
+            symbol_nodes = fetch_nodes(symbol)?;
         }
         outcome.disclose();
         outcome

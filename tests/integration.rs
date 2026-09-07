@@ -4395,3 +4395,139 @@ fn the_query_time_refresh_also_treats_deletions_as_dirty() {
         "regenerated, not blanked: {after:?}"
     );
 }
+#[test]
+fn test_python_qualified_method_references_and_call_graph() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("app.py"),
+        r#"
+class Alpha:
+    def caller(self):
+        return self.helper()
+
+    def helper(self):
+        return 1
+
+class Beta:
+    def helper(self):
+        return 2
+
+def static_call():
+    return Alpha.helper(None)
+
+def unknown_receiver(alpha):
+    return alpha.helper()
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "Alpha.helper",
+            "relation": "calls"
+        }),
+    );
+    let resp = server.handle_message(&refs).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["symbol"], "Alpha.helper");
+    let refs = result["references"].as_array().unwrap();
+    let names: Vec<&str> = refs
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "Alpha.helper should include self caller, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "Alpha.helper should include static caller, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "unknown receiver must not appear as a reference to Alpha.helper, got: {:?}",
+        names
+    );
+
+    let graph = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "Alpha.helper",
+            "direction": "callers",
+            "depth": 1
+        }),
+    );
+    let resp = server.handle_message(&graph).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["function"], "Alpha.helper");
+    let callers = result["callers"].as_array().unwrap();
+    let names: Vec<&str> = callers
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified call graph should include caller, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified call graph should include static_call, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "qualified call graph must not include unknown receiver, got: {:?}",
+        names
+    );
+
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "symbol_name": "Alpha.helper",
+            "include_references": true,
+            "include_impact": true
+        }),
+    );
+    let resp = server.handle_message(&ast).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["qualified_name"], "Alpha.helper");
+    let callers = result["called_by"].as_array().unwrap();
+    let names: Vec<&str> = callers
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified AST lookup should include caller, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified AST lookup should include static_call, got: {:?}",
+        names
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "qualified AST lookup must not include unknown receiver, got: {:?}",
+        names
+    );
+    assert_eq!(result["impact"]["direct_callers"], 2);
+
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({
+            "file_path": "app.py",
+            "symbol_name": "Alpha.helper",
+            "compact": true
+        }),
+    );
+    let resp = server.handle_message(&ast).unwrap();
+    let result = parse_tool_result(&resp);
+    assert_eq!(result["qualified_name"], "Alpha.helper");
+}

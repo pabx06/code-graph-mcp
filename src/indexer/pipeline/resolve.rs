@@ -32,6 +32,7 @@ pub(super) enum CalleeMeta {
     /// Resolves identically to `SelfType` — restrict candidates to that type's
     /// methods (issue #32 cause 2, Python).
     RecvType(String),
+    PythonImport(Vec<String>),
     Receiver(String),
     Chain,
 }
@@ -66,6 +67,15 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .get("v")?
             .as_str()
             .map(|t| CalleeMeta::RecvType(t.to_string())),
+        "python_import" => {
+            let payload = v.get("v")?.as_str()?;
+            let segments: Vec<String> = payload.split('.').map(String::from).collect();
+            if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+                None
+            } else {
+                Some(CalleeMeta::PythonImport(segments))
+            }
+        }
         "recv" => v
             .get("v")?
             .as_str()
@@ -290,7 +300,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                 // Drop on empty (drain the row without binding), never bare-fall-back.
                 self_filter_candidates(&t, &candidates, db)?
             }
-            Some(CalleeMeta::Path(segments)) => {
+            Some(CalleeMeta::Path(segments)) | Some(CalleeMeta::PythonImport(segments)) => {
                 // Drop on empty (drain the row without binding), never bare-fall-back.
                 path_filter_candidates(&segments, &candidates, &node_id_to_path, db, crate_roots)?
             }
@@ -1266,6 +1276,9 @@ fn filter_by_segment_chain(
     } else {
         None
     };
+    let python_module_suffix = format!("/{}.py", path_chain);
+    let python_stub_suffix = format!("/{}.pyi", path_chain);
+    let python_package_suffix = format!("/{}/__init__.py", path_chain);
 
     let kept: Vec<i64> = candidates
         .iter()
@@ -1278,7 +1291,13 @@ fn filter_by_segment_chain(
                 || path.starts_with(&format!("{}/", path_chain))
                 || single_file_suffix
                     .as_deref()
-                    .is_some_and(|sfx| path.ends_with(sfx));
+                    .is_some_and(|sfx| path.ends_with(sfx))
+                || path == format!("{}.py", path_chain)
+                || path == format!("{}.pyi", path_chain)
+                || path == format!("{}/__init__.py", path_chain)
+                || path.ends_with(&python_module_suffix)
+                || path.ends_with(&python_stub_suffix)
+                || path.ends_with(&python_package_suffix);
 
             let qn_match = qn == qn_chain
                 || qn.starts_with(&format!("{}.", qn_chain))

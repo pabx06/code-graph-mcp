@@ -24,6 +24,62 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::domain::REL_IMPORTS;
+use crate::parser::relations::ParsedRelation;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PythonImportBinding {
+    pub module: String,
+    pub imported_name: String,
+    pub is_module_import: bool,
+}
+
+pub(super) type PythonImportBindings = HashMap<(String, String), PythonImportBinding>;
+
+/// Map `(lexical_scope, local_name)` to the imported Python symbol. Module-level
+/// bindings are fallback-visible from function scopes; function-local imports
+/// stay scoped to the function that contains them.
+pub(super) fn build_python_import_bindings(relations: &[ParsedRelation]) -> PythonImportBindings {
+    let mut bindings = HashMap::new();
+    for rel in relations.iter().filter(|rel| rel.relation == REL_IMPORTS) {
+        let Some(metadata) = rel.metadata.as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        else {
+            continue;
+        };
+        let Some(module) = metadata.get("python_module").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(local_name) = metadata.get("python_local").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let scope = metadata.get("python_scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<module>");
+        bindings.insert(
+            (scope.to_string(), local_name.to_string()),
+            PythonImportBinding {
+                module: module.to_string(),
+                imported_name: rel.target_name.clone(),
+                is_module_import: metadata.get("is_module_import")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            },
+        );
+    }
+    bindings
+}
+
+pub(super) fn find_python_import_binding<'a>(
+    bindings: &'a PythonImportBindings,
+    scope: &str,
+    local_name: &str,
+) -> Option<&'a PythonImportBinding> {
+    bindings.get(&(scope.to_string(), local_name.to_string()))
+        .or_else(|| bindings.get(&("<module>".to_string(), local_name.to_string())))
+}
+
+
 /// Directories Python would import from: the project root, plus every
 /// directory that is neither a package nor inside one. A package directory is
 /// deliberately NOT a root — that is the whole difference between `src/db.py`

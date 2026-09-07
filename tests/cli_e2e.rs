@@ -78,6 +78,40 @@ export class Logger {
     project
 }
 
+fn setup_indexed_python_method_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("app.py"),
+        r#"
+class Alpha:
+    def caller(self):
+        return self.helper()
+
+    def helper(self):
+        return 1
+
+class Beta:
+    def helper(self):
+        return 2
+
+def static_call():
+    return Alpha.helper(None)
+
+def unknown_receiver(alpha):
+    return alpha.helper()
+"#,
+    )
+    .unwrap();
+
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("index.db");
+    let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    project
+}
+
 /// Run a CLI command and return (stdout, stderr, exit_code).
 fn run_cli(project: &TempDir, args: &[&str]) -> (String, String, i32) {
     run_cli_env(project, args, &[])
@@ -11417,4 +11451,71 @@ fn refs_by_node_id_keeps_its_id_when_the_target_has_no_file_row_to_re_resolve_by
         Some("orphan_target"),
         "the answer must still be about the symbol the id named: {after}"
     );
+}
+#[test]
+fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
+    let project = setup_indexed_python_method_project();
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["refs", "Alpha.helper", "--relation", "calls", "--json"],
+    );
+    assert_eq!(code, 0);
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(refs["symbol"], "Alpha.helper");
+    let names: Vec<&str> = refs["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified refs should include self caller, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified refs should include static caller, got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "qualified refs must exclude unknown receiver, got: {names:?}"
+    );
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Alpha.helper",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0);
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let names: Vec<&str> = graph["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"caller"),
+        "qualified callgraph should include caller, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"static_call"),
+        "qualified callgraph should include static caller, got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"unknown_receiver"),
+        "qualified callgraph must exclude unknown receiver, got: {names:?}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "Alpha.helper", "--json"]);
+    assert_eq!(code, 0);
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "Alpha.helper");
+    assert_eq!(impact["direct_callers"], 2);
 }

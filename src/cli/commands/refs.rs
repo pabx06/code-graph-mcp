@@ -79,6 +79,7 @@ enum RefsTarget {
     /// A name resolution already settled, optionally scoped to one file. Cheap
     /// to redo, and redoing it is what keeps the answer attached to the name.
     Name { file_path: Option<String> },
+    QualifiedName { file_path: Option<String> },
 }
 
 impl RefsTarget {
@@ -100,11 +101,16 @@ impl RefsTarget {
             .map(|c| vec![c.node.id])
             .unwrap_or_default(),
             RefsTarget::Orphan(id) => vec![*id],
+            RefsTarget::QualifiedName { file_path } => queries::get_node_ids_by_qualified_name(conn, symbol)?
+                .into_iter()
+                .filter(|(_, fp)| file_path.as_deref().is_none_or(|wanted| wanted == fp))
+                .map(|(id, _)| id)
+                .collect(),
             RefsTarget::Name {
                 file_path: Some(fp),
             } => queries::get_nodes_by_file_path(conn, fp)?
                 .into_iter()
-                .filter(|n| n.name == symbol)
+                .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
                 .map(|n| n.id)
                 .collect(),
             RefsTarget::Name { file_path: None } => queries::get_node_ids_by_name(conn, symbol)?
@@ -135,11 +141,36 @@ impl RefsTarget {
     ) -> Result<()> {
         let cands: Vec<queries::NameCandidate> = match self {
             RefsTarget::Node { .. } | RefsTarget::Orphan(_) => return Ok(()),
+            RefsTarget::QualifiedName { file_path } => {
+                let matches = queries::get_node_ids_by_qualified_name(conn, symbol)?;
+                let filtered: Vec<_> = matches
+                    .into_iter()
+                    .filter(|(_, fp)| file_path.as_deref().is_none_or(|wanted| wanted == fp))
+                    .collect();
+                if filtered.len() > 1 {
+                    let cands: Vec<queries::NameCandidate> = filtered
+                        .into_iter()
+                        .filter_map(|(id, fp)| {
+                            queries::get_node_by_id(conn, id).ok().flatten().map(|n| {
+                                queries::NameCandidate {
+                                    name: n.name,
+                                    file_path: fp,
+                                    node_type: n.node_type,
+                                    node_id: n.id,
+                                    start_line: n.start_line,
+                                }
+                            })
+                        })
+                        .collect();
+                    emit_exact_ambiguity(symbol, &cands, json_mode);
+                }
+                return Ok(());
+            }
             RefsTarget::Name {
                 file_path: Some(fp),
             } => queries::get_nodes_by_file_path(conn, fp)?
                 .into_iter()
-                .filter(|n| n.name == symbol)
+                .filter(|n| n.name == symbol || n.qualified_name.as_deref() == Some(symbol))
                 .map(|n| queries::NameCandidate {
                     name: n.name,
                     file_path: fp.clone(),
@@ -231,13 +262,33 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!(
                 format!("Usage: code-graph-mcp refs <symbol> [--node-id N] [--file path] [--relation {}] [--min-confidence extracted|inferred|ambiguous] [--compact] [--json]", crate::domain::RELATION_FILTER_VOCAB.join("|"))
             ))?;
-        let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-        let file_path = explicit_file.or(resolved_file.as_deref());
+        let qualified_ids = if raw_symbol.contains('.') {
+            queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
+                .into_iter()
+                .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !qualified_ids.is_empty() {
+            (
+                qualified_ids,
+                raw_symbol.to_string(),
+                RefsTarget::QualifiedName {
+                    file_path: explicit_file.map(|s| s.to_string()),
+                },
+            )
+        } else {
+            let (base, resolved_file) = resolve_qualified_symbol(conn, raw_symbol, explicit_file);
+            let file_path = explicit_file.or(resolved_file.as_deref());
 
-        if let Some(fp) = file_path {
-            let nodes = queries::get_nodes_by_file_path(conn, fp)?;
-            let matched: Vec<&queries::NodeResult> =
-                nodes.iter().filter(|n| n.name == base).collect();
+            if let Some(fp) = file_path {
+                let nodes = queries::get_nodes_by_file_path(conn, fp)?;
+                let matched: Vec<&queries::NodeResult> = nodes
+                    .iter()
+                    .filter(|n| n.name == base || n.qualified_name.as_deref() == Some(raw_symbol))
+                    .collect();
             if matched.is_empty() {
                 // Empty-JSON contract: emit a parseable envelope, not empty stdout.
                 if json_mode {
@@ -338,7 +389,8 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 )
             }
         }
-    };
+    }
+};
     // Intentional shadow: downstream paths want &str. Do NOT "simplify" into a
     // single binding — the tuple above must own the String so `get_node_by_id`'s
     // return doesn't get dropped across the .as_str() borrow.
