@@ -25,9 +25,9 @@ on:
   #
   # What it buys, stated precisely: a full CI run on demand. A manual run reports
   # `github.event_name == 'workflow_dispatch'`, so every `if:` below evaluates
-  # true and all five jobs run alongside the ungated `audit` — the right answer
-  # for a button someone deliberately pressed, but NOT a way to exercise the
-  # schedule-only path. That path is verified statically instead, by
+  # true and all FOUR gated jobs run alongside the ungated `audit`, which is five
+  # in total — the right answer for a button someone deliberately pressed, but
+  # NOT a way to exercise the schedule-only path. That path is verified statically instead, by
   # `ci_schedule_runs_only_the_audit_job` in tests/hardening.rs. An earlier
   # version of this comment claimed the button closed that gap; it does not
   # (pre-ship review 2026-09-07).

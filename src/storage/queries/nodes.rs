@@ -728,8 +728,6 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
 
 // --- Batch node queries ---
 
-/// Batch-fetch nodes with their file path and language by node IDs.
-/// Avoids N+1 queries when loading search results.
 /// Node types for the given ids, chunked, with NO join to `files`.
 ///
 /// The joining twin below drops any node whose `files` row is missing, and that
@@ -740,8 +738,11 @@ pub fn get_dirty_node_ids(conn: &Connection, changed_file_ids: &[i64]) -> Result
 /// join's row loss: `find_references` did, and silently stopped emitting its
 /// type-definition warning for orphaned targets (pre-ship review 2026-09-07).
 ///
-/// Order is not preserved and ids with no row are simply absent, matching the
-/// per-id `get_node_by_id` loop this replaced.
+/// Order is not preserved and ids with no row are simply absent. That matches
+/// neither of its neighbours exactly: the per-id `get_node_by_id` loop this
+/// path used before DID preserve order, and the joined batch it briefly used
+/// does not. The sole caller reduces with `any()`, so neither property is load-
+/// bearing.
 pub fn get_node_types_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<String>> {
     if node_ids.is_empty() {
         return Ok(vec![]);
@@ -763,6 +764,12 @@ pub fn get_node_types_by_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<
     Ok(types)
 }
 
+/// Batch-fetch nodes with their file path and language by node IDs.
+/// Avoids N+1 queries when loading search results.
+///
+/// INNER JOIN on `files`: a node whose file row is missing does not come back.
+/// Callers that must survive that state want [`get_node_types_by_ids`] or an
+/// unjoined lookup instead.
 pub fn get_nodes_with_files_by_ids(
     conn: &Connection,
     node_ids: &[i64],

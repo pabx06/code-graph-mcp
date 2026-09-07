@@ -437,11 +437,6 @@ impl McpServer {
         // exhausted, or that lost nothing to filtering, retrieves exactly as
         // before — the retrieval benchmark path is untouched.
         let retry_fetch = crate::domain::search_retry_fetch_count(fetch_count);
-        // Set when the widening below RAN and produced no additional survivor.
-        // That outcome is evidence, not a non-event: a pool four times wider found
-        // nothing more, so the short answer is the complete one and telling the
-        // caller to raise top_k sends them to repeat an experiment already run.
-        let mut widening_found_nothing_more = false;
         if candidates.len() < top_k as usize
             && fused.len() >= fetch_count as usize
             && (skipped_noise_count + dropped_by_filter) > 0
@@ -450,14 +445,19 @@ impl McpServer {
             let (fts_retry, vec_retry, _, _) = retrieve(retry_fetch)?;
             let fused_retry = fuse(&fts_retry, &vec_retry, retry_fetch as usize);
             let (retry_candidates, retry_dropped, retry_skipped) = build_candidates(&fused_retry)?;
+            // The pool numbers move whenever the retry RAN, adopted or not: those
+            // rows were fetched and examined either way, so they are what "did the
+            // pool come back full" has to be asked of. Updating them only on
+            // adoption measured the superseded first pool — at top_k=20 on a
+            // 421-row index that reported "the candidate pool (320 rows) came back
+            // full" while the retry had just read all 421 and found nothing below
+            // any cut (pre-ship review round 2).
+            final_pool_len = fused_retry.len();
+            final_fetch_count = retry_fetch;
             if retry_candidates.len() > candidates.len() {
                 candidates = retry_candidates;
                 dropped_by_filter = retry_dropped;
                 skipped_noise_count = retry_skipped;
-                final_pool_len = fused_retry.len();
-                final_fetch_count = retry_fetch;
-            } else {
-                widening_found_nothing_more = true;
             }
         }
 
@@ -465,20 +465,23 @@ impl McpServer {
         // once here (the counts and both pool numbers are only in scope at this
         // point) and attached to whichever of the three response shapes returns.
         //
-        // `widening_found_nothing_more` changes the ADVICE, not the flag. Getting
-        // that split right took a wrong first attempt worth recording: suppressing
-        // the flag outright when the widening added nothing also silenced the
-        // empty-result case, where a match provably DOES exist below the cut — the
-        // widened pool held 400 of 422 rows and still missed it. "A wider pool
-        // found nothing more" is evidence, not proof, so it cannot decide whether
-        // the answer is complete.
+        // Two wrong attempts at this are worth recording, because both looked
+        // reasonable and both were refuted by measurement.
         //
-        // What it can decide is what to tell the caller. Pre-ship review measured
-        // an index with exactly one match for the filter: top_k=2 returned it and
-        // advised raising top_k; top_k=20 returned the same one result and gave
-        // the same advice again. The flag was right — 23 of 423 nodes really were
-        // unseen — and the instruction was the part that sent the caller to repeat
-        // an experiment the tool had already run.
+        // The first suppressed the flag whenever the widening added no survivor.
+        // That silenced the EMPTY case, where a match provably does exist below
+        // the cut — the widened pool held 400 of 422 rows and still missed it.
+        //
+        // The second kept the flag but branched the ADVICE on the same signal,
+        // telling the caller that raising top_k was unlikely to help. Also false:
+        // `fetch_count` is `top_k * 16` while the retry widens by a fixed 4x, so a
+        // bigger top_k reaches PAST what the retry saw. Measured on that fixture,
+        // top_k=27 returns the match the retry never reached — the advice steered
+        // the caller away from the remedy that works.
+        //
+        // What was actually broken is above: the pool being measured. With the
+        // retry's own pool recorded, a widening that read the index to its end
+        // leaves `final_pool_len < final_fetch_count` and no flag is raised at all.
         let shortfall = PoolShortfall {
             dropped_by_filter,
             skipped_noise: skipped_noise_count,
@@ -486,7 +489,6 @@ impl McpServer {
             saturated: candidates.len() < top_k as usize
                 && final_pool_len >= final_fetch_count as usize
                 && (dropped_by_filter + skipped_noise_count) > 0,
-            widening_exhausted: widening_found_nothing_more,
         };
 
         // Phase 2: Re-rank by adjusted score (name relevance + size normalization)
@@ -772,17 +774,12 @@ struct PoolShortfall {
     dropped_by_filter: usize,
     /// Rows the always-on module/external/test filter removed.
     skipped_noise: usize,
-    /// Size of the pool the returned candidates came from — the retry pool when
-    /// the retry was adopted, the first pool otherwise.
+    /// Size of the WIDEST pool actually fetched — the retry's whenever the retry
+    /// ran, adopted or not, since those rows were examined either way.
     pool_len: usize,
     /// That pool came back FULL and was still consumed before `top_k` was
     /// filled, so rows below the fetch cut were never examined.
     saturated: bool,
-    /// The widening retry RAN and produced no additional survivor. Evidence that
-    /// a bigger `top_k` is unlikely to help — not proof that the answer is
-    /// complete (the widened pool can still stop short of the whole index), so
-    /// it steers the advice rather than the flag.
-    widening_exhausted: bool,
 }
 
 impl PoolShortfall {
@@ -791,24 +788,21 @@ impl PoolShortfall {
     /// filter is not what removed the match. Empty when nothing was cut off, so
     /// the unaffected arms keep their wording verbatim.
     ///
-    /// Kept under 200 characters on purpose: `truncate_large_strings` (see
-    /// `server/helpers.rs`'s `TRUNCATE_MIN_LEN`) cuts longer strings mid-sentence
-    /// on a large compact response, and an advisory that ends in "…" advises
-    /// nothing. Measured at 168 characters for a four-digit pool size.
+    /// Kept short on purpose: `truncate_large_strings` (see `server/helpers.rs`'s
+    /// `TRUNCATE_MIN_LEN = 200`) cuts longer strings mid-sentence on a large
+    /// compact response, and an advisory that ends in "…" advises nothing.
+    /// Measured at 161 bytes after `trim()` for a four-digit pool size — an
+    /// earlier version of this line claimed 168 and had never been counted.
+    ///
+    /// That margin protects the standalone `pool_saturated_note` only. On the
+    /// two empty-result arms this sentence is APPENDED into `hint`, and the
+    /// composed hint runs past 200 bytes, so it remains eligible for truncation
+    /// there. Left as is rather than shortened further: those arms carry the same
+    /// text verbatim in `pool_saturated_note`, which is not composed and not
+    /// truncated, so the finding survives the cut either way.
     fn exhaustion_note(&self) -> String {
         if !self.saturated {
             return String::new();
-        }
-        // Two remedies, and only one of them is ever true. When the widening
-        // already ran and returned nothing extra, "raise top_k" is the advice a
-        // caller has just been shown to be useless — measured pre-ship as the
-        // same one-result answer at top_k=2 and top_k=20, each time telling the
-        // caller to raise it.
-        if self.widening_exhausted {
-            return format!(
-                " The candidate pool ({} rows) came back full, and a wider fetch already returned no further match — so raising top_k is unlikely to help here.",
-                self.pool_len
-            );
         }
         format!(
             " The candidate pool ({} rows) came back full before top_k was filled, so matches may sit below the cut. Raise top_k to widen it; broadening the filter will not.",
@@ -1537,43 +1531,60 @@ mod tests {
         );
     }
 
-    /// Regression, pre-ship review 2026-09-07: the advice looped.
+    /// Regression, pre-ship review round 2: a retry that read the index to its
+    /// END was reported as a full pool, because the pool numbers were updated
+    /// only when the retry's candidates were ADOPTED.
     ///
-    /// One Python match in the whole index. Pre-fix, `top_k=2` returned it and
-    /// said "raise top_k"; `top_k=20` returned the same one result and said
-    /// "raise top_k" again — while the retry had already fetched four times as
-    /// many rows and found no second match. The flag itself was right (rows below
-    /// the cut really were unread), so what has to change is the remedy, and both
-    /// values of `top_k` must now say the widening has already been tried.
+    /// One Python match among ~421 fusable rows. At `top_k=20` the retry fetches
+    /// up to 1000 and comes back with all 421 — nothing sits below any cut, so
+    /// the answer is complete and must carry no flag. Measured pre-fix: it
+    /// announced "the candidate pool (320 rows) came back full", the superseded
+    /// FIRST pool, and advised raising top_k on an answer that was already whole.
+    ///
+    /// `top_k=2` is the contrast in the same fixture: there the retry stops at
+    /// 400 of 421, rows really are unread, and the flag belongs.
     #[test]
-    fn an_exhausted_widening_stops_advising_a_bigger_top_k() {
+    fn a_retry_that_read_the_whole_index_reports_no_truncation() {
         let project = saturating_pool_project(420, &[("widget", 0)]);
         let server = indexed_server(&project);
-        for top_k in [2, 20] {
-            let out = server
+        let ask = |top_k: i64| {
+            server
                 .tool_semantic_search(&json!({
                     "query": "widget", "language": "python",
                     "top_k": top_k, "skip_indexing": true
                 }))
-                .unwrap();
-            assert_eq!(
-                out["results"].as_array().map(|a| a.len()),
-                Some(1),
-                "precondition at top_k={top_k}: exactly one Python match exists, so \
-                 the widening cannot recover a second; got {out}"
-            );
-            let note = out["pool_saturated_note"].as_str().unwrap_or_default();
-            assert!(
-                note.contains("already returned no further match"),
-                "top_k={top_k}: the caller must be told the wider fetch was already \
-                 run, not sent to run it again; got {out}"
-            );
-            assert!(
-                !note.contains("Raise top_k to widen"),
-                "top_k={top_k}: that is the instruction this test exists to remove; \
-                 got {out}"
-            );
-        }
+                .unwrap()
+        };
+
+        let wide = ask(20);
+        assert_eq!(
+            wide["results"].as_array().map(|a| a.len()),
+            Some(1),
+            "precondition: exactly one Python match exists in the index; got {wide}"
+        );
+        assert!(
+            wide.get("pool_saturated").is_none(),
+            "the retry fetched up to 1000 rows and the index holds ~421, so it was \
+             read to its end — nothing was cut off and nothing may be claimed; got \
+             {wide}"
+        );
+
+        let narrow = ask(2);
+        assert_eq!(
+            narrow["pool_saturated"],
+            json!(true),
+            "the contrast: at top_k=2 the retry stops at 400 of ~421, so rows below \
+             the cut really were unread; got {narrow}"
+        );
+        assert!(
+            narrow["pool_saturated_note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Raise top_k to widen it"),
+            "and raising top_k IS the remedy there — `fetch_count` is top_k*16 \
+             while the retry widens by a fixed 4x, so a bigger top_k reaches past \
+             what the retry saw; got {narrow}"
+        );
     }
 
     /// The compressed envelope is the third response shape, and removing its

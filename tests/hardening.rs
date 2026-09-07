@@ -4045,11 +4045,21 @@ fn cache_path_scanner_catches_literals_and_spares_prose() {
         vec!["install-manifest.json"],
         "a literal after a URL on the same line must still be seen"
     );
-    // …and a real comment AFTER a URL still ends the code.
+    // …and a real comment AFTER a URL still ends the code. The name is QUOTED
+    // here on purpose: the first version of this control left it bare, and since
+    // the predicate only matches quoted names it returned empty whether or not
+    // the second `//` stripped — a control that could not fail (pre-ship review
+    // round 2). The pair below is what makes it discriminate.
     assert!(
-        cache_path_literals("fetch('https://example.com/a'); // writes update-state.json")
+        cache_path_literals("fetch('https://example.com/a'); // writes 'update-state.json'")
             .is_empty(),
         "the second `//` here IS a comment marker and must still strip"
+    );
+    assert_eq!(
+        cache_path_literals("fetch('https://example.com/a'); const P = 'update-state.json';"),
+        vec!["update-state.json"],
+        "the same quoted name with no comment marker IS seen, so the assertion \
+         above is about the stripping and not about the quoting"
     );
 }
 
