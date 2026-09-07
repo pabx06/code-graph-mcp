@@ -49,6 +49,11 @@ type: reference
 > ToolSearch 加载），而 Bash 永远在线——真实编程夜（2026-06-12）观测到的全部
 > 转化都是 CLI 调用。结构化查询的最快路径是 Bash 直呼
 > `code-graph-mcp callgraph X / show X / overview <dir> / grep "pat" / impact X`。
+>
+> **裸名字不在 PATH 上时**（纯 `/plugin install`，没跑过 `npm i -g`）：插件自己
+> 下载的那份在 `~/.cache/code-graph/bin/code-graph-mcp`，子命令完全相同；
+> `npm i -g @sdsrs/code-graph` 则把裸名字放上 PATH。下面所有 `code-graph-mcp …`
+> 的写法两种都适用（issue #41）。
 > `grep` 是 drop-in 替代：`-F` 字面 / `-i` / `-w` / `-l` / `-c` 计数 / `-t <lang>` 按语言筛 /
 > `-g <glob>` 路径过滤 / `-A/-B/-C N` 上下文 / `-M N` 行宽上限（默认 512，防长行刷屏）/
 > 多路径 / `-m 0` 取消每文件上限，退出码兼容 grep（0/1/2），召回达 git-grep 级

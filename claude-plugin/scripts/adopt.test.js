@@ -143,6 +143,39 @@ test('buildBlock is deterministic (byte-identical across calls)', () => {
   assert.strictEqual(buildBlock('generic'), buildBlock(undefined));
 });
 
+// issue #41: a plugin-only install never puts `code-graph-mcp` on PATH. The
+// binary the plugin manages for itself lands in ~/.cache/code-graph/bin
+// (auto-update.js `BINARY_CACHE_DIR` + `cachedBinaryPath`), and every row of
+// this block spends the bare name. The reporter's session therefore read a
+// table of commands their shell answers with "command not found".
+test('every project type tells a plugin-only install where the binary is', () => {
+  for (const type of ['generic', 'rust', 'web-rs', 'web-node', 'frontend', 'python']) {
+    const block = buildBlock(type);
+    assert.ok(block.includes('~/.cache/code-graph/bin/code-graph-mcp'),
+      `${type}: the block spends bare \`code-graph-mcp\` but never says where it is ` +
+      'for an install that has it nowhere on PATH');
+  }
+});
+
+// The counterweight to the test above: the obvious way to make the block
+// "always correct" is to resolve the binary at adopt time and write the answer
+// in. That is wrong here — adopt.js:864 tells the user CLAUDE.md is git-tracked
+// and to commit it, so a resolved path is right on exactly one machine and
+// re-written on every other one's next SessionStart (buildBlock's determinism
+// is what needsRefresh diffs against). The block may name a path SHAPE only.
+test('the block stays machine-independent — no resolved home path', () => {
+  const os = require('os');
+  for (const type of ['generic', 'web-rs', 'frontend']) {
+    const block = buildBlock(type);
+    assert.ok(!block.includes(os.homedir()),
+      `${type}: block leaked this machine's home directory`);
+    assert.ok(!/(^|[\s`(])\/(home|Users)\//.test(block),
+      `${type}: block carries an absolute per-user path`);
+    assert.ok(!/[A-Za-z]:\\\\?Users\\/.test(block),
+      `${type}: block carries an absolute Windows user path`);
+  }
+});
+
 // ── adopt — installs CLAUDE.md block + .claude/ detail ──────────────────────
 
 test('adopt creates CLAUDE.md with the block when none exists', () => {

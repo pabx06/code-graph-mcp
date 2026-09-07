@@ -71,6 +71,21 @@ function writeFileAtomic(filePath, data, { followLink = false } = {}) {
 // the full table at .claude/plugin_code_graph_mcp.md (opened on demand, never
 // auto-loaded). Project-type tailoring swaps a couple of rows (web → HTTP-route
 // tracing; frontend → reference audits) — body of the detail doc is unchanged.
+//
+// Every row spends the bare name `code-graph-mcp`, and a plugin-only install has
+// it nowhere on PATH: findBinary() resolves the plugin's own download at
+// ~/.cache/code-graph/bin (auto-update.js `cachedBinaryPath`), and the global-npm
+// tiers below it exist only for users who ran `npm i -g` themselves. Issue #41 is
+// what that reads like from the other side — a table of commands the user's shell
+// answers with "command not found". Hence the fallback line below the table.
+//
+// It names a path SHAPE, never a resolved one. This file goes into a git-tracked
+// CLAUDE.md (the adopt output says so two screens down), so a resolved
+// /home/<user>/… is right on one machine and wrong on every teammate's — and
+// buildBlock's byte-determinism is exactly what needsRefresh diffs, so
+// machine-varying content would rewrite the block on every clone's next
+// SessionStart. No `.exe` variant for the same reason it is safe not to have one:
+// platformGuard() refuses adopt on win32, so this block never exists there.
 const BLOCK_HEADING = '## Code Graph (repo-wide AST index)';
 
 function buildTriggerRows(projectType = 'generic') {
@@ -115,6 +130,9 @@ function buildBlock(projectType = 'generic') {
     'structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:',
     '',
     table,
+    '',
+    'Not on PATH? A plugin-only install keeps its own copy — same commands, run',
+    '`~/.cache/code-graph/bin/code-graph-mcp` (or `npm i -g @sdsrs/code-graph` once).',
     '',
     "Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.",
     'Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`',

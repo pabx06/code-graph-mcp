@@ -558,6 +558,25 @@ function verifyBinary() {
 }
 
 /**
+ * The `unadopt` invocation to hand the user, spelled so their shell can run it.
+ *
+ * Issue #41: the reporter drives this plugin through `/plugin install` only and
+ * has no `code-graph-mcp` on PATH — the plugin resolves its own download under
+ * ~/.cache/code-graph/bin instead. Every remedy this hook printed spent the bare
+ * name, so the way OUT of the adoption was as unrunnable as the feature.
+ *
+ * Unlike the CLAUDE.md block (git-tracked, must stay machine-independent), this
+ * text is stderr for one session on one machine, so the resolved path is exactly
+ * the right thing to print. `verifyBinary()` already resolved it — no second
+ * probe, no new require. Falls back to the bare name when nothing resolved:
+ * `null unadopt` would be worse than a command that at least reads correctly.
+ */
+function unadoptCommand(binaryCheck) {
+  const bin = binaryCheck && binaryCheck.available && binaryCheck.binary;
+  return `${bin || 'code-graph-mcp'} unadopt`;
+}
+
+/**
  * Lightweight consistency checks — called from runSessionInit().
  * Returns an array of issue objects: { id, msg, fix }.
  * Empty array = all consistent (silent).
@@ -806,7 +825,7 @@ function runSessionInit({ source } = {}) {
         '[code-graph] Installed code-graph block into project CLAUDE.md (plugin install → knowing consent).\n' +
         '            Detail table: .claude/plugin_code_graph_mcp.md (generated; safe to gitignore)\n' +
         '            Opt out:    CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env\n' +
-        '            Reverse:    code-graph-mcp unadopt\n'
+        `            Reverse:    ${unadoptCommand(binaryCheck)}\n`
       );
     }
     // `adopt()` has returned `registryRecorded` since it stopped throwing on a
@@ -820,7 +839,7 @@ function runSessionInit({ source } = {}) {
       process.stderr.write(
         '[code-graph] Note: this project could not be recorded in the adopted-projects registry,\n' +
         '            so `/plugin uninstall` will NOT strip the block from this CLAUDE.md.\n' +
-        '            Remove it by hand with `code-graph-mcp unadopt` before uninstalling.\n'
+        `            Remove it by hand with \`${unadoptCommand(binaryCheck)}\` before uninstalling.\n`
       );
     }
   }
@@ -1090,7 +1109,7 @@ module.exports = {
   indexNeedsRevalidation,
   injectProjectMap,
   injectRecentImpact,
-  verifyBinary, missingBinaryMessage,
+  verifyBinary, missingBinaryMessage, unadoptCommand,
   consistencyCheck,
   runSessionInit,
   computeQuietHooks,

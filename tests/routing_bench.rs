@@ -93,6 +93,9 @@ structural queries (LSP only sees open files; this sees everything). Fastest pat
 | Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
 | grep + AST context | `code-graph-mcp grep "pat" [paths] [-t lang] [-g glob] [-c]` |
 
+Not on PATH? A plugin-only install keeps its own copy — same commands, run
+`~/.cache/code-graph/bin/code-graph-mcp` (or `npm i -g @sdsrs/code-graph` once).
+
 Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
 Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
 <!-- code-graph-mcp:end -->"#;

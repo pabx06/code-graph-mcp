@@ -347,6 +347,59 @@ test('an unrecorded adoption warns that uninstall will not clean this project', 
     'the message must name the manual remedy');
 });
 
+// issue #41: the reporter uses the plugin only and has no `code-graph-mcp` on
+// PATH. Both remedies this hook prints — the Reverse line on a fresh adoption
+// and the unrecorded-registry note — spend the bare name, so the escape hatch
+// was exactly as unrunnable as the feature the user wanted out of. stderr is
+// per-machine and ephemeral, so unlike the CLAUDE.md block it may (and must)
+// name the path this install actually resolved.
+test('the adoption remedies name a binary this install can run', (t) => {
+  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
+  const findBinary = JSON.stringify(path.join(__dirname, 'find-binary.js'));
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-reverse-',
+    preloadSrc: `
+      const ad = require(${adopt});
+      ad.maybeAutoAdopt = () => ({
+        attempted: true,
+        reason: 'adopted',
+        result: { ok: true, detailWritten: true, registryRecorded: false },
+      });
+      const fb = require(${findBinary});
+      fb.findBinary = () => '/bin/true';
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  assert.match(res.stderr, /Reverse:\s+\/bin\/true unadopt/,
+    `the Reverse hint must be runnable as printed; stderr was:\n${res.stderr}`);
+  assert.match(res.stderr, /`\/bin\/true unadopt`/,
+    `the unrecorded-registry remedy must be runnable too; stderr was:\n${res.stderr}`);
+});
+
+// Negative control for the test above: with no binary resolved there is no path
+// to print, and the hint must fall back to the bare name rather than to
+// `null unadopt` or an empty command.
+test('with no binary resolved the remedy falls back to the bare name', (t) => {
+  const adopt = JSON.stringify(path.join(__dirname, 'adopt.js'));
+  const findBinary = JSON.stringify(path.join(__dirname, 'find-binary.js'));
+  const { res } = runSessionInitHook(t, {
+    prefix: 'cg-si-reverse-none-',
+    preloadSrc: `
+      const ad = require(${adopt});
+      ad.maybeAutoAdopt = () => ({
+        attempted: true,
+        reason: 'adopted',
+        result: { ok: true, detailWritten: true, registryRecorded: true },
+      });
+      const fb = require(${findBinary});
+      fb.findBinary = () => null;
+    `,
+  });
+  assert.equal(res.status, 0, `hook must still exit 0; stderr:\n${res.stderr}`);
+  assert.match(res.stderr, /Reverse:\s+code-graph-mcp unadopt/,
+    `no binary → bare name, not a null path; stderr was:\n${res.stderr}`);
+});
+
 // Control for the two tests above: the same harness with NO stubbed failure
 // must stay quiet, so neither assertion can be passing on an unconditional line.
 // JS-08 (audit 2026-08-29): the hook-dark detector read `process.cwd()` while
