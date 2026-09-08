@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.142.0
 
 **Upgrading:** two printed remedies change, and one teardown message changes
 shape. Nothing else here is user-visible.
