@@ -91,10 +91,9 @@ pub(super) const BATCH_SIZE: usize = 500;
 /// Measured (2026-09-08) on a generated TypeScript corpus of 500 KiB files,
 /// each half the 1 MiB per-file cap, indexed by the release binary: peak RSS ran
 /// at ~70x the batch's source bytes and scaled linearly with it — 29 MB source
-/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB, and a 241 MB corpus was
-/// still climbing through 9 GiB at 14 s when the probe's cap killed it. The
-/// amplification is the trees plus `ParsedNode::code_content`, which stores each
-/// node's own text, so nested declarations carry their bodies more than once.
+/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB. The amplification is the
+/// trees plus `ParsedNode::code_content`, which stores each node's own text, so
+/// nested declarations carry their bodies more than once.
 ///
 /// 16 MiB leaves the common case untouched: this repo indexes ~6 MiB of source
 /// across 333 tracked files (mean 26.6 KiB), so an ordinary run still forms one
@@ -102,9 +101,21 @@ pub(super) const BATCH_SIZE: usize = 500;
 /// would otherwise hold tens of MiB at once — the shape that OOM-killed a 24 GiB
 /// host with no swap.
 ///
+/// What this budget does NOT do is bound a batch below one FILE. `plan_chunks`
+/// gives an item at or over the budget a run of its own, because a file has to
+/// be parsed whole, so the real ceiling is `max(BATCH_MAX_BYTES, max_file_size())`
+/// — the `BATCH_SIZE * max_file_size()` term above loses the `BATCH_SIZE` factor,
+/// not the whole product. At the 1 MiB default that is immaterial; raise
+/// `CODE_GRAPH_MAX_FILE_SIZE` to 64 MiB and one such file reproduces the original
+/// shape (~4.5 GiB at the 70x above) with this budget still in force. That knob
+/// is a memory setting as much as a coverage one.
+///
 /// A/B on the 116 MB corpus, same build flags, budget out of reach vs. 16 MiB:
 /// 7.87 GiB / 121.0 s -> 3.49 GiB / 118.3 s. On the 241 MB one: crossed 9 GiB in
-/// 5.5 s and was killed, vs. finishing at 6.29 GiB.
+/// 5.5 s and was killed, vs. finishing at 6.45 GiB. (Repeated runs of one
+/// configuration spread ~3%: the batch-bounded, Phase-3-unbounded 241 MB run
+/// measured 6.27, 6.29 and 6.45 GiB. Differences below that are noise, which is
+/// why the 116 MB point reads 7.88 in the sweep above and 7.87 in this A/B.)
 ///
 /// Tightening this further is deliberately not done. Once the batch is bounded
 /// the batch stops being the peak: timing the phase log on the 241 MB corpus put
@@ -136,6 +147,11 @@ const BATCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// a repository that size still runs Phase 3 exactly as before — while holding
 /// the phase's own footprint to roughly 100-200 MB at the 2-4 KB per node
 /// measured across a synthetic corpus and 178 real crates.
+///
+/// Note what the unit is: this bounds a chunk's NODE COUNT, and the bytes behind
+/// a node are governed elsewhere — `code_content` is truncated at
+/// `CODE_GRAPH_MAX_CODE_LEN` (4 KB by default). Raising that knob scales this
+/// phase's footprint with it and the "100-200 MB" above stops holding.
 const CONTEXT_CHUNK_NODES: usize = 50_000;
 
 /// Split a sequence into runs bounded by BOTH item count and cumulative size.
@@ -2291,7 +2307,9 @@ pub(super) fn index_files(
         }
     };
 
-    // Phase 3: Build context strings + embeddings (single transaction, lightweight)
+    // Phase 3: Build context strings + embeddings, in chunks of
+    // CONTEXT_CHUNK_NODES with one savepoint each (it was one transaction for
+    // the whole run until that became the largest term of a full index).
     if !all_indexed.is_empty() {
         finalize_tick();
         build_context_strings_and_embed(db, &all_indexed, model, &finalize_tick)?;
@@ -3568,33 +3586,56 @@ mod tests {
     ///
     /// Phase 1a materializes a whole batch's source, trees and nodes at once, so
     /// a batch capped only by FILE COUNT is capped only at
-    /// `BATCH_SIZE * max_file_size()` — 200 files at the 1 MiB per-file default
-    /// is 200 MiB of source in one batch, measured at ~70x that in RSS.
+    /// `BATCH_SIZE * max_file_size()` — 500 * 1 MiB at the defaults. The fixture
+    /// below uses 200 such files rather than the full 500, which is already
+    /// 200 MiB of source in one batch and ~70x that in RSS; the count is the
+    /// fixture's, not the constant's.
     ///
     /// The fixture size is deliberately NOT derived from [`BATCH_MAX_BYTES`]: a
     /// fixture that scales with the constant is green at any value of it, which
-    /// is the vacuity this test exists to avoid. Raising the budget back toward
-    /// the old effective ceiling turns this red (verified by mutation, not
-    /// assumed), and so does deleting the byte term.
+    /// is the vacuity this test exists to avoid — the first draft of this test
+    /// did exactly that and survived its own mutation.
+    ///
+    /// It pins the CEILING, not the constant. The planner packs this fixture at
+    /// `BATCH_MAX_BYTES` worth of 1 MiB files per batch, so the assertion is
+    /// green for any budget up to 64 MiB and red above it — checked at 128 MiB
+    /// and at 500 MiB, the pre-fix effective ceiling. Deleting the byte term
+    /// instead does not compile at all, under `-D warnings`.
     #[test]
     fn plan_batches_bounds_the_source_bytes_one_batch_may_hold() {
         const MIB: u64 = 1024 * 1024;
-        /// The most source one batch may carry. Independent of the constant
-        /// under test — this is the property, `BATCH_MAX_BYTES` is the setting.
-        const CEILING_MIB: usize = 64;
+        /// The most source one batch may carry, in BYTES. Independent of the
+        /// constant under test — this is the property, `BATCH_MAX_BYTES` is the
+        /// setting.
+        const CEILING_BYTES: u64 = 64 * MIB;
 
         let dir = tempfile::TempDir::new().unwrap();
         // 200 files at the default `max_file_size()`: individually legal, and
         // the exact shape that put 200 MiB of source in one batch.
-        let files = sized_files(dir.path(), &[MIB; 200]);
+        let sizes = [MIB; 200];
+        let files = sized_files(dir.path(), &sizes);
 
         let lens = plan_batches(&files, dir.path(), BATCH_SIZE, BATCH_MAX_BYTES);
 
-        let widest = lens.iter().copied().max().unwrap_or(0);
+        // Summed from the fixture's own byte sizes, never inferred from a batch
+        // LENGTH: at 1 MiB per file the two happen to coincide, and a fixture
+        // whose file size changed would silently assert a different ceiling.
+        let mut at = 0usize;
+        let widest = lens
+            .iter()
+            .map(|&l| {
+                let bytes: u64 = sizes[at..at + l].iter().sum();
+                at += l;
+                bytes
+            })
+            .max()
+            .unwrap_or(0);
         assert!(
-            widest <= CEILING_MIB,
-            "one batch was planned to hold {widest} MiB of source; no batch may exceed \
-             {CEILING_MIB} MiB, or peak RSS follows it up (~70x measured). Plan: {lens:?}"
+            widest <= CEILING_BYTES,
+            "one batch was planned to hold {} MiB of source; no batch may exceed {} MiB, \
+             or peak RSS follows it up (~70x measured). Plan: {lens:?}",
+            widest / MIB,
+            CEILING_BYTES / MIB
         );
         assert_eq!(
             lens.iter().sum::<usize>(),
@@ -3671,8 +3712,10 @@ mod tests {
     ///
     /// As with the byte budget, the fixture is deliberately NOT derived from
     /// [`CONTEXT_CHUNK_NODES`]: a fixture that scales with the constant is green
-    /// at every value of it. Raising the constant past the ceiling turns this
-    /// red — verified by mutation, not assumed.
+    /// at every value of it.
+    ///
+    /// It pins the CEILING, not the constant: green for any budget up to
+    /// 100,000 nodes and red above it — checked at 200,000 and at 500,000.
     #[test]
     fn plan_context_chunks_bounds_the_nodes_one_chunk_may_hold() {
         /// Independent of the constant under test: this is the property.

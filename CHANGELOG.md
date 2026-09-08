@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.143.0
 
 **Upgrading:** nothing to do. `INDEX_VERSION` is not bumped and no index needs
-rebuilding — this changes how much memory a run holds, not what it produces.
+rebuilding — this changes how much memory a run holds, not what it produces, and
+that is verified rather than asserted (see below). To pin back to the previous
+release: `npm i -g @sdsrs/code-graph@0.142.0`, or `cargo install code-graph-mcp
+--version 0.142.0`; plugin users can set the version in the marketplace entry.
+Reverting only restores the old memory profile — no index or config migration is
+involved in either direction.
 
 ### A repository of large files could index itself into an OOM kill
 
@@ -62,13 +67,37 @@ context string instead of all of them. `repair_null_context_strings` already run
 once per process at server startup for exactly this state, and the batch loop has
 always committed per batch.
 
-Known remaining gap: what is left is proportional to SYMBOL count — the
-run-global name map and indexed-file list, 2.71 GiB at 2,065,100 nodes. Bounding
-that means putting cross-batch resolution back in SQL, which is a latency trade
-this pipeline already measured its way out of, so it is not a follow-up so much
-as a different design. None of it is visible on ordinary repositories: 178 real
-crates (75 MB of Rust, 3,580 files, 72,828 nodes) index end to end at 0.87 GiB
-before this change.
+### Not covered
+
+**Neither bound goes below one item.** A file has to be parsed whole, so
+`plan_chunks` gives an at-or-over-budget file a batch of its own: the real
+ceiling is `max(16 MiB, CODE_GRAPH_MAX_FILE_SIZE)`, and what the byte budget
+removes from `BATCH_SIZE * max_file_size()` is the `BATCH_SIZE` factor, not the
+whole product. At the 1 MiB default that is immaterial. Raise
+`CODE_GRAPH_MAX_FILE_SIZE` to 64 MiB and a single such file reproduces the
+original shape with the budget still in force — that knob is a memory setting as
+much as a coverage one. The same asymmetry applies to Phase 3, which bounds a
+chunk's node COUNT while the bytes behind a node come from
+`CODE_GRAPH_MAX_CODE_LEN` (4 KB by default).
+
+**What is left is proportional to symbol count** — the run-global name map and
+indexed-file list, 2.71 GiB at 2,065,100 nodes. Bounding that means putting
+cross-batch resolution back in SQL, which is a latency trade this pipeline
+already measured its way out of, so it is not a follow-up so much as a different
+design. None of it is visible on ordinary repositories: 178 real crates (75 MB of
+Rust, 3,580 files, 72,828 nodes) index end to end at 0.87 GiB before this change
+and 0.78 GiB after.
+
+**Repeated runs of one configuration spread about 3%** (the 241 MB corpus
+measured 6.27, 6.29 and 6.45 GiB in the same configuration), so differences below
+that in the numbers above are noise, not signal.
+
+**The process that actually triggered the incident is not identified.** The
+kernel killed a `code_graph_mcp-` test binary at 11.8 GiB; the committed test
+suite peaks at 1.37 GiB for the whole process tree, with that binary at 194 MiB,
+so it was running something not in the repository. Both passes fixed here are
+reproducible causes of a process that size, which is why they are fixed; neither
+is proven to be the one.
 
 ## 0.142.0
 
