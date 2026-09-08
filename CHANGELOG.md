@@ -1,5 +1,75 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading:** nothing to do. `INDEX_VERSION` is not bumped and no index needs
+rebuilding — this changes how much memory a run holds, not what it produces.
+
+### A repository of large files could index itself into an OOM kill
+
+`BATCH_SIZE` (500 files) was the only bound on what a batch held, and Phase 1a
+materializes every file in a batch at once: source string, tree-sitter tree and
+extracted nodes. At the 1 MiB per-file default that is up to 500 MiB of source
+resident simultaneously — none of it individually oversize, so nothing along the
+way declines it — and the trees plus each node's own stored text multiply it
+several-fold on top.
+
+Measured on a generated TypeScript corpus of 500 KiB files, each half the
+per-file cap: peak RSS ran at ~70x the batch's source bytes and scaled linearly
+with them. 116 MB of source peaked at 7.87 GiB; 241 MB crossed 9 GiB in 5.5
+seconds and was still climbing. On a 24 GiB host with no swap that is an OOM
+kill, which is where this report came from.
+
+A batch is now bounded by cumulative source bytes (16 MiB) as well as by file
+count. Same corpora, same build flags: 116 MB peaks at 3.49 GiB and gets slightly
+faster (121.0 s -> 118.3 s); 241 MB now completes, at 6.29 GiB.
+
+Ordinary repositories are unaffected. This one indexes ~6 MiB of source across
+333 tracked files, so a run still forms a single 500-file batch and never
+consults the budget; only a batch that would otherwise hold tens of MiB at once
+gets split, and a split batch resolves through the same cross-batch deferred pass
+a >500-file run already used.
+
+### The pass that builds context strings held the whole repository at once
+
+Bounding the batch moved the peak rather than removing it. Timed against the
+phase log on the same 241 MB corpus, the batch loop ended holding 2.35 GiB and
+the run peaked at 6.29 GiB sixteen seconds later — inside Phase 3, which
+materialized every node's row for the whole run at once, source text included,
+along with every edge touching them and every context string built from them. It
+was unbounded in exactly the way the batch loop had been, and once the batch was
+fixed it was the largest single term in a full index.
+
+Phase 3 now runs in chunks of 50,000 nodes. The number keeps ordinary
+repositories in a single chunk — django/django is 48,084 nodes — so for them the
+pass runs exactly as before.
+
+Same corpus, same build flags, Phase 3 unbounded vs. chunked: **6.45 GiB / 310.2 s
+-> 2.71 GiB / 264.8 s**, so it is both smaller and faster. Taken with the batch
+bound above, a corpus that used to cross 9 GiB in 5.5 seconds and never finish now
+completes with a 2.71 GiB peak.
+
+Chunking is safe against the one thing that could have made it lossy: the edge
+query selects on the node being either end and resolves the far end by joining
+`nodes`, so a node still sees every edge it has, including edges into another
+chunk. Verified rather than argued — a 40-file corpus whose imports, inherits and
+calls all cross chunk boundaries produces a byte-identical index either way,
+`context_string` values included (384,430 nodes, 256,420 edges, same SHA-256).
+
+One behaviour change worth naming: the savepoint is now per chunk where it used
+to wrap the phase, so a run killed mid-Phase-3 leaves some nodes without a
+context string instead of all of them. `repair_null_context_strings` already runs
+once per process at server startup for exactly this state, and the batch loop has
+always committed per batch.
+
+Known remaining gap: what is left is proportional to SYMBOL count — the
+run-global name map and indexed-file list, 2.71 GiB at 2,065,100 nodes. Bounding
+that means putting cross-batch resolution back in SQL, which is a latency trade
+this pipeline already measured its way out of, so it is not a follow-up so much
+as a different design. None of it is visible on ordinary repositories: 178 real
+crates (75 MB of Rust, 3,580 files, 72,828 nodes) index end to end at 0.87 GiB
+before this change.
+
 ## 0.142.0
 
 **Upgrading:** two printed remedies change, and one teardown message changes

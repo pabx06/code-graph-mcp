@@ -80,6 +80,116 @@ fn looks_like_cpp_header(source: &str) -> bool {
 /// then drops heavyweight data (ASTs, source strings) before the next batch.
 pub(super) const BATCH_SIZE: usize = 500;
 
+/// Cumulative source bytes admitted into one batch, alongside [`BATCH_SIZE`].
+///
+/// A file COUNT is not a memory bound. Phase 1a materializes the whole batch at
+/// once — source string, tree-sitter tree and extracted nodes for every file in
+/// it — so peak RSS tracks the batch's BYTES, and the only thing bounding those
+/// was `BATCH_SIZE * max_file_size()`: 500 MiB of source at the defaults, none
+/// of it individually oversize.
+///
+/// Measured (2026-09-08) on a generated TypeScript corpus of 500 KiB files,
+/// each half the 1 MiB per-file cap, indexed by the release binary: peak RSS ran
+/// at ~70x the batch's source bytes and scaled linearly with it — 29 MB source
+/// -> 2.03 GiB, 58 MB -> 3.96 GiB, 116 MB -> 7.88 GiB, and a 241 MB corpus was
+/// still climbing through 9 GiB at 14 s when the probe's cap killed it. The
+/// amplification is the trees plus `ParsedNode::code_content`, which stores each
+/// node's own text, so nested declarations carry their bodies more than once.
+///
+/// 16 MiB leaves the common case untouched: this repo indexes ~6 MiB of source
+/// across 333 tracked files (mean 26.6 KiB), so an ordinary run still forms one
+/// 500-file batch and never consults the budget. It only splits a batch that
+/// would otherwise hold tens of MiB at once — the shape that OOM-killed a 24 GiB
+/// host with no swap.
+///
+/// A/B on the 116 MB corpus, same build flags, budget out of reach vs. 16 MiB:
+/// 7.87 GiB / 121.0 s -> 3.49 GiB / 118.3 s. On the 241 MB one: crossed 9 GiB in
+/// 5.5 s and was killed, vs. finishing at 6.29 GiB.
+///
+/// Tightening this further is deliberately not done. Once the batch is bounded
+/// the batch stops being the peak: timing the phase log on the 241 MB corpus put
+/// the end of the batch loop at t=166 s holding 2.35 GiB, and the run peaking at
+/// 6.29 GiB sixteen seconds later, inside `build_context_strings_and_embed` —
+/// which is now bounded in turn by [`CONTEXT_CHUNK_NODES`]. Consistent with
+/// 4 MiB buying only -0.57 GiB on the 116 MB corpus for +9.5% wall. Two candidate
+/// explanations for the residue were measured and REFUTED: `temp_store = FILE`
+/// moves the peak 6.27 -> 6.19 GiB (noise), and SQLite's page cache is pinned at
+/// 64 MB by `cache_size`.
+///
+/// What is left after both bounds is the run-global name map and indexed-file
+/// list, which grow with symbol count (2.71 GiB for 2,065,100 nodes). Bounding
+/// THAT means putting cross-batch resolution back in SQL, which is the trade this
+/// pipeline already measured its way out of — a full table scan per batch.
+const BATCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Nodes admitted into one Phase 3 chunk.
+///
+/// Phase 3 is the batch loop's defect one phase later: it used to materialize
+/// the WHOLE run at once — every node's row including `code_content`, every edge
+/// touching them, and the context string built for each — with no bound at all.
+/// Timed against the phase log on a 241 MB corpus (2,065,100 nodes), the batch
+/// loop ended at t=166 s holding 2.35 GiB and the run then peaked at 6.29 GiB at
+/// t=182 s, inside this phase: it was the single largest term in the run, larger
+/// than everything the bounded batch loop did.
+///
+/// 50,000 keeps the common case in one chunk — django/django is 48,084 nodes, so
+/// a repository that size still runs Phase 3 exactly as before — while holding
+/// the phase's own footprint to roughly 100-200 MB at the 2-4 KB per node
+/// measured across a synthetic corpus and 178 real crates.
+const CONTEXT_CHUNK_NODES: usize = 50_000;
+
+/// Split a sequence into runs bounded by BOTH item count and cumulative size.
+///
+/// Shared by the two places that must not materialize a whole run at once. A
+/// single item at or over `max_size` still gets a run — of one — rather than an
+/// empty one, and every item lands in exactly one run, in order.
+fn plan_chunks(sizes: impl Iterator<Item = u64>, max_items: usize, max_size: u64) -> Vec<usize> {
+    let mut lens: Vec<usize> = Vec::new();
+    let mut len = 0usize;
+    let mut size_acc = 0u64;
+    for size in sizes {
+        if len > 0 && (len >= max_items || size_acc.saturating_add(size) > max_size) {
+            lens.push(len);
+            len = 0;
+            size_acc = 0;
+        }
+        len += 1;
+        size_acc = size_acc.saturating_add(size);
+    }
+    if len > 0 {
+        lens.push(len);
+    }
+    lens
+}
+
+/// Lengths of the batches `files` splits into, bounded by BOTH `max_files` and
+/// `max_bytes` of source. Every file lands in exactly one batch, in order.
+///
+/// A file whose size cannot be read counts as 0: the size is a scheduling hint,
+/// and Phase 1a re-stats each file and skips it on its own terms.
+fn plan_batches(files: &[String], root: &Path, max_files: usize, max_bytes: u64) -> Vec<usize> {
+    plan_chunks(
+        files.iter().map(|rel| {
+            std::fs::metadata(root.join(rel))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        }),
+        max_files,
+        max_bytes,
+    )
+}
+
+/// Lengths of the Phase 3 chunks `all_indexed` splits into, bounded by node
+/// count. Chunks are whole files, so a node's name and path stay together with
+/// the file that produced them.
+fn plan_context_chunks(all_indexed: &[FileIndexed], max_nodes: usize) -> Vec<usize> {
+    plan_chunks(
+        all_indexed.iter().map(|fi| fi.node_ids.len() as u64),
+        usize::MAX,
+        max_nodes as u64,
+    )
+}
+
 /// Files touched in one run before it refreshes query-planner statistics.
 ///
 /// Set from the two measured ends rather than picked round: at 1 file the
@@ -1975,8 +2085,15 @@ pub(super) fn index_files(
     let mut global_name_map: HashMap<String, Vec<crate::storage::queries::NameEntry>> =
         get_all_node_names_with_ids(db.conn())?;
 
-    // Process files in batches — each batch does Phase 1 + Phase 2
-    for batch in files.chunks(BATCH_SIZE) {
+    // Process files in batches — each batch does Phase 1 + Phase 2.
+    // Bounded by bytes as well as by count: see [`BATCH_MAX_BYTES`] for why a
+    // 500-file cap alone let one batch reach 500 MiB of source.
+    let plan = plan_batches(&files, root, BATCH_SIZE, BATCH_MAX_BYTES);
+    let multi_batch = plan.len() > 1;
+    let mut batch_start = 0usize;
+    for batch_len in plan {
+        let batch = &files[batch_start..batch_start + batch_len];
+        batch_start += batch_len;
         let tx = db.savepoint("idx_batch")?;
 
         // --- Phase 1a: Parallel CPU-bound work (read + parse + extract nodes) ---
@@ -2110,7 +2227,9 @@ pub(super) fn index_files(
             cb(IndexPhase::Files, all_indexed.len(), files.len());
         }
 
-        if files.len() > BATCH_SIZE {
+        // Multi-batch is no longer implied by `files.len() > BATCH_SIZE`: the
+        // byte budget can split a run of far fewer, far larger files.
+        if multi_batch {
             tracing::info!(
                 "[index] batch {}/{}: {} files ({} nodes, {} edges)",
                 all_indexed.len(),
@@ -3242,82 +3361,105 @@ fn resolve_deferred_relations(
 /// vector table, touching none of the caller's accumulators — so the extraction
 /// is behaviour-preserving by construction rather than by inspection.
 ///
-/// `tick` is the caller's finalizing heartbeat: 3a/3b run inside one savepoint
-/// and 3c can take minutes on a cold embed, so the progress consumer's mtime has
-/// to move between them or a stale-file gate reads the run as killed.
+/// `tick` is the caller's finalizing heartbeat: 3a/3b run inside a savepoint and
+/// 3c can take minutes on a cold embed, so the progress consumer's mtime has to
+/// move between them or a stale-file gate reads the run as killed.
+///
+/// Runs in chunks of [`CONTEXT_CHUNK_NODES`] rather than over the whole run at
+/// once — see that constant for the measurement. Chunking is safe against the
+/// one thing that could have made it lossy: `get_edges_batch` selects on
+/// `source_id IN (…)` / `target_id IN (…)` and resolves the FAR end by joining
+/// `nodes`, so a node still sees every edge it has, including edges to nodes in
+/// another chunk. Per-node edge order is unchanged too — a node's outgoing set
+/// and incoming set each come from one query, ordered by content.
+///
+/// The savepoint is per chunk, where it used to wrap the phase. That trades
+/// all-or-nothing for a bounded footprint, on a column that already has a repair
+/// path: `repair_null_context_strings` runs once per process at server startup
+/// precisely because a Phase 3 can die half-done, and the batch loop above has
+/// always committed per batch. A crash now leaves SOME nodes without a context
+/// string instead of ALL of them; the same repair fixes either.
 fn build_context_strings_and_embed(
     db: &Database,
     all_indexed: &[FileIndexed],
     model: Option<&EmbeddingModel>,
     tick: &dyn Fn(),
 ) -> Result<()> {
-    {
-        let tx = db.savepoint("idx_context")?;
-        let all_node_ids: Vec<i64> = all_indexed
-            .iter()
-            .flat_map(|fi| fi.node_ids.iter().copied())
-            .collect();
-        let all_edges = get_edges_batch(db.conn(), &all_node_ids)?;
-        let all_node_details: HashMap<i64, (NodeResult, Option<String>)> = {
-            let nodes = get_nodes_with_files_by_ids(db.conn(), &all_node_ids)?;
-            nodes
-                .into_iter()
-                .map(|nwf| (nwf.node.id, (nwf.node, nwf.language)))
-                .collect()
-        };
+    let mut built = 0usize;
+    let mut start = 0usize;
 
-        // Phase 3a: Build all context strings (CPU-bound, parallelized with rayon)
-        // Flatten to (node_id, node_name, file_path) tuples for parallel iteration
-        let node_tasks: Vec<(i64, &str, &str)> = all_indexed
-            .iter()
-            .flat_map(|fi| {
-                fi.node_ids.iter().enumerate().map(move |(idx, &node_id)| {
-                    (node_id, fi.node_names[idx].as_str(), fi.rel_path.as_str())
+    for chunk_len in plan_context_chunks(all_indexed, CONTEXT_CHUNK_NODES) {
+        let chunk = &all_indexed[start..start + chunk_len];
+        start += chunk_len;
+
+        // The heavyweight reads live in this block so the node rows (which carry
+        // `code_content`) and the edge map are dropped before the next chunk
+        // reads its own — the whole point of the bound.
+        let context_updates: Vec<(i64, String)> = {
+            let tx = db.savepoint("idx_context")?;
+            let node_ids: Vec<i64> = chunk
+                .iter()
+                .flat_map(|fi| fi.node_ids.iter().copied())
+                .collect();
+            let chunk_edges = get_edges_batch(db.conn(), &node_ids)?;
+            let chunk_node_details: HashMap<i64, (NodeResult, Option<String>)> = {
+                let nodes = get_nodes_with_files_by_ids(db.conn(), &node_ids)?;
+                nodes
+                    .into_iter()
+                    .map(|nwf| (nwf.node.id, (nwf.node, nwf.language)))
+                    .collect()
+            };
+
+            // Phase 3a: Build this chunk's context strings (CPU-bound, rayon).
+            // Flatten to (node_id, node_name, file_path) tuples for parallel iteration
+            let node_tasks: Vec<(i64, &str, &str)> = chunk
+                .iter()
+                .flat_map(|fi| {
+                    fi.node_ids.iter().enumerate().map(move |(idx, &node_id)| {
+                        (node_id, fi.node_names[idx].as_str(), fi.rel_path.as_str())
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let context_updates: Vec<(i64, String)> = node_tasks
-            .par_iter()
-            .map(|&(node_id, node_name, file_path)| {
-                let edges = all_edges.get(&node_id);
-                let cat = categorize_edges(edges, format_route_from_metadata);
-                let node_detail = all_node_details.get(&node_id);
+            let updates: Vec<(i64, String)> = node_tasks
+                .par_iter()
+                .map(|&(node_id, node_name, file_path)| {
+                    let edges = chunk_edges.get(&node_id);
+                    let cat = categorize_edges(edges, format_route_from_metadata);
+                    let node_detail = chunk_node_details.get(&node_id);
 
-                let ctx = build_context_string(&NodeContext {
-                    node_type: node_detail
-                        .map(|(n, _)| n.node_type.clone())
-                        .unwrap_or_default(),
-                    name: node_name.to_string(),
-                    qualified_name: node_detail.and_then(|(n, _)| n.qualified_name.clone()),
-                    file_path: file_path.to_string(),
-                    language: node_detail.and_then(|(_, lang)| lang.clone()),
-                    signature: node_detail.and_then(|(n, _)| n.signature.clone()),
-                    return_type: node_detail.and_then(|(n, _)| n.return_type.clone()),
-                    param_types: node_detail.and_then(|(n, _)| n.param_types.clone()),
-                    code_content: node_detail.map(|(n, _)| n.code_content.clone()),
-                    routes: cat.routes,
-                    callees: cat.callees,
-                    callers: cat.callers,
-                    inherits: cat.inherits,
-                    imports: cat.imports,
-                    implements: cat.implements,
-                    exports: cat.exports,
-                    doc_comment: node_detail.and_then(|(n, _)| n.doc_comment.clone()),
-                });
+                    let ctx = build_context_string(&NodeContext {
+                        node_type: node_detail
+                            .map(|(n, _)| n.node_type.clone())
+                            .unwrap_or_default(),
+                        name: node_name.to_string(),
+                        qualified_name: node_detail.and_then(|(n, _)| n.qualified_name.clone()),
+                        file_path: file_path.to_string(),
+                        language: node_detail.and_then(|(_, lang)| lang.clone()),
+                        signature: node_detail.and_then(|(n, _)| n.signature.clone()),
+                        return_type: node_detail.and_then(|(n, _)| n.return_type.clone()),
+                        param_types: node_detail.and_then(|(n, _)| n.param_types.clone()),
+                        code_content: node_detail.map(|(n, _)| n.code_content.clone()),
+                        routes: cat.routes,
+                        callees: cat.callees,
+                        callers: cat.callers,
+                        inherits: cat.inherits,
+                        imports: cat.imports,
+                        implements: cat.implements,
+                        exports: cat.exports,
+                        doc_comment: node_detail.and_then(|(n, _)| n.doc_comment.clone()),
+                    });
 
-                (node_id, ctx)
-            })
-            .collect();
+                    (node_id, ctx)
+                })
+                .collect();
 
-        // Phase 3b: Batch update context strings in DB
-        update_context_strings_batch(db.conn(), &context_updates)?;
-        tx.commit()?;
-
-        tracing::info!(
-            "[index] Phase 3: context strings built for {} nodes",
-            all_node_ids.len()
-        );
+            // Phase 3b: Batch update context strings in DB
+            update_context_strings_batch(db.conn(), &updates)?;
+            tx.commit()?;
+            built += node_ids.len();
+            updates
+        };
 
         // Phase 3c: Embed outside the committed tx — recoverable on failure via repair_null_context_strings
         tick();
@@ -3327,6 +3469,8 @@ fn build_context_strings_and_embed(
             }
         }
     }
+
+    tracing::info!("[index] Phase 3: context strings built for {} nodes", built);
     Ok(())
 }
 
@@ -3399,7 +3543,179 @@ fn run_global_edge_post_passes(
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_cpp_header;
+    use super::{
+        looks_like_cpp_header, plan_batches, plan_context_chunks, BATCH_MAX_BYTES, BATCH_SIZE,
+        CONTEXT_CHUNK_NODES,
+    };
+
+    /// Sparse files: `plan_batches` only stats, so `set_len` buys the size
+    /// without writing the bytes.
+    fn sized_files(dir: &std::path::Path, sizes: &[u64]) -> Vec<String> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let rel = format!("f{i}.ts");
+                let f = std::fs::File::create(dir.join(&rel)).unwrap();
+                f.set_len(len).unwrap();
+                rel
+            })
+            .collect()
+    }
+
+    /// The bound that was missing, stated as an ABSOLUTE ceiling on the source
+    /// one batch may hold.
+    ///
+    /// Phase 1a materializes a whole batch's source, trees and nodes at once, so
+    /// a batch capped only by FILE COUNT is capped only at
+    /// `BATCH_SIZE * max_file_size()` — 200 files at the 1 MiB per-file default
+    /// is 200 MiB of source in one batch, measured at ~70x that in RSS.
+    ///
+    /// The fixture size is deliberately NOT derived from [`BATCH_MAX_BYTES`]: a
+    /// fixture that scales with the constant is green at any value of it, which
+    /// is the vacuity this test exists to avoid. Raising the budget back toward
+    /// the old effective ceiling turns this red (verified by mutation, not
+    /// assumed), and so does deleting the byte term.
+    #[test]
+    fn plan_batches_bounds_the_source_bytes_one_batch_may_hold() {
+        const MIB: u64 = 1024 * 1024;
+        /// The most source one batch may carry. Independent of the constant
+        /// under test — this is the property, `BATCH_MAX_BYTES` is the setting.
+        const CEILING_MIB: usize = 64;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // 200 files at the default `max_file_size()`: individually legal, and
+        // the exact shape that put 200 MiB of source in one batch.
+        let files = sized_files(dir.path(), &[MIB; 200]);
+
+        let lens = plan_batches(&files, dir.path(), BATCH_SIZE, BATCH_MAX_BYTES);
+
+        let widest = lens.iter().copied().max().unwrap_or(0);
+        assert!(
+            widest <= CEILING_MIB,
+            "one batch was planned to hold {widest} MiB of source; no batch may exceed \
+             {CEILING_MIB} MiB, or peak RSS follows it up (~70x measured). Plan: {lens:?}"
+        );
+        assert_eq!(
+            lens.iter().sum::<usize>(),
+            files.len(),
+            "every file must land in exactly one batch, got {lens:?}"
+        );
+    }
+
+    /// The count cap has not been traded away for the byte cap: many small files
+    /// still batch at `max_files`.
+    #[test]
+    fn plan_batches_still_stops_at_the_file_count_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = sized_files(dir.path(), &[10; 7]);
+
+        let lens = plan_batches(&files, dir.path(), 3, BATCH_MAX_BYTES);
+
+        assert_eq!(lens, vec![3, 3, 1], "count cap must still close a batch");
+    }
+
+    /// A file bigger than the whole budget cannot be dropped or stall the plan —
+    /// it takes a batch of its own, and the next file starts a fresh one.
+    #[test]
+    fn plan_batches_gives_a_single_oversize_file_its_own_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = sized_files(dir.path(), &[100, 10, 10]);
+
+        let lens = plan_batches(&files, dir.path(), BATCH_SIZE, 50);
+
+        assert_eq!(
+            lens,
+            vec![1, 2],
+            "the oversize file batches alone, the two small ones share the next"
+        );
+    }
+
+    /// A path whose size cannot be read (deleted between the scan and here) is
+    /// still scheduled — Phase 1a re-stats and skips it on its own terms. Losing
+    /// it here would drop the file from the run silently.
+    #[test]
+    fn plan_batches_schedules_a_file_whose_size_cannot_be_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut files = sized_files(dir.path(), &[10, 10]);
+        files.push("vanished.ts".to_string());
+
+        let lens = plan_batches(&files, dir.path(), BATCH_SIZE, BATCH_MAX_BYTES);
+
+        assert_eq!(lens.iter().sum::<usize>(), 3, "got {lens:?}");
+    }
+
+    #[test]
+    fn plan_batches_of_nothing_is_no_batches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(plan_batches(&[], dir.path(), BATCH_SIZE, BATCH_MAX_BYTES).is_empty());
+    }
+
+    /// The planner reads only `node_ids.len()`, so names stay empty.
+    fn indexed_with(node_counts: &[usize]) -> Vec<super::FileIndexed> {
+        node_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| super::FileIndexed {
+                rel_path: format!("f{i}.ts"),
+                node_ids: (0..n as i64).collect(),
+                node_names: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Phase 3's bound, stated as an ABSOLUTE ceiling on the nodes one chunk may
+    /// hold — it used to materialize every node in the run at once, rows and
+    /// `code_content` included, and that was measured as the largest single term
+    /// of a full index (6.29 GiB peak, entered 16 s after the batch loop ended).
+    ///
+    /// As with the byte budget, the fixture is deliberately NOT derived from
+    /// [`CONTEXT_CHUNK_NODES`]: a fixture that scales with the constant is green
+    /// at every value of it. Raising the constant past the ceiling turns this
+    /// red — verified by mutation, not assumed.
+    #[test]
+    fn plan_context_chunks_bounds_the_nodes_one_chunk_may_hold() {
+        /// Independent of the constant under test: this is the property.
+        const CEILING: usize = 100_000;
+
+        // 400 files x 1,000 nodes — a 400,000-node run, which the unbounded
+        // version held in one piece.
+        let indexed = indexed_with(&[1_000; 400]);
+
+        let lens = plan_context_chunks(&indexed, CONTEXT_CHUNK_NODES);
+
+        let widest = lens.iter().map(|&l| l * 1_000).max().unwrap_or(0);
+        assert!(
+            widest <= CEILING,
+            "one Phase 3 chunk was planned to hold {widest} nodes; no chunk may exceed \
+             {CEILING}, or the phase is unbounded again. Plan: {lens:?}"
+        );
+        assert_eq!(
+            lens.iter().sum::<usize>(),
+            indexed.len(),
+            "every file must land in exactly one chunk, got {lens:?}"
+        );
+    }
+
+    /// A chunk is whole files, so one file with more nodes than the budget takes
+    /// a chunk of its own rather than being split or dropped.
+    #[test]
+    fn plan_context_chunks_keeps_an_oversized_file_whole_and_alone() {
+        let indexed = indexed_with(&[10, 500, 10]);
+
+        let lens = plan_context_chunks(&indexed, 50);
+
+        assert_eq!(
+            lens,
+            vec![1, 1, 1],
+            "the 500-node file cannot share a chunk in either direction"
+        );
+    }
+
+    #[test]
+    fn plan_context_chunks_of_nothing_is_no_chunks() {
+        assert!(plan_context_chunks(&[], CONTEXT_CHUNK_NODES).is_empty());
+    }
 
     #[test]
     fn cpp_header_detection_upgrades_only_real_cpp() {
