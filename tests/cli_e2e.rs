@@ -7010,9 +7010,16 @@ fn test_cli_incremental_index_gitignore_opt_out() {
         "the switch must suppress the .gitignore write entirely"
     );
 
-    // Positive control: the same command without the switch still writes, so the
-    // assertion above is not green because indexing silently did nothing.
-    let (_, stderr, code) = run_cli(&project, &["incremental-index"]);
+    // Positive control: the same command with the switch OFF still writes, so the
+    // assertion above is not green because indexing silently did nothing. Set the
+    // variable to "0" rather than leaving it unset — `run_cli` inherits the
+    // ambient environment, so a developer carrying CODE_GRAPH_NO_GITIGNORE=1 in
+    // their own profile would otherwise fail this control.
+    let (_, stderr, code) = run_cli_env(
+        &project,
+        &["incremental-index"],
+        &[("CODE_GRAPH_NO_GITIGNORE", "0")],
+    );
     assert_eq!(code, 0, "control run must succeed; stderr={stderr}");
     let content = std::fs::read_to_string(&gitignore).expect("control run must create .gitignore");
     assert!(
