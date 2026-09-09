@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.145.0
+
+**Upgrading:** nothing to do. Default behaviour is unchanged, no index needs
+rebuilding, and the one new thing is an opt-out you have to ask for.
+
+`CODE_GRAPH_NO_GITIGNORE=1` stops the tool writing `.code-graph/` into your
+`.gitignore`. Set it if your own ignore rules already cover the index directory —
+a global `core.excludesFile`, say — and you would rather the tool never touched
+`.gitignore` in the repos it runs in. Unset, everything behaves exactly as in
+0.144.0.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.144.0`, or `cargo install
+code-graph-mcp --version 0.144.0`; plugin users can set the version in the
+marketplace entry. Nothing migrates in either direction. `INDEX_VERSION` stays
+at 70.
+
+### An opt-out for the `.gitignore` write
+
+Contributed by @ross (#47). The index directory holds a multi-hundred-MB SQLite
+cache that nobody wants committed, so every index-creating entry point appends
+`.code-graph/` to the repo's `.gitignore`. That append is unconditional, which
+means the tool edits a tracked file in every repository it is pointed at,
+including ones the user does not own and did not intend to modify. The switch
+makes it declinable.
+
+Worth stating plainly, because it is the obvious worry: **turning the switch on
+does not make the indexer start walking its own database.** `.code-graph/` is
+excluded because it is hidden (`hidden(true)` in the file walker), not because
+of the `.gitignore` line. That was verified for this release rather than
+asserted — two byte-identical fixtures, one of them with no `.gitignore` at all,
+produce identical `nodes` and `edges` dumps, and a `.ts` file planted inside
+`.code-graph/` is excluded in the arm that has no `.gitignore` whatsoever. The
+same reasoning is why `INDEX_VERSION` is not bumped: nothing about what gets
+extracted changes, so no existing index is stale.
+
+### The CI action pins moved
+
+`actions/checkout` v6 → v7.0.1, `actions/setup-node` v6 → v7.0.0, and
+`softprops/action-gh-release` forward within v3. Invisible from the outside, and
+listed here only because two of them are major bumps whose release notes name
+changes this repo could plausibly have depended on, and did not:
+
+- checkout v7 blocks checking out a fork PR under `pull_request_target` and
+  `workflow_run`. No workflow here uses either trigger — `pr-impact-review.yml`
+  runs on plain `pull_request`.
+- setup-node v7 removes its dummy `NODE_AUTH_TOKEN` export. `release.yml` sets
+  `NODE_AUTH_TOKEN` explicitly on both publish steps, so it never relied on the
+  dummy; the other npm calls in that job are `npm root -g`, which needs no auth.
+
+### Not covered
+
+- The switch is not retroactive. A `.code-graph/` line written by an earlier run
+  stays where it is; remove it by hand if you want it gone.
+- It is documented in the README's environment table, and deliberately not added
+  to the plugin's adoption opt-out list, which is scoped to install-time
+  behaviour.
+- `CODE_GRAPH_NO_GITIGNORE` is read as exactly `1`, matching the other
+  `CODE_GRAPH_NO_*` switches. Any other value, including `true`, leaves the
+  write enabled.
+
 ## 0.144.0
 
 **Upgrading:** nothing to do, and two things change on their own.
