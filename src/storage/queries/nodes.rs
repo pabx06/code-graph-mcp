@@ -183,11 +183,30 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
     Ok(results)
 }
 
-/// Match either a bare node name or an exact qualified name.
-pub fn get_nodes_with_files_by_symbol(conn: &Connection, symbol: &str) -> Result<Vec<NodeWithFile>> {
+/// Match a symbol with exact-qualified precedence.
+///
+/// If any node has `qualified_name = symbol`, return only those rows. Otherwise
+/// return exact bare-name rows. This avoids combining a qualified definition
+/// with an unrelated node whose literal bare name happens to contain dots.
+pub fn get_nodes_with_files_by_symbol(
+    conn: &Connection,
+    symbol: &str,
+) -> Result<Vec<NodeWithFile>> {
+    let qualified = get_nodes_with_files_by_qualified_name(conn, symbol)?;
+    if !qualified.is_empty() {
+        return Ok(qualified);
+    }
+    get_nodes_with_files_by_name(conn, symbol)
+}
+
+/// Return internal nodes whose qualified name exactly matches `symbol`.
+pub fn get_nodes_with_files_by_qualified_name(
+    conn: &Connection,
+    symbol: &str,
+) -> Result<Vec<NodeWithFile>> {
     let sql = format!(
         "SELECT {}, f.path, f.language FROM nodes n JOIN files f ON f.id = n.file_id \
-         WHERE (n.name = ?1 OR n.qualified_name = ?1) AND f.path <> '<external>'",
+         WHERE n.qualified_name = ?1 AND f.path <> '<external>'",
         NODE_SELECT_ALIASED
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -540,9 +559,13 @@ pub fn get_node_ids_by_name(conn: &Connection, name: &str) -> Result<Vec<(i64, S
 }
 
 /// Get all node IDs matching an exact qualified name, with file paths for filtering.
-pub fn get_node_ids_by_qualified_name(conn: &Connection, qualified_name: &str) -> Result<Vec<(i64, String)>> {
+pub fn get_node_ids_by_qualified_name(
+    conn: &Connection,
+    qualified_name: &str,
+) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, COALESCE(f.path, '') FROM nodes n LEFT JOIN files f ON f.id = n.file_id WHERE n.qualified_name = ?1"
+        "SELECT n.id, f.path FROM nodes n JOIN files f ON f.id = n.file_id \
+         WHERE n.qualified_name = ?1 AND f.path <> '<external>'",
     )?;
     let rows = stmt.query_map([qualified_name], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1014,6 +1037,61 @@ mod tests {
         let found = get_nodes_by_name(db.conn(), "handleLogin").unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "handleLogin");
+    }
+
+    #[test]
+    fn qualified_lookup_has_exact_precedence_and_excludes_external_rows() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let internal_file = upsert_file(
+            conn,
+            &FileRecord {
+                path: "pkg/service.py".into(),
+                blake3_hash: "internal".into(),
+                last_modified: 1,
+                language: Some("python".into()),
+            },
+        )
+        .unwrap();
+        let external_file = upsert_file(
+            conn,
+            &FileRecord {
+                path: "<external>".into(),
+                blake3_hash: "external".into(),
+                last_modified: 0,
+                language: None,
+            },
+        )
+        .unwrap();
+        let node = |file_id, name: &str, qualified_name: Option<&str>, line| NodeRecord {
+            file_id,
+            node_type: "function".into(),
+            name: name.into(),
+            qualified_name: qualified_name.map(str::to_string),
+            start_line: line,
+            end_line: line,
+            code_content: String::new(),
+            signature: None,
+            doc_comment: None,
+            context_string: None,
+            name_tokens: None,
+            return_type: None,
+            param_types: None,
+            is_test: false,
+        };
+
+        let exact = insert_node(conn, &node(internal_file, "run", Some("Service.run"), 1)).unwrap();
+        insert_node(conn, &node(internal_file, "Service.run", None, 2)).unwrap();
+        insert_node(conn, &node(external_file, "run", Some("Service.run"), 0)).unwrap();
+
+        let rows = get_nodes_with_files_by_symbol(conn, "Service.run").unwrap();
+        assert_eq!(rows.len(), 1, "qualified lookup must not union bare rows");
+        assert_eq!(rows[0].node.id, exact);
+        assert_eq!(
+            get_node_ids_by_qualified_name(conn, "Service.run").unwrap(),
+            vec![(exact, "pkg/service.py".to_string())],
+            "qualified ID lookup must exclude <external> sentinels"
+        );
     }
 
     #[test]

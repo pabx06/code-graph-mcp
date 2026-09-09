@@ -155,18 +155,20 @@ pub(crate) fn extract_callee(
     }
 }
 
-/// Python calls use `attribute` nodes for dotted references. Preserve paths
-/// that can be resolved statically (`Alpha.helper()`, `myutils.helper()`) and
-/// attach direct `self` / `cls` calls to the enclosing class. Runtime instance
-/// receivers such as `alpha.helper()` are represented as a path too: if no
-/// matching class/module path exists, the resolver drops the edge instead of
-/// attaching it to every same-named method in the project.
+/// Extract the bare target and written receiver path from a Python call.
+///
+/// Direct `self` and `cls` calls carry the enclosing class. Other attribute
+/// chains remain syntactic paths here; the indexer later decides whether the
+/// leading segment is an import binding, an exact class, or a runtime receiver.
+/// Keeping that decision out of the parser prevents filenames from being
+/// mistaken for imports.
 pub(crate) fn extract_python_callee(
     node: &tree_sitter::Node,
     source: &str,
     current_class: Option<&str>,
 ) -> Option<(String, CalleeQualifier)> {
-    let function = node.child_by_field_name("function")
+    let function = node
+        .child_by_field_name("function")
         .or_else(|| node.named_child(0))?;
 
     if function.kind() != "attribute" {
@@ -198,6 +200,9 @@ pub(crate) fn extract_python_callee(
     Some((name, CalleeQualifier::Chain))
 }
 
+/// Flatten an identifier/attribute-only Python receiver into dotted segments.
+/// Calls and subscripts return `None` because their runtime value is not a
+/// statically named path.
 fn collect_python_attribute_segments(
     node: &tree_sitter::Node,
     source: &str,

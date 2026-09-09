@@ -63,14 +63,15 @@ impl McpServer {
             self.ensure_file_fresh_opt(file_path)?;
         }
 
-        let qualified_matches = if let Some(symbol_name) = symbol_name_arg.filter(|s| s.contains('.')) {
-            queries::get_node_ids_by_qualified_name(self.db.conn(), symbol_name)?
-                .into_iter()
-                .filter(|(_, fp)| file_path.is_none_or(|wanted| wanted == fp))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let qualified_matches =
+            if let Some(symbol_name) = symbol_name_arg.filter(|s| s.contains('.')) {
+                queries::get_node_ids_by_qualified_name(self.db.conn(), symbol_name)?
+                    .into_iter()
+                    .filter(|(_, fp)| file_path.is_none_or(|wanted| wanted == fp))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
 
         // Resolve symbol to node_id(s)
         let (target_ids, symbol_name): (Vec<i64>, String) = if let Some(nid) = node_id {
@@ -124,7 +125,10 @@ impl McpServer {
                             })
                     })
                     .collect();
-                return Ok(crate::resolve::ambiguity_response(symbol_name, &suggestions));
+                return Ok(crate::resolve::ambiguity_response(
+                    symbol_name,
+                    &suggestions,
+                ));
             }
             (
                 qualified_matches.iter().map(|(id, _)| *id).collect(),
@@ -136,7 +140,9 @@ impl McpServer {
             let nodes = queries::get_nodes_by_file_path(self.db.conn(), fp)?;
             let matching: Vec<i64> = nodes
                 .iter()
-                .filter(|n| n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name))
+                .filter(|n| {
+                    n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name)
+                })
                 .map(|n| n.id)
                 .collect();
             if matching.is_empty() {
@@ -158,7 +164,9 @@ impl McpServer {
             if matching.len() > 1 {
                 let cands: Vec<queries::NameCandidate> = nodes
                     .iter()
-                    .filter(|n| n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name))
+                    .filter(|n| {
+                        n.name == symbol_name || n.qualified_name.as_deref() == Some(symbol_name)
+                    })
                     .map(|n| queries::NameCandidate {
                         name: n.name.clone(),
                         file_path: fp.to_string(),

@@ -80,49 +80,34 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let is_qualified = raw_symbol.contains('.');
-    let (symbol, file_filter) = if is_qualified {
-        let qualified_matches = queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
-            .into_iter()
-            .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
-            .collect::<Vec<_>>();
-
-        if qualified_matches.len() > 1 {
-            let cands: Vec<queries::NameCandidate> = qualified_matches
-                .iter()
-                .filter_map(|(id, fp)| {
-                    queries::get_node_by_id(conn, *id).ok().flatten().map(|n| {
-                        queries::NameCandidate {
-                            name: n.name,
-                            file_path: fp.clone(),
-                            node_type: n.node_type,
-                            node_id: n.id,
-                            start_line: n.start_line,
-                        }
-                    })
-                })
-                .collect();
-            emit_exact_ambiguity(raw_symbol, &cands, json_mode);
+    let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+        Ok(selection) => selection,
+        Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
+            emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
         }
-
-        let target_file = explicit_file
-            .map(|s| s.to_string())
-            .or_else(|| qualified_matches.first().map(|(_, fp)| fp.clone()));
-        (raw_symbol, target_file)
-    } else {
-        let (base_symbol, resolved_file) =
-            resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-        (
-            base_symbol,
-            explicit_file.map(|s| s.to_string()).or(resolved_file),
-        )
+        Err(CliSymbolSelectionError::QualifiedNotFound) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "results": [],
+                        "error": format!("No call graph results for: {}", raw_symbol),
+                        "symbol": raw_symbol,
+                    })
+                );
+            }
+            eprintln!("[code-graph] No call graph results for: {}", raw_symbol);
+            std::process::exit(1);
+        }
     };
-    let file_filter = file_filter.as_deref();
+    let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
+    let symbol = selection.lookup_name.as_str();
+    let file_filter = selection.file_filter.as_deref();
 
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge call graphs.
     // Shared with MCP via crate::resolve so both surfaces agree (audit #6).
-    if file_filter.is_none() && !is_qualified {
+    if file_filter.is_none() && !is_exact_qualified {
         if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
@@ -148,7 +133,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let has_edges = result.nodes.iter().any(|n| n.depth > 0);
     let has_seed = result.nodes.iter().any(|n| n.depth == 0);
     let mut resolved_symbol: String = symbol.to_string();
-    if !(has_edges || (has_seed && file_filter.is_some())) {
+    if !(is_exact_qualified || has_edges || has_seed && file_filter.is_some()) {
         match resolve_fuzzy_name_cli(conn, symbol)? {
             CliFuzzyResolution::Unique(resolved) => {
                 if resolved != symbol {
@@ -189,6 +174,19 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     let files: Vec<String> = result.nodes.iter().map(|n| n.file_path.clone()).collect();
     let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
     if outcome.any_changed {
+        if is_exact_qualified {
+            match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+                Ok(refreshed) if refreshed.lookup == CliSymbolLookup::ExactQualified => {}
+                Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
+                    outcome.disclose();
+                    emit_exact_ambiguity(raw_symbol, &candidates, json_mode);
+                }
+                Ok(_) | Err(CliSymbolSelectionError::QualifiedNotFound) => {
+                    // Let the ordinary empty-result branch below render the
+                    // command's established not-found envelope and hint.
+                }
+            }
+        }
         result = run_query(symbol)?;
     }
     outcome.disclose();
@@ -215,7 +213,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         // refs. Gated on the symbol being genuinely ABSENT — a symbol that
         // exists with zero edges also reaches this branch, and hinting at
         // reindexing there would send the user chasing a non-problem.
-        let absent = if is_qualified {
+        let absent = if is_exact_qualified {
             queries::get_node_ids_by_qualified_name(conn, symbol)
                 .map(|nodes| nodes.is_empty())
                 .unwrap_or(false)

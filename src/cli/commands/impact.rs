@@ -74,47 +74,37 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
-    let is_qualified = raw_symbol.contains('.');
-    let (symbol, file_filter) = if is_qualified {
-        let qualified_matches = queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
-            .into_iter()
-            .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
-            .collect::<Vec<_>>();
-
-        if qualified_matches.len() > 1 {
-            let cands: Vec<queries::NameCandidate> = qualified_matches
-                .iter()
-                .filter_map(|(id, fp)| {
-                    queries::get_node_by_id(conn, *id).ok().flatten().map(|n| {
-                        queries::NameCandidate {
-                            name: n.name,
-                            file_path: fp.clone(),
-                            node_type: n.node_type,
-                            node_id: n.id,
-                            start_line: n.start_line,
-                        }
-                    })
-                })
-                .collect();
-            emit_exact_ambiguity(raw_symbol, &cands, json_mode);
+    let selection = match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+        Ok(selection) => selection,
+        Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
+            emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
         }
-
-        let target_file = explicit_file
-            .map(|s| s.to_string())
-            .or_else(|| qualified_matches.first().map(|(_, fp)| fp.clone()));
-        (raw_symbol, target_file)
-    } else {
-        let (base_symbol, resolved_file) =
-            resolve_qualified_symbol(conn, raw_symbol, explicit_file);
-        (
-            base_symbol,
-            explicit_file.map(|s| s.to_string()).or(resolved_file),
-        )
+        Err(CliSymbolSelectionError::QualifiedNotFound) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": "Symbol not found in file",
+                        "symbol": raw_symbol,
+                        "file": explicit_file.unwrap_or_default(),
+                    })
+                );
+            }
+            eprintln!(
+                "[code-graph] Symbol '{}' not found in file '{}'.",
+                raw_symbol,
+                explicit_file.unwrap_or_default()
+            );
+            std::process::exit(1);
+        }
     };
-    let file_filter = file_filter.as_deref();
+    let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
+    let symbol = selection.lookup_name.as_str();
+    let output_symbol = selection.bare_name.as_str();
+    let file_filter = selection.file_filter.as_deref();
 
     let fetch_nodes = |sym: &str| -> Result<Vec<queries::NodeResult>> {
-        if is_qualified {
+        if is_exact_qualified {
             let ids = queries::get_node_ids_by_qualified_name(conn, sym)?
                 .into_iter()
                 .filter(|(_, fp)| file_filter.is_none_or(|wanted| wanted == fp))
@@ -165,14 +155,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     if let Some(fp) = explicit_file {
         let in_file = queries::get_nodes_by_file_path(conn, fp)?;
         // `--file` NARROWS, so a qualifier the user typed must survive it.
-        // `resolve_qualified_symbol` returns early when `--file` is present and
-        // hands back the bare name, so this check used to accept any same-named
-        // node in the file: `impact Gamma.run --file two.ts` matched `Alpha.run`
-        // and answered `"risk":"LOW"` exit 0 for a class that does not exist —
-        // the same safety-endorsement-for-a-typo shape P1-9 fixed for paths,
-        // still reachable through the qualifier (audit 2026-08-16 Minor tail).
-        let qualified_input = raw_symbol.contains('.');
-        let present = if qualified_input {
+        // A qualifier supplied with `--file` is strict. Bare names retain the
+        // historical file-scoped lookup.
+        let present = if is_exact_qualified {
             in_file
                 .iter()
                 .any(|n| n.qualified_name.as_deref() == Some(raw_symbol))
@@ -233,7 +218,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     // Exact-name ambiguity guard: a bare name with ≥2 non-test definitions
     // (cross-file OR same-file overloads) would silently merge callers across
     // both, misreporting risk/blast radius. Shared with MCP via crate::resolve.
-    if file_filter.is_none() && !is_qualified {
+    if file_filter.is_none() && !is_exact_qualified {
         if let Some(cands) = crate::resolve::detect_ambiguity(conn, symbol)? {
             emit_exact_ambiguity(symbol, &cands, json_mode);
         }
@@ -261,6 +246,29 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         }
         let outcome = refresh_files_if_stale(&ctx.db, &ctx.project_root, &files);
         if outcome.any_changed {
+            if is_exact_qualified {
+                match select_cli_symbol(conn, raw_symbol, explicit_file)? {
+                    Ok(refreshed) if refreshed.lookup == CliSymbolLookup::ExactQualified => {}
+                    Err(CliSymbolSelectionError::Ambiguous(candidates)) => {
+                        outcome.disclose();
+                        emit_exact_ambiguity(raw_symbol, &candidates, json_mode);
+                    }
+                    Ok(_) | Err(CliSymbolSelectionError::QualifiedNotFound) => {
+                        outcome.disclose();
+                        if json_mode {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "error": "Symbol not found",
+                                    "symbol": raw_symbol,
+                                })
+                            );
+                        }
+                        eprintln!("[code-graph] Symbol not found: {}", raw_symbol);
+                        std::process::exit(1);
+                    }
+                }
+            }
             caller_set = crate::graph::routes::get_callers_with_route_info(
                 conn,
                 symbol,
@@ -338,7 +346,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 
     if json_mode {
         let mut result = serde_json::json!({
-            "symbol": symbol,
+            "symbol": output_symbol,
             "risk": risk,
             "direct_callers": direct_callers,
             "total_callers": prod_callers.len(),
@@ -383,7 +391,7 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         return Ok(());
     }
 
-    writeln!(stdout, "Impact: {} — Risk: {}", symbol, risk)?;
+    writeln!(stdout, "Impact: {} — Risk: {}", output_symbol, risk)?;
     if let Some(warning) = impact.type_warning {
         writeln!(stdout, "  (warning: {})", warning)?;
     }

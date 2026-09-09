@@ -534,7 +534,9 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
     // Undefined callees (print, os.path.join, …) drop at Phase-2 same-language
     // resolution, so this only adds edges to defined same-project functions.
     let scope = ctx.scope_or_module();
-    if let Some((callee, qualifier)) = helpers::extract_python_callee(&node, source, ctx.current_class) {
+    if let Some((callee, qualifier)) =
+        helpers::extract_python_callee(&node, source, ctx.current_class)
+    {
         // Receiver-type propagation (issue #32 cause 2): when the call is
         // `recv.method()` and `recv`'s type is fixed by a single local
         // `recv = ClassName(...)` constructor assignment, stamp

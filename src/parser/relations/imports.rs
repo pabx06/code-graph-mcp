@@ -680,7 +680,11 @@ pub(super) fn extract_python_import_names(
             if child.kind() == "dotted_name" || child.kind() == "identifier" {
                 let name = node_text(&child, source).to_string();
                 if !name.is_empty() {
-                    let metadata = python_import_metadata(&name, true, Some(&name), scope);
+                    // `import pkg.sub` binds only `pkg` in the local namespace.
+                    // An explicit alias (`import pkg.sub as ps`) is handled by
+                    // the branch below and remains the local binding verbatim.
+                    let local_name = name.split('.').next().unwrap_or(&name);
+                    let metadata = python_import_metadata(&name, true, Some(local_name), scope);
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: name,
@@ -868,9 +872,13 @@ fn python_import_metadata(
 ) -> String {
     let mut metadata = serde_json::json!({
         "python_module": module,
-        "is_module_import": is_module_import,
         "python_scope": scope.unwrap_or("<module>"),
     });
+    // Absence means "imported symbol". Emitting false made the parser's two
+    // row kinds look equivalent to consumers that distinguish by key presence.
+    if is_module_import {
+        metadata["is_module_import"] = serde_json::json!(true);
+    }
     if let Some(local_name) = local_name {
         metadata["python_local"] = serde_json::json!(local_name);
     }

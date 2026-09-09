@@ -1022,16 +1022,41 @@ fn test_extract_python_from_import() {
 
 #[test]
 fn test_extract_python_aliased_import_binding_metadata() {
-    let code = "def caller():\n    from pkg.cache import Cache as NewCache\n    return NewCache()\n";
+    let code =
+        "def caller():\n    from pkg.cache import Cache as NewCache\n    return NewCache()\n";
     let relations = extract_relations(code, "python").unwrap();
-    let import = relations.iter()
+    let import = relations
+        .iter()
         .find(|r| r.relation == REL_IMPORTS && r.target_name == "Cache")
         .expect("aliased Python import should be extracted");
-    let metadata: serde_json::Value = serde_json::from_str(import.metadata.as_deref().unwrap()).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(import.metadata.as_deref().unwrap()).unwrap();
     assert_eq!(metadata["python_module"], "pkg.cache");
     assert_eq!(metadata["python_local"], "NewCache");
     assert_eq!(metadata["python_scope"], "caller");
-    assert_eq!(metadata["is_module_import"], false);
+    assert!(metadata.get("is_module_import").is_none());
+}
+
+#[test]
+fn test_extract_python_plain_dotted_import_binds_first_component() {
+    let relations =
+        extract_relations("import pkg.sub\nimport pkg.other as explicit\n", "python").unwrap();
+    let plain = relations
+        .iter()
+        .find(|relation| relation.relation == REL_IMPORTS && relation.target_name == "pkg.sub")
+        .expect("plain dotted import should be extracted");
+    let plain_metadata: serde_json::Value =
+        serde_json::from_str(plain.metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(plain_metadata["python_local"], "pkg");
+    assert_eq!(plain_metadata["is_module_import"], true);
+
+    let aliased = relations
+        .iter()
+        .find(|relation| relation.relation == REL_IMPORTS && relation.target_name == "pkg.other")
+        .expect("aliased dotted import should be extracted");
+    let aliased_metadata: serde_json::Value =
+        serde_json::from_str(aliased.metadata.as_deref().unwrap()).unwrap();
+    assert_eq!(aliased_metadata["python_local"], "explicit");
 }
 
 // --- Task 4: Python class inheritance ---
@@ -1350,20 +1375,32 @@ fn test_extract_python_method_call() {
 fn test_extract_python_self_method_call_qualifier() {
     let code = "class Service:\n    def caller(self):\n        return self.helper()\n\n    def helper(self):\n        return 1\n";
     let relations = extract_relations(code, "python").unwrap();
-    let call = relations.iter()
-        .find(|r| r.relation == REL_CALLS && r.source_name == "Service.caller" && r.target_name == "helper")
+    let call = relations
+        .iter()
+        .find(|r| {
+            r.relation == REL_CALLS
+                && r.source_name == "Service.caller"
+                && r.target_name == "helper"
+        })
         .expect("Service.caller -> self.helper call should be extracted");
-    assert_eq!(call.metadata.as_deref(), Some(r#"{"q":"self","v":"Service"}"#));
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"self","v":"Service"}"#)
+    );
 }
 
 #[test]
 fn test_extract_python_dotted_call_qualifier() {
     let code = "def caller():\n    return services.users.load()\n";
     let relations = extract_relations(code, "python").unwrap();
-    let call = relations.iter()
+    let call = relations
+        .iter()
         .find(|r| r.relation == REL_CALLS && r.source_name == "caller" && r.target_name == "load")
         .expect("services.users.load call should be extracted");
-    assert_eq!(call.metadata.as_deref(), Some(r#"{"q":"path","v":"services::users"}"#));
+    assert_eq!(
+        call.metadata.as_deref(),
+        Some(r#"{"q":"path","v":"services::users"}"#)
+    );
 }
 
 #[test]
@@ -3619,7 +3656,8 @@ class Holder:
                 r.metadata.as_deref(),
                 Some(r#"{"q":"path","v":"w"}"#),
                 "ambiguous/unknown receiver carries path qualifier (source={}); got {:?}",
-                r.source_name, r.metadata
+                r.source_name,
+                r.metadata
             );
         }
     }

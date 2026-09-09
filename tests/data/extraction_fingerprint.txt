@@ -6,7 +6,7 @@
 # one that was actually in the tree when the digest was taken.
 
 extraction_fingerprint = b6c747e39909378e8f63a1d263cc44d49a36c6c878ab3749350c6bb5c1d4d020
-extraction_recorded_at_index_version = 71
+extraction_recorded_at_index_version = 72
 
 schema_fingerprint = fc1b9e59d19f8962094448c1c06aeb0b6867955b094f81eb241887133a43b36a
 schema_recorded_at_schema_version = 10

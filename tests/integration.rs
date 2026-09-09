@@ -4437,10 +4437,7 @@ def unknown_receiver(alpha):
     let result = parse_tool_result(&resp);
     assert_eq!(result["symbol"], "Alpha.helper");
     let refs = result["references"].as_array().unwrap();
-    let names: Vec<&str> = refs
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
+    let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"caller"),
         "Alpha.helper should include self caller, got: {:?}",
@@ -4456,10 +4453,13 @@ def unknown_receiver(alpha):
         "Alpha.helper must not include Beta caller beta_static_call, got: {:?}",
         names
     );
-    assert!(
-        !names.contains(&"unknown_receiver"),
-        "unknown receiver must not appear as a reference to Alpha.helper, got: {:?}",
-        names
+    let unknown = refs
+        .iter()
+        .find(|reference| reference["name"] == "unknown_receiver")
+        .expect("runtime receivers use normal bare-name reference resolution");
+    assert_eq!(
+        unknown["confidence"], "ambiguous",
+        "runtime receiver collisions must remain non-structural: {unknown}"
     );
 
     let graph = tool_call_json(
@@ -4474,10 +4474,7 @@ def unknown_receiver(alpha):
     let result = parse_tool_result(&resp);
     assert_eq!(result["function"], "Alpha.helper");
     let callers = result["callers"].as_array().unwrap();
-    let names: Vec<&str> = callers
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
+    let names: Vec<&str> = callers.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"caller"),
         "qualified call graph should include caller, got: {:?}",
@@ -4511,10 +4508,7 @@ def unknown_receiver(alpha):
     let result = parse_tool_result(&resp);
     assert_eq!(result["qualified_name"], "Alpha.helper");
     let callers = result["called_by"].as_array().unwrap();
-    let names: Vec<&str> = callers
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
+    let names: Vec<&str> = callers.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"caller"),
         "qualified AST lookup should include caller, got: {:?}",
@@ -4531,8 +4525,8 @@ def unknown_receiver(alpha):
         names
     );
     assert!(
-        !names.contains(&"unknown_receiver"),
-        "qualified AST lookup must not include unknown receiver, got: {:?}",
+        names.contains(&"unknown_receiver"),
+        "AST references should retain the ambiguous runtime-receiver edge, got: {:?}",
         names
     );
     assert_eq!(result["impact"]["direct_callers"], 2);
@@ -4582,10 +4576,7 @@ def invoke():
     let resp = server.handle_message(&refs).unwrap();
     let result = parse_tool_result(&resp);
     let refs = result["references"].as_array().unwrap();
-    let names: Vec<&str> = refs
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
+    let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"invoke"),
         "aliased module import call a.execute() should resolve to execute, got: {:?}",
@@ -4629,10 +4620,7 @@ def normal_caller():
     let resp = server.handle_message(&refs).unwrap();
     let result = parse_tool_result(&resp);
     let refs = result["references"].as_array().unwrap();
-    let names: Vec<&str> = refs
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
+    let names: Vec<&str> = refs.iter().filter_map(|r| r["name"].as_str()).collect();
     assert!(
         names.contains(&"normal_caller"),
         "unshadowed caller should resolve to execute, got: {:?}",

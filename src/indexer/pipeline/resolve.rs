@@ -19,6 +19,10 @@ use crate::storage::queries::{
     list_pending_unresolved_calls,
 };
 
+use super::python_modules::{
+    build_python_module_map, project_module_files, python_same_package_files,
+};
+
 /// Decoded form of `edges.metadata` for REL_CALLS rows. See
 /// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`
 /// §"Wire protocol" for the JSON shapes this parses.
@@ -32,7 +36,10 @@ pub(super) enum CalleeMeta {
     /// Resolves identically to `SelfType` — restrict candidates to that type's
     /// methods (issue #32 cause 2, Python).
     RecvType(String),
-    PythonImport(Vec<String>),
+    PythonImport {
+        module: String,
+        owner: Option<String>,
+    },
     Receiver(String),
     Chain,
 }
@@ -68,12 +75,18 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .as_str()
             .map(|t| CalleeMeta::RecvType(t.to_string())),
         "python_import" => {
-            let payload = v.get("v")?.as_str()?;
-            let segments: Vec<String> = payload.split('.').map(String::from).collect();
-            if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+            let module = v.get("module").or_else(|| v.get("v"))?.as_str()?;
+            if module.is_empty() || module.split('.').any(str::is_empty) {
                 None
             } else {
-                Some(CalleeMeta::PythonImport(segments))
+                Some(CalleeMeta::PythonImport {
+                    module: module.to_string(),
+                    owner: v
+                        .get("owner")
+                        .and_then(|owner| owner.as_str())
+                        .filter(|owner| !owner.is_empty())
+                        .map(str::to_string),
+                })
             }
         }
         "recv" => v
@@ -82,6 +95,201 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .map(|r| CalleeMeta::Receiver(r.to_string())),
         _ => None,
     }
+}
+
+#[derive(Debug)]
+struct PythonClassNode {
+    id: i64,
+    qualified_name: String,
+    file_path: String,
+}
+
+/// Load internal Python classes with exact-qualified precedence.
+///
+/// A nested `Outer.Worker` must not make a written top-level `Worker` ambiguous
+/// when an exact `qualified_name = 'Worker'` exists. Bare-name matching is only
+/// a compatibility fallback for rows without the requested qualified spelling.
+fn python_class_nodes(db: &Database, class_name: &str) -> Result<Vec<PythonClassNode>> {
+    let bare_name = class_name.rsplit('.').next().unwrap_or(class_name);
+    let load = |column: &str, value: &str| -> Result<Vec<PythonClassNode>> {
+        let sql = format!(
+            "SELECT n.id, COALESCE(n.qualified_name, n.name), f.path
+             FROM nodes n JOIN files f ON f.id = n.file_id
+             WHERE f.language = 'python' AND f.path <> '<external>'
+               AND n.type = 'class' AND n.{column} = ?1"
+        );
+        let mut stmt = db.conn().prepare(&sql)?;
+        let rows = stmt.query_map([value], |row| {
+            Ok(PythonClassNode {
+                id: row.get(0)?,
+                qualified_name: row.get(1)?,
+                file_path: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    };
+    let exact = load("qualified_name", class_name)?;
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+    load("name", bare_name)
+}
+
+/// Match `method_candidates` to one class and its nearest indexed ancestors.
+///
+/// Own methods win. Otherwise the walk follows outgoing Python `inherits`
+/// edges breadth-first, protects against cycles, and stops at the first depth
+/// that owns the method. A method is accepted only from the same file as its
+/// owning class node.
+fn python_methods_from_class(
+    db: &Database,
+    seed: &PythonClassNode,
+    method_name: &str,
+    method_candidates: &[i64],
+) -> Result<Vec<i64>> {
+    let candidate_paths = get_node_paths_by_ids(db.conn(), method_candidates)?;
+    let candidate_qnames = get_node_qualified_names_by_ids(db.conn(), method_candidates)?;
+    let methods_of = |class: &PythonClassNode| {
+        let wanted = format!("{}.{}", class.qualified_name, method_name);
+        method_candidates
+            .iter()
+            .copied()
+            .filter(|id| {
+                candidate_paths.get(id).map(String::as_str) == Some(class.file_path.as_str())
+                    && candidate_qnames.get(id).map(String::as_str) == Some(wanted.as_str())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let own = methods_of(seed);
+    if !own.is_empty() {
+        return Ok(own);
+    }
+
+    let mut visited = HashSet::from([seed.id]);
+    let mut frontier = vec![seed.id];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        let mut ancestors = Vec::new();
+        let mut stmt = db.conn().prepare_cached(
+            "SELECT n.id, COALESCE(n.qualified_name, n.name), f.path
+             FROM edges e
+             JOIN nodes n ON n.id = e.target_id
+             JOIN files f ON f.id = n.file_id
+             WHERE e.source_id = ?1 AND e.relation = 'inherits'
+               AND f.language = 'python' AND f.path <> '<external>'
+               AND n.type = 'class'",
+        )?;
+        for source_id in frontier {
+            let rows = stmt.query_map([source_id], |row| {
+                Ok(PythonClassNode {
+                    id: row.get(0)?,
+                    qualified_name: row.get(1)?,
+                    file_path: row.get(2)?,
+                })
+            })?;
+            for row in rows {
+                let ancestor = row?;
+                if visited.insert(ancestor.id) {
+                    next.push(ancestor.id);
+                    ancestors.push(ancestor);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        for ancestor in &ancestors {
+            found.extend(methods_of(ancestor));
+        }
+        found.sort_unstable();
+        found.dedup();
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        frontier = next;
+    }
+    Ok(Vec::new())
+}
+
+/// Resolve a Python typed receiver against its local class and inheritance tree.
+///
+/// The enclosing class in the caller's file is authoritative. If it is absent,
+/// only one class with that name in the same module-map package is accepted.
+/// An empty result tells the caller to use normal bare-name fallback.
+pub(super) fn python_typed_method_candidates(
+    class_name: &str,
+    method_name: &str,
+    method_candidates: &[i64],
+    caller_path: &str,
+    db: &Database,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Result<Vec<i64>> {
+    let classes = python_class_nodes(db, class_name)?;
+    let in_caller: Vec<&PythonClassNode> = classes
+        .iter()
+        .filter(|class| class.file_path == caller_path)
+        .collect();
+    let seed = if in_caller.len() == 1 {
+        in_caller[0]
+    } else if in_caller.is_empty() {
+        let package_files = python_same_package_files(caller_path, python_module_map);
+        let in_package: Vec<&PythonClassNode> = classes
+            .iter()
+            .filter(|class| package_files.contains(&class.file_path))
+            .collect();
+        if in_package.len() != 1 {
+            return Ok(Vec::new());
+        }
+        in_package[0]
+    } else {
+        return Ok(Vec::new());
+    };
+    python_methods_from_class(db, seed, method_name, method_candidates)
+}
+
+/// Resolve a call through an explicit Python import binding.
+///
+/// All targets must live in files named by the module map. When `owner` names
+/// an imported class, its own or nearest inherited method is selected using the
+/// same class walk as typed receivers. A module-level call has no owner and is
+/// constrained to a top-level symbol in the bound module file.
+pub(super) fn python_imported_call_candidates(
+    module: &str,
+    owner: Option<&str>,
+    method_name: &str,
+    candidates: &[i64],
+    db: &Database,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Result<Vec<i64>> {
+    let Some(module_files) = project_module_files(module, python_module_map) else {
+        return Ok(Vec::new());
+    };
+    let paths = get_node_paths_by_ids(db.conn(), candidates)?;
+    let qualified_names = get_node_qualified_names_by_ids(db.conn(), candidates)?;
+    let in_module: Vec<i64> = candidates
+        .iter()
+        .copied()
+        .filter(|id| {
+            paths
+                .get(id)
+                .is_some_and(|path| module_files.iter().any(|file| file == path))
+                && (owner.is_some() || {
+                    qualified_names.get(id).map(String::as_str) == Some(method_name)
+                })
+        })
+        .collect();
+    let Some(owner) = owner else {
+        return Ok(in_module);
+    };
+
+    let classes: Vec<PythonClassNode> = python_class_nodes(db, owner)?
+        .into_iter()
+        .filter(|class| module_files.iter().any(|file| file == &class.file_path))
+        .collect();
+    if classes.len() != 1 {
+        return Ok(Vec::new());
+    }
+    python_methods_from_class(db, &classes[0], method_name, candidates)
 }
 
 /// Disambiguate N same-language cross-file candidates for a single call/import
@@ -183,6 +391,52 @@ pub(super) fn refine_ambiguous_targets(
     }
 }
 
+/// Decide whether an unresolved cross-file call is standard-library noise.
+///
+/// Python builtin spellings are suppressed only when the complete candidate
+/// pool does not contain exactly one internal Python definition. This lets a
+/// project-defined `open`, `len`, or exception class win without turning a
+/// genuine builtin call into a graph edge. Other languages retain the existing
+/// static noise policy.
+pub(super) fn should_suppress_call_target(
+    name: &str,
+    language: &str,
+    same_language_candidate_count: usize,
+) -> bool {
+    if language == "python" && crate::domain::is_python_builtin_call_target(name) {
+        return same_language_candidate_count != 1;
+    }
+    crate::domain::is_cross_file_call_noise(name, language)
+}
+
+/// Mark a resolved call target set as ambiguous, including same-file edges.
+///
+/// The normal confidence pass examines cross-file edges because ordinary
+/// same-file name resolution is exact. Multiple equally near Python ancestors
+/// are the exception: they are structurally constrained but still ambiguous,
+/// and may all live in the caller's file.
+pub(super) fn mark_call_edges_ambiguous(
+    db: &Database,
+    source_ids: &[i64],
+    target_ids: &[i64],
+) -> Result<()> {
+    let mut stmt = db.conn().prepare_cached(
+        "UPDATE edges SET confidence = ?1
+         WHERE source_id = ?2 AND target_id = ?3 AND relation = ?4",
+    )?;
+    for source_id in source_ids {
+        for target_id in target_ids {
+            stmt.execute(rusqlite::params![
+                crate::domain::CONF_AMBIGUOUS,
+                source_id,
+                target_id,
+                REL_CALLS,
+            ])?;
+        }
+    }
+    Ok(())
+}
+
 /// Sweep `pending_unresolved_calls` against the current node state. Rows whose
 /// `(target_name, source_language)` now match a real node become a `calls`
 /// edge and the pending row is dropped; rows that still don't resolve stay
@@ -199,6 +453,21 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
     if pending.is_empty() {
         return Ok(0);
     }
+
+    // Rebuild the same module map the batch/deferred paths use. Pending rows
+    // survive across indexing invocations, so retaining a previous run's map
+    // would be stale precisely when a missing module file has just appeared.
+    let python_module_map = {
+        let mut paths = HashSet::new();
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT path FROM files WHERE language = 'python'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            paths.insert(row?);
+        }
+        build_python_module_map(&paths)
+    };
 
     // Build name → [(node_id, language)] map ONCE, then iterate pending rows
     // in memory. Narrowed by `n.name IN (SELECT DISTINCT target_name ...)` so
@@ -262,9 +531,10 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
             })
             .unwrap_or_default();
 
-        if candidates.is_empty() {
-            continue; // still unresolvable — leave buffered
-        }
+        let source_path = source_id_to_path
+            .get(&row.source_id)
+            .cloned()
+            .unwrap_or_default();
 
         // Apply the SAME callee-qualifier filtering Phase 2 does (index_files.rs
         // match on parse_callee_metadata) before binding. The sweep used to resolve
@@ -273,25 +543,112 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
         // bound to EVERY same-language `write`, wiring false callers that persisted
         // until rebuild-index (H1, silent incremental graph corruption).
         //
-        // Empty-filter behavior must match Phase 2 per qualifier shape, NOT a
-        // blanket bare-fallback:
-        //   - RecvType (Python locally-inferred receiver): ADDITIVE — an empty
-        //     filter is an inherited / mis-inferred method, so fall back to the
-        //     bare set (index_files.rs RecvType arm falls through to bare).
-        //   - SelfType / SelfRecv (Rust `Self::` / `self.`) and Path: STRUCTURAL —
-        //     an empty filter means no target matches the fixed qualifier and a
-        //     re-scan yields the same answer, so bind NOTHING and drain the row
-        //     (index_files.rs SelfRecv/SelfType/Path arms all drop on empty). A
-        //     bare fallback here would wire the very false same-name-sibling edges
-        //     the qualifier exists to exclude.
-        // Only bare (None), rtype (Python), and JS receiver can actually reach the
-        // buffer today; self/stype/path handling is latent parity should a future
-        // Phase-2 change route them here.
-        let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
+        // Empty-filter behavior must match Phase 2 per language and qualifier
+        // shape, not use one blanket fallback. Python's typed resolver walks
+        // indexed bases first and then uses a non-structural bare fallback for
+        // unresolved/external bases. Python runtime paths also use that bare
+        // fallback. Rust Self/path qualifiers remain structural and bind
+        // nothing when their fixed qualifier has no match. RecvType remains
+        // additive for other languages.
+        let parsed_metadata = parse_callee_metadata(row.metadata.as_deref());
+        let had_python_qualifier = row.source_language == "python" && parsed_metadata.is_some();
+        let mut stored_metadata = row.metadata.as_deref();
+        let mut preserve_all = false;
+        let resolved: Vec<i64> = match parsed_metadata {
+            Some(CalleeMeta::PythonImport { module, owner }) if row.source_language == "python" => {
+                let targets = python_imported_call_candidates(
+                    &module,
+                    owner.as_deref(),
+                    &row.target_name,
+                    &candidates,
+                    db,
+                    &python_module_map,
+                )?;
+                if targets.is_empty() {
+                    if python_module_map.contains_key(&module) {
+                        continue; // internal target may appear in a later run
+                    }
+                    to_delete.push(row.id); // external binding: final miss
+                    continue;
+                }
+                preserve_all = true;
+                if targets.len() > 1 {
+                    stored_metadata = None;
+                }
+                targets
+            }
+            Some(CalleeMeta::RecvType(t)) if row.source_language == "python" => {
+                let filtered = python_typed_method_candidates(
+                    &t,
+                    &row.target_name,
+                    &candidates,
+                    &source_path,
+                    db,
+                    &python_module_map,
+                )?;
+                if filtered.is_empty() {
+                    stored_metadata = None;
+                    candidates.clone()
+                } else {
+                    preserve_all = true;
+                    if filtered.len() > 1 {
+                        stored_metadata = None;
+                    }
+                    filtered
+                }
+            }
+            Some(CalleeMeta::SelfType(t)) | Some(CalleeMeta::SelfRecv(t))
+                if row.source_language == "python" =>
+            {
+                let filtered = python_typed_method_candidates(
+                    &t,
+                    &row.target_name,
+                    &candidates,
+                    &source_path,
+                    db,
+                    &python_module_map,
+                )?;
+                if filtered.is_empty() {
+                    stored_metadata = None;
+                    candidates.clone()
+                } else {
+                    preserve_all = true;
+                    if filtered.len() > 1 {
+                        stored_metadata = None;
+                    }
+                    filtered
+                }
+            }
+            Some(CalleeMeta::Path(segments)) if row.source_language == "python" => {
+                let filtered = python_typed_method_candidates(
+                    &segments.join("."),
+                    &row.target_name,
+                    &candidates,
+                    &source_path,
+                    db,
+                    &python_module_map,
+                )?;
+                if filtered.is_empty() {
+                    stored_metadata = None;
+                    candidates.clone()
+                } else {
+                    preserve_all = true;
+                    if filtered.len() > 1 {
+                        stored_metadata = None;
+                    }
+                    filtered
+                }
+            }
+            Some(CalleeMeta::Chain) | Some(CalleeMeta::Receiver(_))
+                if row.source_language == "python" =>
+            {
+                stored_metadata = None;
+                candidates.clone()
+            }
             Some(CalleeMeta::RecvType(t)) => {
                 let filtered = self_filter_candidates(&t, &candidates, db)?;
                 if filtered.is_empty() {
-                    candidates
+                    candidates.clone()
                 } else {
                     filtered
                 }
@@ -300,23 +657,53 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                 // Drop on empty (drain the row without binding), never bare-fall-back.
                 self_filter_candidates(&t, &candidates, db)?
             }
-            Some(CalleeMeta::Path(segments)) | Some(CalleeMeta::PythonImport(segments)) => {
+            Some(CalleeMeta::Path(segments)) => {
                 // Drop on empty (drain the row without binding), never bare-fall-back.
                 path_filter_candidates(&segments, &candidates, &node_id_to_path, db, crate_roots)?
             }
             // Bare / chain / JS receiver: Phase 2's default chain resolves these by
             // bare name too, so the existing behavior already matches.
-            _ => candidates,
+            _ => candidates.clone(),
         };
 
-        let refined = if resolved.len() > 1 {
-            let source_path = source_id_to_path
-                .get(&row.source_id)
-                .cloned()
-                .unwrap_or_default();
-            refine_ambiguous_targets(&resolved, &source_path, &node_id_to_path)
-        } else {
+        if resolved.is_empty() {
+            if row.source_language == "python"
+                && crate::domain::is_python_builtin_call_target(&row.target_name)
+            {
+                to_delete.push(row.id);
+            }
+            continue;
+        }
+
+        let same_file: Vec<i64> = resolved
+            .iter()
+            .copied()
+            .filter(|id| node_id_to_path.get(id).map(String::as_str) == Some(source_path.as_str()))
+            .collect();
+        let has_same_file = !same_file.is_empty();
+        let fallback_pool = if preserve_all || !has_same_file {
             resolved
+        } else {
+            same_file
+        };
+        if !preserve_all
+            && !has_same_file
+            && should_suppress_call_target(
+                &row.target_name,
+                &row.source_language,
+                fallback_pool.len(),
+            )
+        {
+            to_delete.push(row.id);
+            continue;
+        }
+
+        let refined = if preserve_all {
+            fallback_pool
+        } else if fallback_pool.len() > 1 {
+            refine_ambiguous_targets(&fallback_pool, &source_path, &node_id_to_path)
+        } else {
+            fallback_pool
         };
 
         for tgt_id in &refined {
@@ -325,10 +712,15 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                 row.source_id,
                 *tgt_id,
                 REL_CALLS,
-                row.metadata.as_deref(),
+                stored_metadata,
             )? {
                 edges_added += 1;
             }
+        }
+        if (preserve_all && refined.len() > 1)
+            || (had_python_qualifier && stored_metadata.is_none() && candidates.len() > 1)
+        {
+            mark_call_edges_ambiguous(db, &[row.source_id], &refined)?;
         }
         to_delete.push(row.id);
     }
@@ -1017,17 +1409,19 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                           WHERE i.fid = src.file_id
                             AND i.tid = tgt.id
                       )
-                      -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
-                      -- qualifier (self / stype / rtype / path). Those bind the call
-                      -- by a structural signal (the receiver's impl type, or the
-                      -- module path), not by a bare-name guess among same-name
-                      -- siblings — so a duplicate bare name must not relabel them
-                      -- `ambiguous` and hide them under the confidence floor (M1).
+                      -- ... and UNLESS the edge was resolved by a TYPE/PATH/import
+                      -- callee qualifier (self / stype / rtype / path / python_import).
+                      -- Those bind the call by a structural signal (the receiver's
+                      -- type, module path, or explicit Python binding), not by a
+                      -- bare-name guess among same-name siblings — so a duplicate
+                      -- bare name must not relabel them `ambiguous` and hide them
+                      -- under the confidence floor (M1).
                       -- `chain` / `recv` are NOT exempt: they resolve by method
                       -- uniqueness or fall back to bare, so a duplicate name there is
                       -- genuinely ambiguous. NULL metadata (bare) also stays eligible.
                       AND (json_extract(e.metadata, '$.q') IS NULL
-                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'path'))
+                           OR json_extract(e.metadata, '$.q') NOT IN
+                              ('self', 'stype', 'rtype', 'path', 'python_import'))
                  THEN ?3 ELSE ?4 END";
     const CONF_WHERE: &str = "
              WHERE e.relation IN (?1, ?2)
@@ -1276,10 +1670,6 @@ fn filter_by_segment_chain(
     } else {
         None
     };
-    let python_module_suffix = format!("/{}.py", path_chain);
-    let python_stub_suffix = format!("/{}.pyi", path_chain);
-    let python_package_suffix = format!("/{}/__init__.py", path_chain);
-
     let kept: Vec<i64> = candidates
         .iter()
         .copied()
@@ -1291,13 +1681,7 @@ fn filter_by_segment_chain(
                 || path.starts_with(&format!("{}/", path_chain))
                 || single_file_suffix
                     .as_deref()
-                    .is_some_and(|sfx| path.ends_with(sfx))
-                || path == format!("{}.py", path_chain)
-                || path == format!("{}.pyi", path_chain)
-                || path == format!("{}/__init__.py", path_chain)
-                || path.ends_with(&python_module_suffix)
-                || path.ends_with(&python_stub_suffix)
-                || path.ends_with(&python_package_suffix);
+                    .is_some_and(|sfx| path.ends_with(sfx));
 
             let qn_match = qn == qn_chain
                 || qn.starts_with(&format!("{}.", qn_chain))
@@ -1475,6 +1859,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_metadata_python_import_keeps_module_and_owner() {
+        let m = parse_callee_metadata(Some(
+            r#"{"q":"python_import","module":"pkg.api","owner":"Engine"}"#,
+        ))
+        .unwrap();
+        assert!(matches!(
+            m,
+            CalleeMeta::PythonImport { module, owner }
+                if module == "pkg.api" && owner.as_deref() == Some("Engine")
+        ));
+    }
+
+    #[test]
     fn parse_metadata_routes_or_python_imports_returns_none() {
         // Other relations also use metadata; resolver should skip non-call shapes.
         assert!(parse_callee_metadata(Some(r#"{"method":"GET","path":"/api"}"#)).is_none());
@@ -1533,6 +1930,28 @@ mod tests {
             )
             .unwrap()
         }
+        fn class(conn: &rusqlite::Connection, name: &str, file_id: i64) -> i64 {
+            insert_node(
+                conn,
+                &NodeRecord {
+                    file_id,
+                    node_type: "class".into(),
+                    name: name.into(),
+                    qualified_name: Some(name.into()),
+                    start_line: 1,
+                    end_line: 3,
+                    code_content: format!("class {name}: pass"),
+                    signature: None,
+                    doc_comment: None,
+                    context_string: None,
+                    name_tokens: None,
+                    return_type: None,
+                    param_types: None,
+                    is_test: false,
+                },
+            )
+            .unwrap()
+        }
         fn call_targets(conn: &rusqlite::Connection, src: i64) -> Vec<i64> {
             let mut stmt = conn.prepare(
                 "SELECT target_id FROM edges WHERE source_id=?1 AND relation=?2 ORDER BY target_id"
@@ -1560,6 +1979,8 @@ mod tests {
             let f_other = pyfile(conn, "other.py");
 
             let run = method(conn, "run", None, f_app);
+            class(conn, "DataWriter", f_writer);
+            class(conn, "Profile", f_other);
             let dw_write = method(conn, "write", Some("DataWriter.write"), f_writer);
             let pf_write = method(conn, "write", Some("Profile.write"), f_other);
 
@@ -1615,46 +2036,40 @@ mod tests {
             assert_eq!(call_targets(conn, run), vec![helper]);
         }
 
-        /// v49 audit fix: a Self/stype-qualified buffered call whose type filter
-        /// comes up empty must bind NOTHING and drain (mirroring Phase-2, which
-        /// drops SelfType/SelfRecv on empty), NOT fall back to the bare candidate
-        /// set. Before the fix the sweep bare-fell-back → it wired a false edge to
-        /// a same-name sibling on the wrong type. (This qualifier can't reach the
-        /// buffer in production today — latent parity — so the test buffers a
-        /// crafted row directly.)
+        /// Python self calls whose indexed class or ancestors do not own the
+        /// method use the same bare-name fallback as the deferred path. This is
+        /// required for a class whose base is external or otherwise unresolved.
         #[test]
-        fn pending_sweep_self_type_empty_filter_binds_nothing() {
+        fn pending_sweep_python_self_type_empty_filter_uses_bare_fallback() {
             let tmp = TempDir::new().unwrap();
             let db = Database::open(&tmp.path().join("p.db")).unwrap();
             let conn = db.conn();
             let f_app = pyfile(conn, "app.py");
             let f_other = pyfile(conn, "other.py");
             let run = method(conn, "run", None, f_app);
-            // Only `Profile.write` exists — no `DataWriter.write`.
-            let _pf_write = method(conn, "write", Some("Profile.write"), f_other);
+            // Only `Profile.persist_item` exists — no method owned by
+            // DataWriter or one of its indexed ancestors.
+            let profile_method =
+                method(conn, "persist_item", Some("Profile.persist_item"), f_other);
 
-            // Buffered `self.write()` whose impl type is DataWriter (stype). No
-            // DataWriter.write in the project → filter empty.
+            // Buffer a Python `self.persist_item()` whose enclosing type is
+            // DataWriter. The typed filter is empty, so bare fallback applies.
             insert_pending_unresolved_call(
                 conn,
                 run,
-                "write",
+                "persist_item",
                 "python",
                 Some(r#"{"q":"stype","v":"DataWriter"}"#),
             )
             .unwrap();
 
             let added = resolve_pending_calls(&db, &Default::default()).unwrap();
-            assert_eq!(added, 0,
-                "empty stype filter must bind NOTHING (no bare fallback to Profile.write); got {added}");
-            assert!(
-                call_targets(conn, run).is_empty(),
-                "no call edge may be created for an unmatched stype qualifier"
-            );
+            assert_eq!(added, 1, "empty Python stype filter must fall back");
+            assert_eq!(call_targets(conn, run), vec![profile_method]);
             assert_eq!(
                 list_pending_unresolved_calls(conn).unwrap().len(),
                 0,
-                "the row must be drained (dropped), never left buffered forever"
+                "the resolved pending row must be drained"
             );
         }
 
@@ -1752,10 +2167,11 @@ mod tests {
             );
         }
 
-        /// v49 audit fix: same parity for the Path qualifier — empty filter binds
-        /// nothing and drains, never bare-falls-back (Phase-2 drops Path on empty).
+        /// An unmatched Python path is a runtime receiver, not a Rust-style
+        /// structural path. It re-enters bare-name resolution with its qualifier
+        /// metadata removed.
         #[test]
-        fn pending_sweep_path_empty_filter_binds_nothing() {
+        fn pending_sweep_python_path_empty_filter_uses_bare_fallback() {
             let tmp = TempDir::new().unwrap();
             let db = Database::open(&tmp.path().join("p.db")).unwrap();
             let conn = db.conn();
@@ -1764,7 +2180,7 @@ mod tests {
             let run = method(conn, "run", None, f_app);
             // A same-name `helper` exists, but on a file/qualified-name that does
             // NOT match the `foo::bar` path segments → path filter empty.
-            let _helper = method(conn, "helper", Some("Unrelated.helper"), f_other);
+            let helper = method(conn, "helper", Some("Unrelated.helper"), f_other);
 
             insert_pending_unresolved_call(
                 conn,
@@ -1776,18 +2192,12 @@ mod tests {
             .unwrap();
 
             let added = resolve_pending_calls(&db, &Default::default()).unwrap();
-            assert_eq!(
-                added, 0,
-                "empty path filter must bind NOTHING (no bare fallback); got {added}"
-            );
-            assert!(
-                call_targets(conn, run).is_empty(),
-                "no call edge may be created for an unmatched path qualifier"
-            );
+            assert_eq!(added, 1, "unmatched Python path must use bare fallback");
+            assert_eq!(call_targets(conn, run), vec![helper]);
             assert_eq!(
                 list_pending_unresolved_calls(conn).unwrap().len(),
                 0,
-                "the row must be drained (dropped), never left buffered forever"
+                "the resolved pending row must be drained"
             );
         }
     }

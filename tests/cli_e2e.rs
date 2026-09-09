@@ -11484,10 +11484,13 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
         !names.contains(&"beta_static_call"),
         "qualified refs must exclude Beta caller, got: {names:?}"
     );
-    assert!(
-        !names.contains(&"unknown_receiver"),
-        "qualified refs must exclude unknown receiver, got: {names:?}"
-    );
+    let unknown = refs["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|reference| reference["name"] == "unknown_receiver")
+        .expect("runtime receiver should use normal bare-name resolution");
+    assert_eq!(unknown["confidence"], "ambiguous");
 
     let (stdout, _, code) = run_cli(
         &project,
@@ -11527,7 +11530,7 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
     let (stdout, _, code) = run_cli(&project, &["impact", "Alpha.helper", "--json"]);
     assert_eq!(code, 0);
     let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(impact["symbol"], "Alpha.helper");
+    assert_eq!(impact["symbol"], "helper");
     assert_eq!(impact["direct_callers"], 2);
 }
 #[test]
@@ -11577,18 +11580,32 @@ def beta_caller():
     assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
 
     let (_, stderr, code) = run_cli(&project, &["callgraph", "Alpha.helper"]);
-    assert_ne!(code, 0, "ambiguous qualified callgraph without --file must fail");
+    assert_ne!(
+        code, 0,
+        "ambiguous qualified callgraph without --file must fail"
+    );
     assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
 
     let (_, stderr, code) = run_cli(&project, &["impact", "Alpha.helper"]);
-    assert_ne!(code, 0, "ambiguous qualified impact without --file must fail");
+    assert_ne!(
+        code, 0,
+        "ambiguous qualified impact without --file must fail"
+    );
     assert!(stderr.contains("Ambiguous") || stderr.contains("ambiguous"));
 
     // 2. With --file two.py, Alpha.helper disambiguates to two.py:
     // It must NOT merge with one.py and must NOT traverse Beta.helper
     let (stdout, _, code) = run_cli(
         &project,
-        &["callgraph", "Alpha.helper", "--file", "two.py", "--direction", "callers", "--json"],
+        &[
+            "callgraph",
+            "Alpha.helper",
+            "--file",
+            "two.py",
+            "--direction",
+            "callers",
+            "--json",
+        ],
     );
     assert_eq!(code, 0);
     let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -11598,9 +11615,18 @@ def beta_caller():
         .iter()
         .filter_map(|r| r["name"].as_str())
         .collect();
-    assert!(names.contains(&"caller_two"), "should include caller_two: {names:?}");
-    assert!(!names.contains(&"caller_one"), "must exclude caller_one from other file: {names:?}");
-    assert!(!names.contains(&"beta_caller"), "must exclude beta_caller: {names:?}");
+    assert!(
+        names.contains(&"caller_two"),
+        "should include caller_two: {names:?}"
+    );
+    assert!(
+        !names.contains(&"caller_one"),
+        "must exclude caller_one from other file: {names:?}"
+    );
+    assert!(
+        !names.contains(&"beta_caller"),
+        "must exclude beta_caller: {names:?}"
+    );
 
     let (stdout, _, code) = run_cli(
         &project,
@@ -11608,27 +11634,52 @@ def beta_caller():
     );
     assert_eq!(code, 0);
     let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(impact["symbol"], "Alpha.helper");
+    assert_eq!(impact["symbol"], "helper");
     assert_eq!(impact["direct_callers"], 1); // only caller_two, not caller_one, not beta_caller
 
-    // 3. Qualified miss must NOT downgrade to bare name
-    // Even though `helper` exists (bare name), `Gamma.helper` does not exist:
+    // 3. Without --file, a qualified miss retains the historical bare fallback.
+    // `helper` is ambiguous here, so each command must report that ambiguity.
     let (stdout, _, code) = run_cli(&project, &["impact", "Gamma.helper", "--json"]);
     assert_ne!(code, 0, "non-existent qualified target in impact must fail");
     let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
-    assert_eq!(err["error"], "Symbol not found");
-    assert_eq!(err["symbol"], "Gamma.helper");
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Ambiguous symbol 'helper'"));
 
     let (stdout, _, code) = run_cli(&project, &["callgraph", "Gamma.helper", "--json"]);
-    assert_ne!(code, 0, "non-existent qualified target in callgraph must fail");
+    assert_ne!(
+        code, 0,
+        "non-existent qualified target in callgraph must fail"
+    );
     let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
-    assert_eq!(err["symbol"], "Gamma.helper");
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Ambiguous symbol 'helper'"));
 
     let (stdout, _, code) = run_cli(&project, &["refs", "Gamma.helper", "--json"]);
     assert_ne!(code, 0, "non-existent qualified target in refs must fail");
     let err: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
-    assert_eq!(err["error"], "Symbol not found");
-    assert_eq!(err["symbol"], "Gamma.helper");
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Ambiguous symbol 'helper'"));
+
+    // With --file, the qualifier is strict even though that file has a bare
+    // helper under other classes.
+    for command in ["refs", "callgraph", "impact"] {
+        let (stdout, _, code) = run_cli(
+            &project,
+            &[command, "Gamma.helper", "--file", "two.py", "--json"],
+        );
+        assert_ne!(
+            code, 0,
+            "{command} accepted a missing file-scoped qualifier"
+        );
+        let miss: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(miss["symbol"], "Gamma.helper");
+    }
 
     // 4. Stale file refresh for qualified target in impact re-queries node IDs
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -11646,13 +11697,61 @@ def caller_two():
 def caller_three():
     return Alpha.helper(2)
 "#,
-    ).unwrap();
+    )
+    .unwrap();
     let (stdout, _, code) = run_cli(
         &project,
         &["impact", "Alpha.helper", "--file", "two.py", "--json"],
     );
     assert_eq!(code, 0);
     let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(impact["symbol"], "Alpha.helper");
+    assert_eq!(impact["symbol"], "helper");
     assert_eq!(impact["direct_callers"], 2);
+}
+
+#[test]
+fn test_cli_missing_qualifier_falls_back_to_unique_bare_symbol() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("health.py"),
+        "def probe(): return True\ndef invoke(): return probe()\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["refs", "Missing.probe", "--relation", "calls", "--json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(refs["symbol"], "probe");
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Missing.probe",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        !stderr.contains("re-index"),
+        "bare fallback emitted a stale hint: {stderr}"
+    );
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(graph["results"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty()));
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "Missing.probe", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "probe");
 }
