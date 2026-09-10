@@ -1034,6 +1034,7 @@ fn test_extract_python_aliased_import_binding_metadata() {
     assert_eq!(metadata["python_module"], "pkg.cache");
     assert_eq!(metadata["python_local"], "NewCache");
     assert_eq!(metadata["python_scope"], "caller");
+    assert_eq!(metadata["python_explicit_alias"], true);
     assert!(metadata.get("is_module_import").is_none());
 }
 
@@ -1049,6 +1050,7 @@ fn test_extract_python_plain_dotted_import_binds_first_component() {
         serde_json::from_str(plain.metadata.as_deref().unwrap()).unwrap();
     assert_eq!(plain_metadata["python_local"], "pkg");
     assert_eq!(plain_metadata["is_module_import"], true);
+    assert!(plain_metadata.get("python_explicit_alias").is_none());
 
     let aliased = relations
         .iter()
@@ -1057,6 +1059,7 @@ fn test_extract_python_plain_dotted_import_binds_first_component() {
     let aliased_metadata: serde_json::Value =
         serde_json::from_str(aliased.metadata.as_deref().unwrap()).unwrap();
     assert_eq!(aliased_metadata["python_local"], "explicit");
+    assert_eq!(aliased_metadata["python_explicit_alias"], true);
 }
 
 // --- Task 4: Python class inheritance ---

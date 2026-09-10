@@ -717,8 +717,8 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                 edges_added += 1;
             }
         }
-        if (preserve_all && refined.len() > 1)
-            || (had_python_qualifier && stored_metadata.is_none() && candidates.len() > 1)
+        if refined.len() > 1
+            && (preserve_all || (had_python_qualifier && stored_metadata.is_none()))
         {
             mark_call_edges_ambiguous(db, &[row.source_id], &refined)?;
         }
@@ -1962,6 +1962,24 @@ mod tests {
                 .collect()
         }
 
+        fn call_targets_with_confidence(
+            conn: &rusqlite::Connection,
+            src: i64,
+        ) -> Vec<(i64, String)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT target_id, confidence FROM edges
+                     WHERE source_id=?1 AND relation=?2 ORDER BY target_id",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![src, REL_CALLS], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        }
+
         /// H1 regression: the pending-call sweep must apply the SAME callee-qualifier
         /// filtering Phase 2 does. A buffered Python `w.write()` whose receiver type
         /// was inferred as `DataWriter` (rtype qualifier) must bind ONLY to
@@ -2034,6 +2052,39 @@ mod tests {
             let added = resolve_pending_calls(&db, &Default::default()).unwrap();
             assert_eq!(added, 1, "bare unique call must still resolve");
             assert_eq!(call_targets(conn, run), vec![helper]);
+        }
+
+        /// A runtime-receiver qualifier is non-structural, but same-file
+        /// refinement can still leave one exact target. The discarded
+        /// cross-file candidates must not downgrade that single edge to
+        /// ambiguous, because default callgraph and impact queries would hide it.
+        #[test]
+        fn pending_runtime_receiver_refined_to_one_target_stays_precise() {
+            let tmp = TempDir::new().unwrap();
+            let db = Database::open(&tmp.path().join("p.db")).unwrap();
+            let conn = db.conn();
+            let f_app = pyfile(conn, "app.py");
+            let f_other = pyfile(conn, "other.py");
+            let run = method(conn, "run", None, f_app);
+            let local_save = method(conn, "save", Some("Cache.save"), f_app);
+            let remote_save = method(conn, "save", Some("Other.save"), f_other);
+
+            insert_pending_unresolved_call(
+                conn,
+                run,
+                "save",
+                "python",
+                Some(r#"{"q":"recv","v":"cache"}"#),
+            )
+            .unwrap();
+
+            assert_eq!(resolve_pending_calls(&db, &Default::default()).unwrap(), 1);
+            assert_eq!(
+                call_targets_with_confidence(conn, run),
+                vec![(local_save, "extracted".into())],
+                "one same-file target must remain precise"
+            );
+            assert!(!call_targets(conn, run).contains(&remote_save));
         }
 
         /// Python self calls whose indexed class or ancestors do not own the

@@ -52,7 +52,7 @@ use super::js_modules::{
 use super::python_modules::{
     build_python_import_bindings, build_python_module_map, collect_python_local_bindings,
     find_python_import_binding, project_module_files, python_bound_call_target,
-    resolve_python_module_targets,
+    python_import_is_shadowed, resolve_python_module_targets,
 };
 use super::resolve::{
     bind_calls_to_imported_targets, classify_edge_confidence, prune_import_contradicted_call_edges,
@@ -730,10 +730,11 @@ fn module_node_of(
 
 /// Remove Python's lexical binding details from persisted import edges.
 ///
-/// `python_scope` and `python_local` are extractor-time facts used to resolve
-/// calls in the importing file. They do not change the dependency represented
-/// by the graph edge. Storing them made equivalent imports with different
-/// aliases produce duplicate edges because edge uniqueness includes metadata.
+/// `python_scope`, `python_local`, and `python_explicit_alias` are extractor-time
+/// facts used to resolve calls in the importing file. They do not change the
+/// dependency represented by the graph edge. Storing them made equivalent
+/// imports with different aliases produce duplicate edges because edge
+/// uniqueness includes metadata.
 fn canonical_import_edge_metadata(metadata: Option<&str>) -> Option<String> {
     let raw = metadata?;
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -1436,10 +1437,13 @@ fn resolve_batch_relations(
                     // If the function scope shadows target_name (via parameter, assignment,
                     // or nested definition), it is a dynamic invocation of a local, not a call
                     // to any imported or global symbol.
-                    if let Some(locals) = python_local_bindings.get(&rel.source_name) {
-                        if locals.contains(&rel.target_name) {
-                            continue;
-                        }
+                    if python_import_is_shadowed(
+                        &python_import_bindings,
+                        &python_local_bindings,
+                        &rel.source_name,
+                        &rel.target_name,
+                    ) {
+                        continue;
                     }
                     if let Some(binding) = find_python_import_binding(
                         &python_import_bindings,
@@ -1502,6 +1506,19 @@ fn resolve_batch_relations(
                     // use filename suffixes.
                     if let Some(segments) = import_path {
                         if let Some(first) = segments.first() {
+                            // A local receiver (including an `except ... as name`
+                            // alias) invalidates the same-spelled module import.
+                            // Drop it here rather than letting the runtime path
+                            // fallback reconnect it to the imported function by
+                            // bare-name coincidence.
+                            if python_import_is_shadowed(
+                                &python_import_bindings,
+                                &python_local_bindings,
+                                &rel.source_name,
+                                first,
+                            ) {
+                                continue;
+                            }
                             if let Some(binding) = find_python_import_binding(
                                 &python_import_bindings,
                                 &python_local_bindings,

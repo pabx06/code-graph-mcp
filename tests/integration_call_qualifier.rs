@@ -1633,6 +1633,9 @@ def alias_call():
 def dotted_call():
     pkg.api.execute()
 
+def shortened_dotted_call():
+    pkg.execute()
+
 def bare_alias_call():
     imported_execute()
 
@@ -1665,6 +1668,10 @@ def nested_runtime(holder):
         );
         assert_eq!(rows[0].2, "pkg/api.py");
     }
+    assert!(
+        execute.iter().all(|edge| edge.0 != "shortened_dotted_call"),
+        "plain `import pkg.api` must not treat pkg.execute() as pkg.api.execute(): {execute:?}"
+    );
     for caller in ["runtime_call", "nested_runtime"] {
         let rows: Vec<_> = execute.iter().filter(|edge| edge.0 == caller).collect();
         assert!(
@@ -1696,11 +1703,22 @@ fn python_binding_patterns_shadow_imports_without_attribute_false_positives() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     write(root, "lib.py", "def run(): return 1\n");
+    write(root, "api.py", "def send(): return 1\n");
     write(
         root,
         "caller.py",
         r#"
+import api
 from lib import run
+
+def imported_module():
+    api.send()
+
+def except_alias():
+    try:
+        raise RuntimeError()
+    except RuntimeError as api:
+        api.send()
 
 def parameter(run):
     run()
@@ -1786,6 +1804,18 @@ def invoke():
             "{shadowed} incorrectly bound to imported run: {edges:?}"
         );
     }
+
+    let send_edges = python_call_edges(&db, "send");
+    assert!(
+        send_edges
+            .iter()
+            .any(|edge| edge.0 == "imported_module" && edge.2 == "api.py"),
+        "the unshadowed module import must resolve: {send_edges:?}"
+    );
+    assert!(
+        send_edges.iter().all(|edge| edge.0 != "except_alias"),
+        "an except-clause alias must shadow the module import: {send_edges:?}"
+    );
 }
 
 #[test]

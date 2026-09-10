@@ -684,7 +684,8 @@ pub(super) fn extract_python_import_names(
                     // An explicit alias (`import pkg.sub as ps`) is handled by
                     // the branch below and remains the local binding verbatim.
                     let local_name = name.split('.').next().unwrap_or(&name);
-                    let metadata = python_import_metadata(&name, true, Some(local_name), scope);
+                    let metadata =
+                        python_import_metadata(&name, true, Some(local_name), scope, false);
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: name,
@@ -703,7 +704,8 @@ pub(super) fn extract_python_import_names(
                             .or_else(|| child.named_child(1))
                             .map(|alias| node_text(&alias, source))
                             .unwrap_or(&name);
-                        let metadata = python_import_metadata(&name, true, Some(local_name), scope);
+                        let metadata =
+                            python_import_metadata(&name, true, Some(local_name), scope, true);
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
@@ -792,9 +794,9 @@ pub(super) fn extract_python_from_import_names(
                         // Subsequent dotted_names are imported symbols
                         let name = node_text(&child, source).to_string();
                         if !name.is_empty() {
-                            let metadata = module_path
-                                .as_ref()
-                                .map(|m| python_import_metadata(m, false, Some(&name), scope));
+                            let metadata = module_path.as_ref().map(|m| {
+                                python_import_metadata(m, false, Some(&name), scope, false)
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,
@@ -812,7 +814,7 @@ pub(super) fn extract_python_from_import_names(
                     if !name.is_empty() {
                         let metadata = module_path
                             .as_ref()
-                            .map(|m| python_import_metadata(m, false, Some(&name), scope));
+                            .map(|m| python_import_metadata(m, false, Some(&name), scope, false));
                         results.push(ParsedRelation {
                             source_name: "<module>".into(),
                             target_name: name,
@@ -832,9 +834,9 @@ pub(super) fn extract_python_from_import_names(
                                 .or_else(|| child.named_child(1))
                                 .map(|alias| node_text(&alias, source))
                                 .unwrap_or(&name);
-                            let metadata = module_path
-                                .as_ref()
-                                .map(|m| python_import_metadata(m, false, Some(local_name), scope));
+                            let metadata = module_path.as_ref().map(|m| {
+                                python_import_metadata(m, false, Some(local_name), scope, true)
+                            });
                             results.push(ParsedRelation {
                                 source_name: "<module>".into(),
                                 target_name: name,
@@ -849,7 +851,7 @@ pub(super) fn extract_python_from_import_names(
                     // from X import * — record as wildcard
                     let metadata = module_path
                         .as_ref()
-                        .map(|m| python_import_metadata(m, false, None, scope));
+                        .map(|m| python_import_metadata(m, false, None, scope, false));
                     results.push(ParsedRelation {
                         source_name: "<module>".into(),
                         target_name: "*".into(),
@@ -864,11 +866,18 @@ pub(super) fn extract_python_from_import_names(
     }
 }
 
+/// Build parser-time Python import metadata used for lexical call binding.
+///
+/// `python_explicit_alias` is intentionally emitted only for an `as` binding.
+/// The indexer removes it with the other lexical fields before persisting the
+/// import edge, but retaining it here distinguishes `import pkg.sub` from
+/// `import pkg.sub as pkg`, which bind the same local spelling differently.
 fn python_import_metadata(
     module: &str,
     is_module_import: bool,
     local_name: Option<&str>,
     scope: Option<&str>,
+    is_explicit_alias: bool,
 ) -> String {
     let mut metadata = serde_json::json!({
         "python_module": module,
@@ -881,6 +890,9 @@ fn python_import_metadata(
     }
     if let Some(local_name) = local_name {
         metadata["python_local"] = serde_json::json!(local_name);
+    }
+    if is_explicit_alias {
+        metadata["python_explicit_alias"] = serde_json::json!(true);
     }
     metadata.to_string()
 }

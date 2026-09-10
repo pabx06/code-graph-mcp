@@ -28,10 +28,16 @@ use crate::domain::REL_IMPORTS;
 use crate::parser::relations::ParsedRelation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// The semantic target and lexical spelling of one Python import binding.
+///
+/// `is_explicit_alias` distinguishes `import pkg.sub as alias`, where the
+/// alias replaces the full module path, from plain `import pkg.sub`, where a
+/// valid attribute reference must still spell the complete dotted path.
 pub(super) struct PythonImportBinding {
     pub module: String,
     pub imported_name: String,
     pub is_module_import: bool,
+    pub is_explicit_alias: bool,
 }
 
 pub(super) type PythonImportBindings = HashMap<(String, String), PythonImportBinding>;
@@ -41,8 +47,9 @@ fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
     &source[node.start_byte()..node.end_byte()]
 }
 
-/// Collect names bound in function scopes (parameters, local assignments, and
-/// nested definitions) to prevent module-level imports from binding to shadowed names.
+/// Collect names bound in function scopes (parameters, local assignments,
+/// exception aliases, and nested definitions) to prevent module-level imports
+/// from binding to shadowed names.
 pub(super) fn collect_python_local_bindings(
     tree: &tree_sitter::Tree,
     source: &str,
@@ -153,6 +160,11 @@ fn collect_py_body_bindings(
                 collect_binding_pattern(&alias, source, out);
             }
         }
+        "except_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                collect_binding_pattern(&alias, source, out);
+            }
+        }
         "named_expression" => {
             if let Some(name) = node.child_by_field_name("name") {
                 collect_binding_pattern(&name, source, out);
@@ -242,6 +254,10 @@ pub(super) fn build_python_import_bindings(relations: &[ParsedRelation]) -> Pyth
                     .get("is_module_import")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                is_explicit_alias: metadata
+                    .get("python_explicit_alias")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             },
         );
     }
@@ -257,14 +273,30 @@ pub(super) fn find_python_import_binding<'a>(
     if let Some(binding) = bindings.get(&(scope.to_string(), local_name.to_string())) {
         return Some(binding);
     }
-    if scope != "<module>" {
-        if let Some(locals) = local_bindings.get(scope) {
-            if locals.contains(local_name) {
-                return None;
-            }
-        }
+    if python_import_is_shadowed(bindings, local_bindings, scope, local_name) {
+        return None;
     }
     bindings.get(&("<module>".to_string(), local_name.to_string()))
+}
+
+/// Return whether a function-local binding blocks a module-level import.
+///
+/// A function-scoped import is itself authoritative and therefore wins over
+/// the conservative local-binding set. Otherwise any parameter, assignment,
+/// exception alias, or nested definition with this name shadows the module
+/// import throughout the function under Python's lexical scoping rules.
+pub(super) fn python_import_is_shadowed(
+    bindings: &PythonImportBindings,
+    local_bindings: &PythonLocalBindings,
+    scope: &str,
+    local_name: &str,
+) -> bool {
+    scope != "<module>"
+        && !bindings.contains_key(&(scope.to_string(), local_name.to_string()))
+        && bindings.contains_key(&("<module>".to_string(), local_name.to_string()))
+        && local_bindings
+            .get(scope)
+            .is_some_and(|locals| locals.contains(local_name))
 }
 
 /// Translate a written Python attribute receiver through an import binding.
@@ -272,8 +304,9 @@ pub(super) fn find_python_import_binding<'a>(
 /// The returned module is guaranteed to exist in `python_module_map`. The
 /// optional owner is the original imported class or nested attribute prefix
 /// that must precede the called method's bare name; no owner means a module-level
-/// call. An outer `None` means the binding is external and must not fall through
-/// to filename or bare-name guessing.
+/// call. An outer `None` means the binding is external or the written receiver
+/// does not name the bound target. Callers must not reinterpret that receiver
+/// through filename or bare-name guessing.
 pub(super) fn python_bound_call_target(
     binding: &PythonImportBinding,
     written_segments: &[String],
@@ -288,7 +321,11 @@ pub(super) fn python_bound_call_target(
             return None;
         }
         let module_segments: Vec<&str> = binding.module.split('.').collect();
-        let consumed = if written_segments.len() >= module_segments.len()
+        let consumed = if binding.is_explicit_alias {
+            // An explicit alias replaces the complete module path, including
+            // the valid but unusual `import pkg.sub as pkg` spelling.
+            1
+        } else if written_segments.len() >= module_segments.len()
             && written_segments
                 .iter()
                 .zip(&module_segments)
@@ -296,7 +333,9 @@ pub(super) fn python_bound_call_target(
         {
             module_segments.len()
         } else {
-            1 // an explicit alias replaces the module path's first segment
+            // Plain `import pkg.sub` binds `pkg`, but `pkg.helper()` does not
+            // name `pkg.sub.helper`; the complete dotted path must be written.
+            return None;
         };
         let owner = written_segments
             .get(consumed..)
@@ -543,8 +582,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn except_clause_alias_is_a_local_binding() {
+        let source = "def invoke():\n    try:\n        operation()\n    except RuntimeError as api:\n        api.send()\n";
+        let tree = crate::parser::treesitter::parse_tree(source, "python").unwrap();
+        let bindings = collect_python_local_bindings(&tree, source);
+
+        assert!(
+            bindings
+                .get("invoke")
+                .is_some_and(|names| names.contains("api")),
+            "{bindings:?}; {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
     fn map_of(paths: &[&str]) -> HashMap<String, Vec<String>> {
         build_python_module_map(&paths.iter().map(|p| p.to_string()).collect())
+    }
+
+    #[test]
+    fn plain_dotted_module_import_requires_its_full_path() {
+        let module_map = map_of(&["pkg/__init__.py", "pkg/sub.py"]);
+        let plain = PythonImportBinding {
+            module: "pkg.sub".into(),
+            imported_name: "pkg.sub".into(),
+            is_module_import: true,
+            is_explicit_alias: false,
+        };
+
+        assert_eq!(
+            python_bound_call_target(&plain, &["pkg".into(), "sub".into()], &module_map),
+            Some(("pkg.sub".into(), None))
+        );
+        assert_eq!(
+            python_bound_call_target(&plain, &["pkg".into()], &module_map),
+            None,
+            "`import pkg.sub` must not reinterpret pkg.helper() as pkg.sub.helper()"
+        );
+
+        let alias = PythonImportBinding {
+            is_explicit_alias: true,
+            ..plain
+        };
+        assert_eq!(
+            python_bound_call_target(&alias, &["alias".into()], &module_map),
+            Some(("pkg.sub".into(), None))
+        );
+        assert_eq!(
+            python_bound_call_target(&alias, &["pkg".into()], &module_map),
+            Some(("pkg.sub".into(), None)),
+            "an explicit alias remains authoritative even when it equals the root component"
+        );
     }
 
     #[test]

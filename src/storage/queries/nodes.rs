@@ -183,18 +183,21 @@ pub fn get_nodes_with_files_by_name(conn: &Connection, name: &str) -> Result<Vec
     Ok(results)
 }
 
-/// Match a symbol with exact-qualified precedence.
+/// Match a symbol, applying exact-qualified precedence only to qualified input.
 ///
-/// If any node has `qualified_name = symbol`, return only those rows. Otherwise
-/// return exact bare-name rows. This avoids combining a qualified definition
-/// with an unrelated node whose literal bare name happens to contain dots.
+/// For a dotted symbol, an exact `qualified_name` match wins; otherwise the
+/// literal bare name is queried. A bare symbol always returns every `name`
+/// match, even when a top-level node also has `qualified_name = symbol`, so that
+/// same-named methods remain visible to ambiguity detection.
 pub fn get_nodes_with_files_by_symbol(
     conn: &Connection,
     symbol: &str,
 ) -> Result<Vec<NodeWithFile>> {
-    let qualified = get_nodes_with_files_by_qualified_name(conn, symbol)?;
-    if !qualified.is_empty() {
-        return Ok(qualified);
+    if symbol.contains('.') {
+        let qualified = get_nodes_with_files_by_qualified_name(conn, symbol)?;
+        if !qualified.is_empty() {
+            return Ok(qualified);
+        }
     }
     get_nodes_with_files_by_name(conn, symbol)
 }
@@ -1082,11 +1085,24 @@ mod tests {
 
         let exact = insert_node(conn, &node(internal_file, "run", Some("Service.run"), 1)).unwrap();
         insert_node(conn, &node(internal_file, "Service.run", None, 2)).unwrap();
+        let top_level = insert_node(conn, &node(internal_file, "run", Some("run"), 3)).unwrap();
         insert_node(conn, &node(external_file, "run", Some("Service.run"), 0)).unwrap();
 
         let rows = get_nodes_with_files_by_symbol(conn, "Service.run").unwrap();
         assert_eq!(rows.len(), 1, "qualified lookup must not union bare rows");
         assert_eq!(rows[0].node.id, exact);
+        let mut bare_ids: Vec<i64> = get_nodes_with_files_by_symbol(conn, "run")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.node.id)
+            .collect();
+        bare_ids.sort_unstable();
+        let mut expected_bare = vec![exact, top_level];
+        expected_bare.sort_unstable();
+        assert_eq!(
+            bare_ids, expected_bare,
+            "a top-level qualified_name equal to the bare name must not hide methods"
+        );
         assert_eq!(
             get_node_ids_by_qualified_name(conn, "Service.run").unwrap(),
             vec![(exact, "pkg/service.py".to_string())],
