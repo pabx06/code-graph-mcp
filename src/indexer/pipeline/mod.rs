@@ -384,7 +384,12 @@ pub fn apply_file_refreshes(
     // read command touching a deleted file permanently orphaned its callers and
     // importers with no recovery channel, while the incremental path buffered
     // them into `pending_unresolved_calls` (audit 2026-08-29 PIPE-01).
+    resolve::snapshot_definition_counts(db.conn(), &dirty_seed)?;
     index_files(db, project_root, &files, &hashes, model, drop_rows, None)?;
+    // Before the marker restore below, not after: the fan-out round is another
+    // `index_files` call, and `index_files` clears that marker when it finishes.
+    // Restoring first would hand the clear something to destroy.
+    fan_out_to_new_duplicate_definitions(db, project_root, &hashes, model)?;
     if was_interrupted {
         crate::storage::queries::set_meta(
             db.conn(),
@@ -483,6 +488,24 @@ pub fn run_incremental_index_cached(
         HashSet::new()
     };
 
+    // D#24: taken BEFORE the run, because the question the fan-out round asks —
+    // "which names did this run add a definition for" — is a difference, and one
+    // side of it stops existing the moment `index_files` writes.
+    //
+    // Skipped entirely on an empty diff, which is not a micro-optimisation: the
+    // file watcher reaches here with nothing to do constantly, and the pair
+    // below costs six temp-table DDL statements and two indexes every time.
+    // Measured on django (3,456 files, 48k nodes), each arm against its own
+    // run's baseline because the absolute numbers drift between runs: running
+    // the pair unconditionally made a no-op incremental 45% slower than
+    // baseline (110 ms -> 159 ms median of 7); with this guard it is not slower
+    // than baseline (148 ms baseline, 104 ms median of 7). A run that indexes no
+    // file and deletes no file cannot have added a definition of anything.
+    let fanout_possible = !dirty_seed.is_empty();
+    if fanout_possible {
+        resolve::snapshot_definition_counts(db.conn(), &dirty_seed)?;
+    }
+
     let result = index_files(
         db,
         project_root,
@@ -492,6 +515,10 @@ pub fn run_incremental_index_cached(
         &deleted_files,
         progress,
     )?;
+
+    if fanout_possible {
+        fan_out_to_new_duplicate_definitions(db, project_root, &current_hashes, model)?;
+    }
 
     if !dirty_node_ids.is_empty() {
         // Heartbeat: context-string regeneration for dirty dependents runs after
@@ -514,6 +541,81 @@ pub fn run_incremental_index_cached(
     }
 
     Ok((result, new_cache))
+}
+
+/// D#24's second extraction round: re-extract the bare-name callers that a run
+/// just gave a new same-name definition to.
+///
+/// A bare call fans out to EVERY same-name candidate, so a rebuild of a tree
+/// where `c.py` defines a second `helper` carries both `b.py:caller ->
+/// a.py:helper` and `b.py:caller -> c.py:helper`. The incremental run that added
+/// `c.py` carried only the first: `b.py` did not change, so its relations were
+/// never re-emitted, and nothing else creates an edge. The post passes relabel
+/// edges that exist — they relabelled the surviving one `ambiguous`, correctly —
+/// but the one that should now exist has no author. `callgraph` and `impact`
+/// therefore under-reported that caller until its own file was next touched, and
+/// nothing prompted that.
+///
+/// **Re-extraction, not edge synthesis.** The alternative — a post pass that
+/// inserts the missing edge — would have to re-derive bare-call fan-out outside
+/// extraction AND reproduce `refine_ambiguous_targets`' proximity narrowing, or
+/// it mints edges a rebuild does not have. The Phase 0-pre block in
+/// `index_files` settled that argument after PIPE-02 cost a permanent,
+/// self-reinforcing divergence: re-extraction is the only mechanism that
+/// reproduces extraction's own shape, because it is the same code path a full
+/// rebuild runs.
+///
+/// **A second call, not a re-entrant `index_files`.** `index_files` holds
+/// invariants keyed on "the files in this run" — `run_file_paths` exists so a
+/// requeue whose source is in the run cannot dangle a node id that a later batch
+/// cascade-deletes. Growing one run's file set after Phase 0 would move that
+/// ground underneath every phase. Two calls each keep their own consistent set,
+/// so nothing inside `index_files` changes at all.
+///
+/// **Terminates in one extra round, by construction**: round two re-extracts
+/// files whose symbol sets it does not change, so no name's definition count can
+/// rise again. Pinned by `a_second_fanout_round_finds_nothing_to_do`.
+///
+/// **What it costs, measured on django** (3,456 files, 48k nodes, 262k edges).
+/// A new file defining `get_queryset` and `as_sql` — names django defines many
+/// times over — pulls **23** caller files, and the run goes 352 ms -> 2,993 ms.
+/// That is not overhead: re-indexing 23 ordinary django files on the UNPATCHED
+/// binary takes 2,690 ms, so the round costs what re-extracting those files
+/// costs and nothing beyond it. The ordinary interactive edit, which is what
+/// v0.143.0's scoped post passes bought, is unaffected: 1,232 ms -> 1,249 ms
+/// median of 7, inside the baseline's own 1,155-1,355 ms spread.
+///
+/// There is deliberately **no cap** on the caller set. A cap would restore, in a
+/// quieter form, exactly the silent divergence this closes — the graph would be
+/// right on small fan-outs and wrong on large ones with nothing to say so.
+///
+/// Caller contract: `resolve::snapshot_definition_counts` must have run over
+/// this run's paths BEFORE the `index_files` call this follows.
+fn fan_out_to_new_duplicate_definitions(
+    db: &Database,
+    project_root: &Path,
+    hashes: &HashMap<String, String>,
+    model: Option<&EmbeddingModel>,
+) -> Result<usize> {
+    let callers = resolve::bare_name_callers_of_new_duplicates(db.conn())?;
+    if callers.is_empty() {
+        return Ok(0);
+    }
+    tracing::info!(
+        "[index] fan-out round: re-extracting {} bare-name caller file(s) reached by a new \
+         same-name definition",
+        callers.len()
+    );
+    // Same reason round one captures it: re-indexing these files replaces their
+    // node ids, so the context strings of nodes in OTHER files that point at
+    // them go stale, and the rows are only still there to be found BEFORE
+    // `index_files` cascades them away (CORE-12).
+    let dirty = collect_dirty_node_ids(db, &callers)?;
+    index_files(db, project_root, &callers, hashes, model, &[], None)?;
+    if !dirty.is_empty() {
+        regenerate_context_strings(db, &dirty, model)?;
+    }
+    Ok(callers.len())
 }
 
 /// True when a previous index run was killed after committing file hashes but

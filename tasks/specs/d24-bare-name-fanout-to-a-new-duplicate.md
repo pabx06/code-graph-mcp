@@ -1,6 +1,6 @@
 ---
-status: draft
-revision: 1
+status: implemented
+revision: 3
 ---
 
 # D#24 — a new same-name definition never reaches an untouched bare caller
@@ -108,6 +108,132 @@ inverse (a definition disappearing, leaving one) is already handled by
 `deleting_the_duplicate_puts_the_untouched_edge_back` — confirm round two does
 not double-handle it.
 
+## Design (rev 2 — answers the open questions above)
+
+Reproduced again at `cfd4aa2`; the RED is verbatim the message recorded above.
+
+### Two `index_files` calls, not one re-entrant one
+
+`index_files` is **not modified**. The caller (`run_incremental_index_cached`,
+`apply_file_refreshes`) runs it, computes the trigger set from the committed
+result, and — only when that set is non-empty — calls it a second time with the
+affected caller files. Each call keeps its own consistent `run_file_paths`, so
+none of the invariants rev 1 flagged (`restore_inbound_edges`, the pending
+sweep, the deferred pass, Phase 0-pre) sees a set that changed underneath it.
+That was rev 1's whole review surface, and this shape removes it rather than
+managing it.
+
+### Discovery, corrected against the code
+
+Rev 1 proposed reading `scope_names_from_count_drift` (`resolve.rs:518`). Two
+facts make that unusable as written, both verified at `cfd4aa2`:
+
+1. **It only runs in the `Files` scope.** `snapshot_scope_name_counts` is inside
+   the `else` branch at `index_files.rs:2031`; a run of more than
+   `SCOPED_POST_PASS_MAX_FILES` (64) files takes `PostPassScope::Global` and
+   never builds the table. Global does not rescue the defect either — the post
+   passes relabel edges that exist, which is the same reason the bug exists at
+   all. So a drift signal that lives only in the scoped branch would fix small
+   runs and leave big ones diverging.
+2. **Its temps are dropped before the caller sees them** (`drop_scope_temps`,
+   `index_files.rs:2487`), and `cg_scope_names` is a symmetric difference — up
+   OR down — where this needs UP only.
+
+So the caller takes its own `(name, language) -> count` snapshot over the run's
+paths before calling `index_files` and recounts after, keeping the names whose
+count ROSE. Same technique, same reason rev 1 liked it (a count diff cannot miss
+a channel the way a hand-maintained list can), moved to where it is available
+regardless of scope. For a one-file interactive refresh both counts are a
+single-file group-by.
+
+### The caller set is the post pass's own verdict
+
+The bare-name callers needing re-extraction do not have to be re-derived, which
+is what rev 1 feared. Round 1's Phase 2e has already relabelled the surviving
+edge `ambiguous` — rev 1 records exactly that, as the thing that is "already
+correct". `CONF_CASE` (`resolve.rs:823`) assigns `ambiguous` only when the
+target name's count is >1 AND the caller's file does not import that exact
+target AND the edge was not bound by a type/path qualifier. That is precisely
+"resolved by a bare name among same-name siblings".
+
+Round 2's file set is therefore:
+
+> files NOT in round 1 that hold an outgoing `calls` edge whose target name is
+> in the count-rose set and whose confidence is `ambiguous`.
+
+Import-bound and type-qualified calls are excluded by construction — they must
+NOT fan out — rather than by a filter this spec would have to keep in sync with
+`CONF_CASE`. Indexes exist for the join (`idx_nodes_name`,
+`idx_edges_target_rel`).
+
+### Termination
+
+Exactly one extra round, never a loop. Round 2 re-extracts existing files whose
+symbol sets it does not change, so no name's definition count can rise again —
+to be asserted by a test, not assumed.
+
+### Outcome against the success criteria (rev 3)
+
+1. **The appendix test passes, `assert_eq!(inc, full)` included.** It is in the
+   tree as `a_new_same_name_definition_reaches_an_untouched_bare_caller`.
+2. **The siblings stayed green, and
+   `a_third_file_reclassifies_an_edge_between_two_files_it_never_touched` was
+   tightened to full-set equality**, with the comment explaining why it could not
+   be deleted rather than left to rot.
+3. **Full suite green**: 1,816 passed / 0 failed / 5 ignored on
+   `--no-default-features`; clippy `-D warnings` clean on both feature legs.
+4. **No interactive regression.** django, 3,456 files / 48k nodes / 262k edges,
+   each arm against its own run's baseline: ordinary one-file edit 1,232 ms ->
+   1,249 ms (median of 7, inside the baseline's own 1,155-1,355 ms spread);
+   no-op incremental not slower than baseline once the empty-diff guard was
+   added — without that guard it was 45% slower (110 -> 159 ms), because the
+   watcher reaches this path with an empty diff constantly and the count pair
+   costs six temp-table DDL statements.
+
+**What the fix costs when it fires**: a new file defining `get_queryset` and
+`as_sql` pulls 23 caller files and takes the run from 352 ms to 2,993 ms.
+Measured control: re-indexing 23 ordinary django files on the UNPATCHED binary
+takes 2,690 ms — so the round costs what re-extracting those files costs, with no
+overhead of its own. Left uncapped deliberately; a cap would reinstate the silent
+divergence in a quieter form.
+
+**Three things this turned up that rev 2 did not predict:**
+
+- `test_phase2c_restore_binds_only_original_target_file` **encoded the same
+  divergence as its contract**, in TypeScript, asserting `caller → other.ts == 0`
+  as "an edge a full rebuild never makes". Measured: a rebuild of that exact tree
+  makes it. The assertion was never checked against a control.
+- That test can no longer carry its own v31 #4 over-creation guard:
+  `idx_edges_unique` collapses the row a wrong restore would write into the row
+  the fan-out round writes correctly. The guard was re-homed to
+  `restore_does_not_fan_out_to_a_same_name_sibling`, which uses an import-bound
+  caller the round provably skips, and is mutation-verified — under a planted
+  v31 #4 the new test fails and the old one stays green.
+- The first over-firing guard was **vacuous**: it started from one definition, so
+  the caller's edge was `inferred` and the `ambiguous` filter refused the round
+  no matter what the counts said. Relaxing `a.cnt > COALESCE(b.cnt, 0)` to `>=`
+  left it passing. Rewritten to start from two definitions, where the count is
+  the only thing left holding the round back, and the mutation now kills it.
+
+### Risks this carries into review
+
+- **Interactive cost.** Criterion 4 (django one-file edit, 513 ms). The
+  discovery counts run every incremental run; round 2 must fire only on a real
+  new duplicate. Both need measuring, and the firing RATE needs measuring, not
+  assuming — the CORE-06 fallback was believed cheap and made the optimisation
+  inert.
+- **No silent cap.** Bounding round 2's file count would reintroduce exactly the
+  silent divergence this fixes. If a real corpus shows a pathological fan-out,
+  that is a decision to take with the user, not a threshold to bury.
+- **Node-id churn widens.** Round 2 re-extracts files the run never touched, so
+  their node ids change. Consistent with ARCHITECTURE §6 ("a node_id is only
+  valid in the index state it was resolved from"), but it enlarges the set that
+  churns per run, and `refresh_result_set`'s re-dispatch (SURF-32) lives on that
+  invariant.
+- **INDEX_VERSION.** Existing indexes carry the old divergence and nothing else
+  heals it, so a bump is probably owed — which costs every user a full re-index
+  on upgrade. Decide explicitly, with the released-artifact checklist.
+
 ## Verify
 
 ```
@@ -196,3 +322,14 @@ fn a_new_same_name_definition_reaches_an_untouched_bare_caller() {
 - rev 1 (2026-09-11): written after reproducing the defect at `cd6941e`. Test
   authored and run; design narrowed to re-extraction; discovery placement
   identified as the open question.
+- rev 3 (2026-09-11): implemented and measured. `INDEX_VERSION` 70 -> 71: the
+  guard's question ("does this change what gets extracted for source already
+  indexed") answers YES, and nothing but the version triggers the rebuild that
+  heals an existing index. Cost of that bump: every user takes one full re-index
+  on upgrade, which the release CHANGELOG owes a note about.
+- rev 2 (2026-09-11): RED re-reproduced at `cfd4aa2`. Discovery answered — the
+  caller owns the count snapshot, because `scope_names_from_count_drift` runs
+  only in the `Files` branch and its temps are dropped before the caller sees
+  them; the bare-name caller set is read off Phase 2e's own `ambiguous` verdict
+  rather than re-derived. `index_files` stays unmodified: two calls, not a
+  re-entrant one. Risks enumerated for AUTH.

@@ -1477,8 +1477,23 @@ fn test_phase2c_restore_binds_only_original_target_file() {
     // to the same-name node in the file the edge originally pointed into — not
     // every same-name node in the batch. caller.ts → target() resolves into
     // target.ts; an incremental then re-indexes target.ts AND other.ts in one
-    // batch and other.ts gains its own `target`. The restored edge must land on
-    // target.ts only (a fan-out to other.ts is an edge a full rebuild never makes).
+    // batch and other.ts gains its own `target`.
+    //
+    // The over-creation assertion USED to be `caller → other.ts == 0`, justified
+    // as "an edge a full rebuild never makes". That justification was never
+    // checked, and it is false: a rebuild of this exact final tree produces BOTH
+    // `caller → target.ts:target` and `caller → other.ts:target`, each
+    // `ambiguous` (measured 2026-09-11). A bare call fans out to every same-name
+    // candidate — the same rule D#24 is about — so the old assertion pinned that
+    // divergence as the contract, in TypeScript, where D#24's own tests pinned it
+    // in Python.
+    //
+    // So the guard is stated against a control rebuild instead of against a
+    // remembered number. That is strictly stronger for its actual subject: if
+    // the restore over-creates, the incremental carries an edge the rebuild does
+    // not, and the equality fails. What it gives up is attribution — the final
+    // graph can no longer say WHICH mechanism made the other.ts edge, because
+    // D#24's fan-out round now makes it legitimately.
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     fs::create_dir_all(project_dir.path().join("src")).unwrap();
@@ -1544,11 +1559,103 @@ fn test_phase2c_restore_binds_only_original_target_file() {
         1,
         "restore must rebind caller → target.ts:target to the new node id"
     );
-    // Over-creation guard: must NOT fan out to other.ts's same-name target.
+    // What this tree can still prove: the incremental agrees with a rebuild.
+    //
+    // It can NOT prove the v31 #4 over-creation guard any more, and saying so is
+    // the point. `idx_edges_unique` is on (source_id, target_id, relation,
+    // metadata), so a restore that wrongly bound caller → other.ts writes the
+    // very row D#24's fan-out round writes correctly, and the database dedupes
+    // them. No count and no set comparison over this tree can separate the two.
+    // The guard moved to `restore_does_not_fan_out_to_a_same_name_sibling`,
+    // which uses a tree the fan-out round provably never touches.
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
     assert_eq!(
-        count_caller_to("src/other.ts"),
-        0,
-        "restore must NOT bind caller → other.ts:target (cross-file fan-out a rebuild never makes)"
+        graph_projection_with_confidence(&db),
+        graph_projection_with_confidence(&control),
+        "an incrementally grown index must carry the same edges as a rebuild of the same tree"
+    );
+}
+
+#[test]
+fn restore_does_not_fan_out_to_a_same_name_sibling() {
+    // v31 #4, re-homed. The Phase-2c inbound-edge restore keys on
+    // `(target_file_id, name)` — the file the edge ORIGINALLY pointed into — so
+    // a batch that re-indexes the original target alongside a sibling gaining
+    // the same name must not hand the restored edge to both.
+    //
+    // The sibling test above used to carry this guard and can no longer: there,
+    // D#24's fan-out round writes the same row a wrong restore would, and
+    // `idx_edges_unique` collapses them. Here the call is IMPORT-BOUND, so
+    // `CONF_CASE` labels it `inferred` rather than `ambiguous`, and the fan-out
+    // round — which selects `ambiguous` callers only — provably never opens
+    // caller.ts. Anything that appears pointing at other.ts came from the
+    // restore.
+    //
+    // Measured control (2026-09-11): a rebuild of this final tree produces
+    // `caller.ts:caller --calls--> target.ts:target` at `inferred` and NO edge
+    // into other.ts, so the correct answer here is verified rather than
+    // remembered — which is exactly what the old form of this guard was missing.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(
+        project_dir.path().join("src/caller.ts"),
+        "import { target } from './target';\nfunction caller() { target(); }",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/target.ts"),
+        "export function target() {}",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/other.ts"),
+        "function unrelated() {}",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Re-index BOTH in one batch: target.ts keeps `target`, other.ts gains one.
+    fs::write(
+        project_dir.path().join("src/target.ts"),
+        "export function target() { return 1; }",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/other.ts"),
+        "function unrelated() {}\nexport function target() {}",
+    )
+    .unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let inc = graph_projection_with_confidence(&db);
+    assert!(
+        inc.iter().any(|(s, r, t, c)| s == "src/caller.ts:caller"
+            && r == REL_CALLS
+            && t == "src/target.ts:target"
+            && c == "inferred"),
+        "happy path: the import-bound edge is restored to the new target.ts node, still \
+         import-bound and so still `inferred` — if this is `ambiguous` the fan-out round \
+         would be in scope and the guard below would stop meaning anything: {inc:?}"
+    );
+    assert!(
+        !inc.iter().any(|(s, r, t, _)| s == "src/caller.ts:caller"
+            && r == REL_CALLS
+            && t == "src/other.ts:target"),
+        "restore bound the saved edge to a same-name node in a DIFFERENT file (v31 #4): {inc:?}"
+    );
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        inc,
+        graph_projection_with_confidence(&control),
+        "an incrementally grown index must carry the same edges as a rebuild of the same tree"
     );
 }
 
@@ -4852,30 +4959,20 @@ fn a_third_file_reclassifies_an_edge_between_two_files_it_never_touched() {
         Some("ambiguous"),
         "a second `helper` appeared, so the untouched b.py -> a.py edge must be reclassified: {inc:?}"
     );
-    // Compared on the edges the incremental index HOLDS, not on the whole set.
+    // Full-set equality, as of D#24.
     //
-    // A rebuild of this tree also carries `b.py:caller -> c.py:helper`: a bare
-    // call fans out to every same-name candidate, and the incremental run never
-    // re-resolves b.py because b.py did not change. That divergence is older
-    // than this scope and independent of it — forcing `PostPassScope::Global`
-    // reproduces it unchanged — so it is not this test's subject. Asserting the
-    // full set here would pin a known-wrong incremental shape as expected.
-    for row in &inc {
-        let (s, r, t, c) = row;
-        let same = full
-            .iter()
-            .find(|(fs_, fr, ft, _)| fs_ == s && fr == r && ft == t);
-        assert!(
-            same.is_some(),
-            "incremental produced an edge the rebuild does not have: {row:?}"
-        );
-        assert_eq!(
-            &same.unwrap().3,
-            c,
-            "same edge, different confidence than a rebuild: {row:?} vs {:?}",
-            same.unwrap()
-        );
-    }
+    // This used to compare only the edges the incremental index HOLDS, with a
+    // comment explaining that a rebuild also carries `b.py:caller ->
+    // c.py:helper` — a bare call fans out to every same-name candidate — and
+    // that the incremental run never re-resolved b.py because b.py did not
+    // change. That was a real divergence, older than this scope and independent
+    // of it, deliberately not pinned here so as not to encode a wrong shape as
+    // expected. `fan_out_to_new_duplicate_definitions` closed it, so the weaker
+    // comparison is no longer what this test can honestly make.
+    assert_eq!(
+        inc, full,
+        "an incrementally grown index must carry the same edges as a rebuild of the same tree"
+    );
 }
 
 #[test]
@@ -4923,6 +5020,205 @@ fn deleting_the_duplicate_puts_the_untouched_edge_back() {
     assert_eq!(
         inc, full,
         "an incrementally grown index must carry the same confidences as a rebuild of the same tree"
+    );
+}
+
+#[test]
+fn a_new_same_name_definition_reaches_an_untouched_bare_caller() {
+    // D#24, deferred 2026-09-08 while adding scope-completeness tests for
+    // CORE-06, now pinned. A bare call fans out to EVERY same-name candidate, so
+    // a rebuild of the final tree carries `b.py:caller -> a.py:helper` AND
+    // `b.py:caller -> c.py:helper`. The incremental run that introduced c.py
+    // carries only the first, because b.py did not change and its relations are
+    // therefore never re-emitted: the post-passes relabel confidence on edges
+    // that exist, they do not create the one that should now exist.
+    //
+    // Independent of `PostPassScope` — the deferred note records it reproducing
+    // unchanged with SCOPED_POST_PASS_MAX_FILES forced to 0 (always Global), so
+    // it is older than that scope. User-visible as `callgraph`/`impact`
+    // under-reporting a caller until the caller's own file is next touched.
+    //
+    // The sibling test above compares only the edges the incremental index
+    // HOLDS, deliberately, so as not to pin this wrong shape as expected. This
+    // one asserts the missing edge directly.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    let has_edge = |rows: &[(String, String, String, String)], target: &str| -> bool {
+        rows.iter()
+            .any(|(s, r, t, _)| s == "src/b.py:caller" && r == REL_CALLS && t == target)
+    };
+    let before = graph_projection_with_confidence(&db);
+    assert!(
+        has_edge(&before, "src/a.py:helper") && !has_edge(&before, "src/c.py:helper"),
+        "precondition: one `helper`, one edge: {before:?}"
+    );
+
+    // One run, one file: c.py appears with a second `helper`. a.py and b.py are
+    // byte-identical and are never opened by this run.
+    fs::write(src.join("c.py"), "def helper():\n    pass\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+
+    let inc = graph_projection_with_confidence(&db);
+    let full = graph_projection_with_confidence(&control);
+
+    // Control on the control: the rebuild really does fan out, so the assertion
+    // below is about the incremental path and not about what a bare call means.
+    assert!(
+        has_edge(&full, "src/a.py:helper") && has_edge(&full, "src/c.py:helper"),
+        "control: a rebuild fans the bare call out to both definitions: {full:?}"
+    );
+    assert!(
+        has_edge(&inc, "src/c.py:helper"),
+        "a file appearing with a duplicate name must reach the bare-name callers of that \
+         name; the incremental index under-reports the caller until b.py is next touched: {inc:?}"
+    );
+    assert_eq!(
+        inc, full,
+        "incremental edge set diverged from a rebuild of the same tree"
+    );
+}
+
+#[test]
+fn an_ordinary_edit_does_not_drag_callers_into_a_fanout_round() {
+    // The precision half of D#24, and the one its own success criteria put a
+    // number on: the fan-out round must fire on a NEW same-name definition, not
+    // on every edit that happens to touch a file defining a called name.
+    // Otherwise each keystroke-scale refresh re-extracts the callers too, which
+    // is the interactive budget v0.143.0 spent a release bounding.
+    //
+    // Observed through node ids, because "did not fire" has no other external
+    // signal — `IndexResult` reports round one only. Re-extraction replaces a
+    // file's nodes, so b.py keeping its ids IS the statement that nothing
+    // re-extracted b.py.
+    //
+    // The tree starts with TWO `helper`s deliberately, and that is what makes
+    // this a test of the count predicate. A first draft started with one, so
+    // b.py's edge was `inferred`, and the caller query's `ambiguous` filter
+    // refused it no matter what the counts said — relaxing
+    // `a.cnt > COALESCE(b.cnt, 0)` to `>=` left the test GREEN. With the edge
+    // already `ambiguous`, the confidence filter is satisfied before the count
+    // is consulted, so the count is the only thing left holding the round back.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+    fs::write(src.join("c.py"), "def helper():\n    pass\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert!(
+        graph_projection_with_confidence(&db)
+            .iter()
+            .any(|(s, r, _, c)| s == "src/b.py:caller" && r == REL_CALLS && c == "ambiguous"),
+        "precondition: two `helper`s, so the caller's edge is already `ambiguous` and the \
+         confidence filter cannot be what holds the fan-out round back"
+    );
+
+    let node_ids_of = |path: &str| -> Vec<i64> {
+        let mut v: Vec<i64> = db
+            .conn()
+            .prepare("SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1")
+            .unwrap()
+            .query_map([path], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let b_before = node_ids_of("src/b.py");
+    assert!(!b_before.is_empty(), "precondition: b.py has nodes");
+
+    // a.py changes CONTENT but still defines exactly one `helper`. The count
+    // does not rise, so no bare-name caller has anything new to learn.
+    fs::write(src.join("a.py"), "def helper():\n    return 1\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        node_ids_of("src/b.py"),
+        b_before,
+        "an edit that adds no same-name definition must not re-extract the caller"
+    );
+
+    // Contrast arm, so the assertion above cannot pass by the round being dead:
+    // a THIRD `helper` appears, and now b.py must be re-extracted.
+    fs::write(src.join("d.py"), "def helper():\n    pass\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_ne!(
+        node_ids_of("src/b.py"),
+        b_before,
+        "a new same-name definition must re-extract the bare-name caller — if this still \
+         matches, the arm above proves nothing"
+    );
+}
+
+#[test]
+fn a_second_fanout_round_finds_nothing_to_do() {
+    // Termination for D#24's fan-out round, asserted rather than assumed.
+    //
+    // `fan_out_to_new_duplicate_definitions` runs exactly once per
+    // `index_files` call, so nothing in the production path loops. What this
+    // pins is the reason that is SAFE: the round re-extracts files whose symbol
+    // sets it does not change, so no name's definition count can rise a second
+    // time and a hypothetical third round would have an empty trigger set. If
+    // that ever stopped holding, "runs once" would be hiding an unfinished
+    // repair rather than describing a fixed point.
+    //
+    // Driven through the public entry point twice: the second
+    // `run_incremental_index` sees a clean tree, so its own snapshot/recount
+    // pair must produce no callers. Asserted on the graph, because the count is
+    // internal — a run that did re-extract would have to change something to
+    // matter, and byte-identical output over a re-run that indexes nothing is
+    // the observable form of "fixed point".
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    fs::write(src.join("c.py"), "def helper():\n    pass\n").unwrap();
+    let first = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    let after_first = graph_projection_with_confidence(&db);
+    assert!(
+        after_first
+            .iter()
+            .any(|(s, r, t, _)| s == "src/b.py:caller" && r == REL_CALLS && t == "src/c.py:helper"),
+        "precondition: the fan-out round ran and created the edge: {after_first:?}"
+    );
+    assert!(
+        first.files_indexed > 0,
+        "precondition: the first run did index something"
+    );
+
+    // Nothing changed on disk. The diff is empty, so this run indexes no file —
+    // and the fan-out round must agree there is nothing left to fan out.
+    let second = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        second.files_indexed, 0,
+        "a re-run over an unchanged tree must index nothing — a non-zero count here is the \
+         fan-out round re-firing on its own output"
+    );
+    assert_eq!(
+        graph_projection_with_confidence(&db),
+        after_first,
+        "the fan-out round is not a fixed point: a second pass moved the graph"
     );
 }
 

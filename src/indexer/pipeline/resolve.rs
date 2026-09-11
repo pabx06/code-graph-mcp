@@ -576,6 +576,126 @@ pub(super) fn drop_scope_temps(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot `(name, language) -> definition count` for `paths`, before an
+/// `index_files` run mutates them. Pair with
+/// [`bare_name_callers_of_new_duplicates`] after.
+///
+/// Deliberately NOT [`snapshot_scope_name_counts`], which this otherwise
+/// mirrors. That one lives inside `index_files` and only on the
+/// `PostPassScope::Files` branch, so a run of more than
+/// `SCOPED_POST_PASS_MAX_FILES` files never takes it; its temps are also dropped
+/// before `index_files` returns, so a caller cannot read them. D#24 needs the
+/// signal on EVERY incremental run and needs it after the run commits, so the
+/// caller owns its own pair of counts. Keyed `(name, language)` for the same
+/// reason the sibling is: a name moving between languages leaves a name-only
+/// count unchanged on both sides.
+///
+/// Unlike the sibling, `<external>` is deliberately NOT in `paths`. There it
+/// widens a relabelling scope, which is the safe direction. Here it would widen
+/// a set of files to RE-EXTRACT, and a sentinel is never a fan-out target: it
+/// records a specifier that failed to resolve, so a bare call must not gain an
+/// edge to one. Sentinels are minted and reaped mid-run, so including them would
+/// buy nothing but extra rounds.
+pub(super) fn snapshot_definition_counts(
+    conn: &rusqlite::Connection,
+    paths: &[String],
+) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_fanout_paths;
+         DROP TABLE IF EXISTS temp.cg_fanout_before;
+         CREATE TEMP TABLE cg_fanout_paths (path TEXT PRIMARY KEY);",
+    )?;
+    {
+        let mut stmt = conn.prepare("INSERT OR IGNORE INTO cg_fanout_paths (path) VALUES (?1)")?;
+        for p in paths {
+            stmt.execute([p])?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE cg_fanout_before AS
+           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           FROM nodes n
+           JOIN files f ON f.id = n.file_id
+           JOIN cg_fanout_paths p ON p.path = f.path
+           GROUP BY n.name, f.language;
+         CREATE INDEX cg_fanout_before_k ON cg_fanout_before(nm, lang);",
+    )?;
+    Ok(())
+}
+
+/// The files a second extraction round must cover: D#24's answer to "who needs
+/// to learn that this name now has another definition".
+///
+/// Two halves, both read off state that already exists rather than re-derived:
+///
+/// * **Which names.** Those whose definition count inside this run's own paths
+///   ROSE — up only, unlike `scope_names_from_count_drift`'s symmetric
+///   difference. A name that LOST a definition needs no new edge; the surviving
+///   edges only need the relabel the post passes already do.
+/// * **Which callers.** Files outside the run holding a `calls` edge to that
+///   name that Phase 2e has just labelled `ambiguous`. `CONF_CASE` assigns that
+///   label exactly when the target name's count is >1 AND the caller's file does
+///   not import that exact target AND the edge carries no type/path qualifier —
+///   which is the definition of "resolved by a bare name among same-name
+///   siblings". Reusing that verdict means an import-bound or type-qualified
+///   call is excluded by construction, instead of by a second predicate here
+///   that would have to be kept in step with `CONF_CASE`.
+///
+/// Drops its own temps: unlike the scope tables, nothing downstream reads these.
+pub(super) fn bare_name_callers_of_new_duplicates(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<String>> {
+    use crate::domain::{CONF_AMBIGUOUS, REL_CALLS};
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_fanout_after;
+         CREATE TEMP TABLE cg_fanout_after AS
+           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           FROM nodes n
+           JOIN files f ON f.id = n.file_id
+           JOIN cg_fanout_paths p ON p.path = f.path
+           GROUP BY n.name, f.language;
+         CREATE INDEX cg_fanout_after_k ON cg_fanout_after(nm, lang);
+         DROP TABLE IF EXISTS temp.cg_fanout_up;
+         CREATE TEMP TABLE cg_fanout_up AS
+           SELECT DISTINCT a.nm AS nm
+           FROM cg_fanout_after a
+           LEFT JOIN cg_fanout_before b ON b.nm = a.nm AND b.lang IS a.lang
+           WHERE a.cnt > COALESCE(b.cnt, 0);
+         CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm);",
+    )?;
+
+    // `CROSS JOIN` in scope-first order for the same reason every post pass
+    // spells it that way (see `PostPassScope::is_global`): SQLite has no
+    // statistics for a temp table and will otherwise drive from
+    // `idx_edges_relation`, scanning every `calls` edge in the repo to use a
+    // handful of names as a bloom filter.
+    let sql = format!(
+        "SELECT DISTINCT f.path
+         FROM cg_fanout_up u
+         CROSS JOIN nodes tgt ON tgt.name = u.nm
+         CROSS JOIN edges e ON e.target_id = tgt.id
+                           AND e.relation = '{REL_CALLS}'
+                           AND e.confidence = '{CONF_AMBIGUOUS}'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let paths: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_fanout_paths;
+         DROP TABLE IF EXISTS temp.cg_fanout_before;
+         DROP TABLE IF EXISTS temp.cg_fanout_after;
+         DROP TABLE IF EXISTS temp.cg_fanout_up;",
+    )?;
+    Ok(paths)
+}
+
 pub(super) fn bind_calls_to_imported_targets(
     db: &Database,
     scope: &PostPassScope,
