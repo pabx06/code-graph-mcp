@@ -1,6 +1,5 @@
 {
-  "description": "code-graph-mcp hooks — only SessionStart is loaded by Claude Code from plugin-cache. All other event types are registered by lifecycle.js into ~/.claude/settings.json (v0.32.0+).",
-  "_note": "Empirical 2026-05-24: current Claude Code only loads SessionStart entries from plugin-cache hooks.json. PreToolUse / PostToolUse / UserPromptSubmit / Stop / SessionEnd entries here are SILENTLY IGNORED. lifecycle.js install/update writes those to ~/.claude/settings.json instead (pattern from claude-mem-lite). Re-adding non-SessionStart entries here would NOT make them fire — they would just be dead config. See feedback_pretooluse_dark_under_green_health.md for the jsonl evidence chain.",
+  "description": "code-graph-mcp hooks — only SessionStart is loaded by Claude Code from plugin-cache; PreToolUse / PostToolUse / UserPromptSubmit / Stop / SessionEnd entries here are SILENTLY IGNORED (empirical 2026-05-24). lifecycle.js install/update registers those into ~/.claude/settings.json instead (v0.32.0+), so re-adding them here would be dead config, not a second chance — pinned by the SessionStart-only guard in hooks.test.js. Keep this file to the keys Claude Code's schema allows (description, hooks, modules, surface); anything else is warned about at startup and dropped.",
   "hooks": {
     "SessionStart": [
       {

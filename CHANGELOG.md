@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.145.1
+
+**Upgrading:** update the plugin and the red line at session start goes away.
+Nothing else moves — no index rebuild, no behaviour change, no new switch, and
+nothing at all for users who install the binary rather than the plugin.
+`INDEX_VERSION` stays at 70.
+
+Claude Code 2.1.268 began validating each plugin's `hooks.json` against a closed
+key set, and warns for anything outside it. This plugin's file carried a `_note`
+key — a maintainer comment, because JSON has no comments — so every session
+opened with `code-graph-mcp: hooks.json: unknown key "_note" ignored` in the
+startup banner, and the same text prefixed `Plugin ` with the source appended in
+the debug log. The key is gone.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.145.0`, or `cargo install
+code-graph-mcp --version 0.145.0`; plugin users can set the version in the
+marketplace entry. Nothing migrates in either direction.
+
+### The warning was noise, and the hooks were never dark
+
+Worth saying plainly, because the wording invites the opposite reading:
+*ignored* in that message refers to the `_note` key, not to the hooks beside it.
+`hooks.SessionStart` loaded normally on 0.145.0 and `session-init.js` ran on
+every session it matched. Nothing that worked stopped working and nothing broken
+is now fixed — what changes is that the plugin stops announcing itself in red.
+
+### What the note said, and where it now lives
+
+It recorded the finding that current Claude Code loads *only* `SessionStart`
+from a plugin's cached `hooks.json`, silently ignoring `PreToolUse` /
+`PostToolUse` / `UserPromptSubmit` / `Stop` / `SessionEnd` there — which is why
+`lifecycle.js` registers those into `~/.claude/settings.json` instead. That is
+load-bearing for the next person to open the file, so it moved into the
+`description` string, which the schema does allow, rather than being deleted.
+
+### A guard, because the next stray key would be just as quiet
+
+`hooks.test.js` now fails on any key outside the set Claude Code accepts —
+`description`, `hooks`, `modules`, `surface` at the top level, `matcher` and
+`hooks` per event entry, both read out of 2.1.268's validator — and reports every
+offender in one message, the way that validator does, rather than stopping at the
+first. Each arm was proved to fail against a planted key before that key was
+removed, and each names the offending path.
+
+It also guards one level deeper than Claude Code does. The hook object itself
+(`type`, `command`, `timeout`) is parsed in strip mode: a typo'd `timeOut` there
+is discarded with **no warning at all** — quieter than the bug this release
+fixes, and it would leave the hook running on a default budget. Nothing outside
+this repo will ever report that, so the guard pins both the allowed key set and
+the presence of all three required fields.
+
+### Not covered
+
+- The allowlist is a snapshot of one Claude Code version. If a later release
+  adds a legal key, the guard fails the first time this repo uses it and the set
+  has to be widened by hand — chosen deliberately over a guard that accepts
+  whatever it is given.
+- Only this plugin's own `hooks.json` is checked. The `~/.claude/settings.json`
+  entries, where every non-SessionStart hook actually lives, are a different
+  schema validated by a different code path, and nothing here inspects them.
+- Older Claude Code versions never printed the warning, so on those this release
+  is a no-op.
+- This is the project's first patch release. It is a patch rather than a minor
+  because nothing the shipped artifact does changes — no flag, no output of our
+  own, no index format. The only difference is a line Claude Code stops printing
+  about us.
+
 ## 0.145.0
 
 **Upgrading:** nothing to do. Default behaviour is unchanged, no index needs

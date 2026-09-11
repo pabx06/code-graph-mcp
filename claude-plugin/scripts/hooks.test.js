@@ -88,6 +88,76 @@ test('hooks.json: contains SessionStart only (v0.32.0)', () => {
     'Adding entries here for PreToolUse/PostToolUse/UserPromptSubmit would be dead config — CC does not load them.');
 });
 
+// v0.145.1: Claude Code validates this file against a closed key set and warns
+// at startup for anything outside it — the banner reads `code-graph-mcp:
+// hooks.json: unknown key "_note" ignored` (the debug log prefixes `Plugin ` and
+// appends the source), on every session, in red. We had carried a `_note` key
+// here since v0.32.0 as a maintainer comment (JSON has none), and it became
+// user-visible noise the moment CC 2.1.268 added the check. The allowlists below
+// are read out of that binary's validator, which collects
+// `Object.keys(manifest).filter(k => !ALLOWED.has(k))` plus the same pass over
+// every event entry, and concatenates both into one message. The warning is
+// emitted AFTER the schema parse has already succeeded and its return value is
+// discarded at the call site, which is why the hooks themselves were never
+// affected — `_note` cost us a red line, not a dark hook.
+// Comments belong in this file (a .js), never in that one.
+const ALLOWED_MANIFEST_KEYS = new Set(['description', 'hooks', 'modules', 'surface']);
+const ALLOWED_ENTRY_KEYS = new Set(['matcher', 'hooks']);
+// One level deeper, Claude Code does NOT warn: the hook object is parsed in
+// strip mode, so a typo'd `timeOut` or `typ` is dropped in total silence —
+// quieter than the `_note` case above, and it would leave the hook on a default
+// budget or unable to run at all. CC gives us no signal there, so this file is
+// the signal. `command` and `timeout` are additionally value-pinned by the
+// HOOK_TIMEOUT_SECONDS test below; `type` is pinned only here.
+const ALLOWED_HOOK_KEYS = new Set(['type', 'command', 'timeout']);
+const REQUIRED_HOOK_KEYS = ['type', 'command', 'timeout'];
+
+test('hooks.json: no key outside the schema Claude Code accepts', () => {
+  const cfg = loadHooks();
+  // Collected into ONE list and reported once, the way Claude Code reports it:
+  // its validator concatenates the top-level and per-entry misses into a single
+  // message. Two asserts would stop at the first, hiding the rest behind a
+  // re-run (pre-ship review).
+  const unknown = Object.keys(cfg)
+    .filter((k) => !ALLOWED_MANIFEST_KEYS.has(k))
+    .map((k) => `"${k}" (top level)`);
+
+  for (const [event, entries] of Object.entries(cfg.hooks || {})) {
+    if (!Array.isArray(entries)) continue;
+    entries.forEach((e, i) => {
+      for (const k of Object.keys(e || {})) {
+        if (!ALLOWED_ENTRY_KEYS.has(k)) unknown.push(`"${k}" in hooks.${event}[${i}]`);
+      }
+      (e && e.hooks ? e.hooks : []).forEach((h, j) => {
+        for (const k of Object.keys(h || {})) {
+          if (!ALLOWED_HOOK_KEYS.has(k)) unknown.push(`"${k}" in hooks.${event}[${i}].hooks[${j}]`);
+        }
+      });
+    });
+  }
+
+  assert.deepEqual(unknown, [],
+    `hooks.json carries ${unknown.length} key(s) outside the schema: ${unknown.join(', ')}. ` +
+    'Claude Code drops the top-level and per-entry ones while warning about them at every ' +
+    'session start, and drops anything deeper WITHOUT warning. Put maintainer notes in the ' +
+    '`description` string or in this test file, never in a new key.');
+
+  // The other direction. An allowlist alone accepts a hook object that is
+  // missing `command` entirely — which is exactly what a rename leaves behind.
+  const incomplete = [];
+  for (const [event, entries] of Object.entries(cfg.hooks || {})) {
+    if (!Array.isArray(entries)) continue;
+    entries.forEach((e, i) => (e && e.hooks ? e.hooks : []).forEach((h, j) => {
+      for (const k of REQUIRED_HOOK_KEYS) {
+        if (!(k in (h || {}))) incomplete.push(`hooks.${event}[${i}].hooks[${j}].${k}`);
+      }
+    }));
+  }
+  assert.deepEqual(incomplete, [],
+    `these required hook fields are missing: ${incomplete.join(', ')} — Claude Code would ` +
+    'silently run the hook wrong rather than tell you');
+});
+
 test('hooks.json: SessionStart wires session-init.js', () => {
   const cfg = loadHooks();
   const entries = (cfg.hooks && cfg.hooks.SessionStart) || [];
