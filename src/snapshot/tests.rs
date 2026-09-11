@@ -510,27 +510,28 @@ fn inspect_bounds_the_decompressed_payload() {
         "expected the decompression cap to refuse this, got: {msg}"
     );
 
-    // Raw SQLite is the same artifact and needs the same ceiling; without the
-    // size check that arm would stage an arbitrarily large file uncapped.
+    // The raw-SQLite arm is deliberately NOT capped, and this assertion is the
+    // second version: the first required the cap here too, which refuses this
+    // repository's own 163 MB `.code-graph/index.db` and breaks
+    // `create --out x.db` -> `inspect`. SURF-25 is about decompression
+    // amplification; a raw `.db` has none, this arm is `fs::copy`, and
+    // `try_install` only ever consumes `.db.zst`, so there is no install-side
+    // ceiling for it to match. A file far over the cap must get PAST the
+    // ceiling and fail later on its content, if at all.
     let raw_path = dir.path().join("big.db");
     let mut raw = b"SQLite format 3\0".to_vec();
     raw.resize(5 * 1024, 0);
     std::fs::write(&raw_path, &raw).unwrap();
-    let err = crate::snapshot::inspect_with_cap(&raw_path, 4 * 1024).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("cap"),
-        "the raw-SQLite arm must honour the same ceiling, got: {msg}"
-    );
-
-    // Negative control: the same raw file under a cap that admits it gets past
-    // the ceiling and fails later, on its content — so the refusals above are
-    // the cap talking, not the fixture being unreadable.
-    let err = crate::snapshot::inspect_with_cap(&raw_path, 1024 * 1024).unwrap_err();
+    let err = crate::snapshot::inspect_with_cap(&raw_path, 1024).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         !msg.contains("cap"),
-        "under a generous cap the failure must not be the cap: {msg}"
+        "the raw arm must not be refused by the decompression ceiling — a raw file's size is \
+         what the caller already has on disk, and this arm never holds it in memory: {msg}"
+    );
+    assert!(
+        msg.contains("not a valid code-graph snapshot") || msg.contains("meta is missing"),
+        "the oversize raw file must reach the content check, not stop at a size gate: {msg}"
     );
 }
 

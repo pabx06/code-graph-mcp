@@ -155,15 +155,22 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // the identical artifact at 100 MB since it was written. `inspect` is a
     // scripted release-artifact check, so it is pointed at bytes nobody has
     // vouched for yet. Audit 2026-09-07 SURF-25.
+    // `read_exact`, not `read`: a single `read` is permitted to return fewer
+    // bytes than asked for, and a short read would leave the 16-byte SQLite
+    // header comparison falsely negative — a valid snapshot reported as garbage.
+    // Anything under 16 bytes cannot be either format, so it is refused below
+    // through the same message rather than given a partial-magic special case.
     let mut magic = [0u8; 16];
-    let magic_len = {
+    let magic: &[u8] = if file_size_bytes >= 16 {
         use std::io::Read;
         let mut f = std::fs::File::open(file)
             .with_context(|| format!("read snapshot file '{}'", file.display()))?;
-        f.read(&mut magic)
-            .with_context(|| format!("read snapshot file '{}'", file.display()))?
+        f.read_exact(&mut magic)
+            .with_context(|| format!("read snapshot file '{}'", file.display()))?;
+        &magic
+    } else {
+        &[]
     };
-    let magic = &magic[..magic_len];
 
     let tmp = tempfile::tempdir().context("inspect tempdir")?;
     let decompressed = tmp.path().join("snapshot.db");
@@ -172,11 +179,17 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     if magic.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         install::decompress_with_cap(file, &decompressed, cap).context("zstd decode")?;
     } else if magic.starts_with(b"SQLite format 3\0") {
-        // The raw arm needs the same ceiling: it is the same artifact, and
-        // staging it is what a later `Database::open` reads.
-        if file_size_bytes > cap {
-            anyhow::bail!("snapshot exceeds {cap} byte cap");
-        }
+        // Deliberately UNCAPPED, and the first version of this fix got it wrong:
+        // it applied `cap` here too, which refuses this repository's own
+        // `.code-graph/index.db` (163 MB) and so breaks `create --out x.db` ->
+        // `inspect` for any project whose index outgrew the ceiling.
+        //
+        // What SURF-25 is about is decompression AMPLIFICATION: a small file on
+        // disk expanding without bound in memory. A raw `.db` has none — its
+        // size is what the caller already has on disk — and this arm is
+        // `fs::copy`, which streams and never holds the file at all. There is
+        // also no install-side precedent to match: `try_install` only ever
+        // consumes `.db.zst` release assets, so `install` has no raw arm.
         std::fs::copy(file, &decompressed).context("stage snapshot for inspect")?;
     } else {
         anyhow::bail!(

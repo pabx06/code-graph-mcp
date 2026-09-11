@@ -18,12 +18,20 @@ const { acquireLock } = require('./install-lock');
 
 // ── Environment Checks ────────────────────────────────────
 
-// `which`/`where` walks every PATH entry, so one unresponsive network mount
-// blocks it indefinitely. Not a hook-budget path, but `downloadAndInstall` holds
+// `which`/`where` walks every PATH entry, so a slow network mount on PATH drags
+// the probe out with it. Not a hook-budget path, but `downloadAndInstall` holds
 // INSTALL_LOCK_FILE across its probes and that lock is only reclaimed after 10
 // minutes, so an unbounded probe parks installs and self-heal for every other
-// session too. 5s is far above any real PATH walk and far below the lock's
-// reclaim window (audit 2026-09-07 JS-21).
+// session too. 5s is far above any real PATH walk and far below that window
+// (audit 2026-09-07 JS-21).
+//
+// What this does NOT fix, stated because the first version of this comment
+// claimed it did: a mount that is HUNG rather than slow leaves the child in
+// uninterruptible sleep, where neither the timeout's signal nor anything else
+// in userspace reaches it. The bound covers slow; it cannot cover wedged.
+// `killSignal` is opted in per `proc-opts.js`'s rule — it is deliberately not a
+// `hidden()` default, and a hang-prone child is exactly the case it names — so
+// the probe does not additionally wait out SIGTERM's grace period.
 const PATH_PROBE_TIMEOUT_MS = 5000;
 
 /**
@@ -36,7 +44,7 @@ const PATH_PROBE_TIMEOUT_MS = 5000;
 function commandExists(cmd, { exec = execFileSync, timeoutMs = PATH_PROBE_TIMEOUT_MS } = {}) {
   try {
     const whichCmd = process.platform === 'win32' ? 'where' : 'which';
-    exec(whichCmd, [cmd], hidden({ stdio: 'ignore', timeout: timeoutMs }));
+    exec(whichCmd, [cmd], hidden({ stdio: 'ignore', timeout: timeoutMs, killSignal: 'SIGKILL' }));
     return true;
   } catch {
     return false;

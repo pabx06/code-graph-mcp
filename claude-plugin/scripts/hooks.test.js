@@ -362,8 +362,16 @@ test('a registered hook that spawns a child must spend the budget, not a literal
       .filter(([, l]) => !/^\s*(?:\/\/|\*|\/\*)/.test(l))
       .map(([n, l]) => [n, l.replace(/\/\/.*$/, '')]);
 
-  const SPAWNS = /(?:^|[^A-Za-z0-9_.])(?:spawnSync|execFileSync|execSync|spawn)\s*\(/;
-  const LITERAL_TIMEOUT = /\btimeout:\s*\d/;
+  // The prefix class excludes `_` and alphanumerics but ALLOWS `.`, so a dotted
+  // receiver still counts: the first version used `[^A-Za-z0-9_.]` and read
+  // `cp.spawnSync(…)` / `require('child_process').execFileSync(…)` as
+  // "delegates" — the single likeliest way to write a spawn in this codebase and
+  // the single likeliest way past the guard. The async pair is listed too.
+  const SPAWNS =
+    /(?:^|[^A-Za-z0-9_])(?:spawnSync|execFileSync|execSync|execFile|exec|spawn)\s*\(/;
+  // `"timeout": 8000` and `timeout : 8000` are the same defect with different
+  // whitespace and quoting; all three spellings are one regex.
+  const LITERAL_TIMEOUT = /["']?\btimeout["']?\s*:\s*\d/;
 
   let spawners = 0;
   for (const script of registered) {
@@ -383,13 +391,26 @@ test('a registered hook that spawns a child must spend the budget, not a literal
 
   // Anti-vacuity floor, absolute rather than derived from the set it guards: if
   // every registered hook stopped spawning directly, the loop above would assert
-  // nothing at all and stay green.
+  // nothing at all and stay green. Four is exactly today's count
+  // (incremental-index, pre-edit-guide, session-init, user-prompt-context), so
+  // this catches a total collapse of the detector, NOT four-of-eight going dark
+  // — raise it alongside any hook that starts spawning.
   assert.ok(
     spawners >= 4,
     `expected at least 4 registered hooks to start a child directly; saw ${spawners}. ` +
     `Either the corpus shrank or the spawn detector stopped matching — both make this guard vacuous`
   );
 });
+
+// Known residue, recorded rather than implied. This scan cannot see
+// `timeout: SOME_CONST` — the likeliest reaction to being told not to write a
+// literal — because deciding whether a named constant is budget-derived needs
+// the value, not the text. The per-hook tests are what cover that half
+// (`incremental-index.test.js` pins `timeout: budget` and `budget === null`
+// positively), and `codeOf` does not strip string CONTENTS, so a literal
+// `timeout: 30…` inside a string would false-positive. Neither shape exists in
+// the registered set today; both are cheap to diagnose because the failure
+// message quotes the offending line.
 
 test('hooks.json SessionStart timeout matches HOOK_TIMEOUT_SECONDS', () => {
   // SessionStart is the one event Claude Code loads from plugin-cache

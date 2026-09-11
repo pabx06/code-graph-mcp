@@ -157,9 +157,16 @@ pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>
     let mut total = 0usize;
     // `get_nodes_missing_context` returns one capped page. This used to take a
     // single page and return, while `spawn_startup_repair` calls this exactly
-    // once per process — so an index with more NULL context strings than the cap
-    // could never finish repairing, and the count logged below (always <= the
-    // cap) never revealed that it had been truncated. Audit 2026-09-07 CORE-17.
+    // once per process — so a server that stays up never finished repairing an
+    // index holding more NULLs than the cap, and the count logged below (always
+    // at or below the cap) never revealed it had been truncated.
+    //
+    // Stated precisely, because the first version of this comment overstated it:
+    // progress WAS monotonic across restarts — each process start repaired a
+    // fresh page — so 25,000 NULLs finished in three restarts, not never. What
+    // was impossible was finishing within one server lifetime, which for a
+    // long-lived MCP server is the lifetime that matters.
+    // Audit 2026-09-07 CORE-17.
     loop {
         let missing_ids = get_nodes_missing_context(db.conn())?;
         if missing_ids.is_empty() {
@@ -225,10 +232,19 @@ pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>
         tracing::info!("[repair] Repaired context strings for {} nodes", count);
         total += count;
 
-        // No progress on a non-empty page: every id in it was unrepairable — a
-        // node whose `files` row is gone is dropped by the INNER JOIN in
-        // `get_nodes_with_files_by_ids`, so the same page would come back
-        // forever. Stop instead of spinning.
+        // Termination backstop, defensive rather than load-bearing — and said
+        // that way on purpose, because the first version of this comment named a
+        // mechanism that cannot happen: it claimed an orphan node (one whose
+        // `files` row is gone) survives the page and is dropped later by the
+        // INNER JOIN in `get_nodes_with_files_by_ids`. It cannot.
+        // `get_nodes_missing_context` carries that same `JOIN files`, so such a
+        // node never enters a page at all.
+        //
+        // Termination really comes from the UPDATE: every id in a page has a
+        // files row, so each one gets a context string and the NULL set shrinks
+        // by `count` every pass. This break only guarantees that a page which
+        // somehow repaired nothing ends the loop rather than re-fetching itself
+        // forever. A comment that invents a reason is worse than no comment.
         if count == 0 {
             break;
         }
