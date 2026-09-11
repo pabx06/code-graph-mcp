@@ -1,12 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.146.0
 
 **Upgrading:** one new refusal, and three repairs to things that were failing
-without saying so. `snapshot inspect` now declines a snapshot larger than 100 MB
-decompressed — the ceiling `snapshot install` has applied to the same artifact
-since it was written. No other output, flag, or exit code changes, and
-`INDEX_VERSION` stays at 70, so no index rebuilds.
+without saying so. `snapshot inspect` now declines a **zstd-compressed** snapshot
+that expands past 100 MB, the ceiling `snapshot install` has always applied to
+the compressed release asset. Raw `.db` input is deliberately unaffected. No flag
+or exit code changes, `INDEX_VERSION` stays at 70 so no index rebuilds, and the
+one other visible difference is extra `[repair]` log lines described below.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.145.1`, or `cargo install
+code-graph-mcp --version 0.145.1`; plugin users can set the version in the
+marketplace entry. Nothing migrates in either direction.
 
 Four items from the 2026-09-07 audit queue. What they share is the reason they
 survived four rounds of review: each one fails silently. None of them logs an
@@ -19,21 +24,36 @@ suites were green across every round that carried them.
 holding the compressed and the fully decompressed payload at once with no bound
 (SURF-25). It is the scripted verification step for a published release artifact,
 so it is pointed at bytes nobody has vouched for yet — and the install path next
-door has capped the identical artifact at 100 MB since it was written. It now
-reads the magic only, streams through the same `decompress_with_cap` the
-installer uses, and applies the same ceiling to the raw-SQLite arm, which was
-equally unbounded. The cap is one constant shared by both callers rather than a
-second opinion about how big a snapshot may be.
+door has capped the compressed release asset at 100 MB since it was written. It
+now reads the magic only and streams the compressed arm through that same
+`decompress_with_cap`, one constant shared by both callers rather than a second
+opinion about how big a snapshot may be.
+
+The raw-SQLite arm is deliberately **not** capped, and the first version of this
+change had that wrong. SURF-25 is about decompression *amplification* — a small
+file on disk expanding without bound in memory — which a raw `.db` does not have;
+its size is what the caller already holds on disk, and that arm is now `fs::copy`,
+which streams and never materialises the file. There is also no install-side
+ceiling for it to match: `try_install` only ever consumes `.db.zst` release
+assets, so `install` has no raw arm at all. Capping it refused this repository's
+own 163 MB `.code-graph/index.db` and would have broken `snapshot create --out
+x.db` → `snapshot inspect` for any project whose index outgrew the ceiling.
 
 ### Startup context-string repair stopped after one page
 
 `get_nodes_missing_context` caps its result at 10,000 rows, and
 `repair_null_context_strings` took one page and returned — while the startup
-repair thread calls it exactly once per process (CORE-17). An index carrying more
-than 10,000 NULL context strings could therefore never finish repairing, on any
-number of restarts, and the log line reported a count that is always at or below
-the cap, so nothing indicated it had been truncated. It now drains, stopping on a
-page that repairs nothing so an unrepairable row cannot spin it.
+repair thread calls it exactly once per process (CORE-17). A server that stays up
+therefore never finished repairing an index holding more NULLs than the cap, and
+the log line reported a count that is always at or below the cap, so nothing
+indicated it had been truncated. It now drains.
+
+Precisely, because an earlier draft of this entry overstated it: progress *was*
+monotonic across restarts, since each process start repaired a fresh page — 25,000
+NULLs finished in three restarts, not never. What was impossible was finishing
+within one server lifetime, which for a long-lived MCP server is the lifetime that
+matters. One visible consequence: the `[repair] Found N` / `Repaired N` pair is
+now logged once per page rather than once per run.
 
 ### An unreadable `lastCheck` parked the updater permanently
 
@@ -51,20 +71,31 @@ line above it.
 `commandExists` shells out to `which`/`where`, which walks every PATH entry, and
 passed no timeout (JS-21). Not a hook-budget path — but `downloadAndInstall`
 holds `install.lock` across its probes and that lock is only reclaimed after ten
-minutes, so a single unresponsive network mount on PATH parked installs and
-self-heal for every other session too. Bounded at 5s, far above any real PATH
-walk. Every other child process in that file was already bounded; this was the
-one that was not.
+minutes, so a **slow** network mount on PATH parked installs and self-heal for
+every other session too. Bounded at 5s, far above any real PATH walk, with
+`killSignal: 'SIGKILL'` opted in per `proc-opts.js`'s rule for hang-prone
+children so the probe does not additionally wait out SIGTERM's grace. Every other
+child process in that file was already bounded; this was the one that was not.
 
 ### Not covered
 
+- **The bound covers slow, not wedged.** A mount that is hung rather than slow
+  leaves the child in uninterruptible sleep, where no signal reaches it and the
+  timeout cannot fire. An earlier draft of this entry claimed the hard-mount case
+  was closed; it is not.
 - The `snapshot inspect` ceiling is a refusal, not a streaming reader: a
-  legitimate snapshot above 100 MB is now declined by `inspect` exactly as it
-  already was by `install`. If that limit ever needs raising it has to move in
-  one place, which is the point.
+  compressed snapshot that expands past 100 MB is declined rather than read
+  incrementally. Raw `.db` input is uncapped by design (above).
 - The repair loop drains one page at a time and holds a page in memory, as
   before. It does not make the repair incremental across restarts; it makes a
-  single run finish.
+  single run finish — and it is now unbounded in wall time, so on a very large
+  backlog the startup-repair thread's later steps (orphan-vector reaping, vector
+  compaction, embedding-cache seeding) queue behind a full drain and re-embed.
+- `shouldCheck` treating an unreadable timestamp as "long ago" interacts with the
+  rate-limit path: `fetchLatestRelease`'s 403 branch sets `rateLimited` without
+  stamping `lastCheck`, so a corrupt `lastCheck` plus a 403 yields one GitHub call
+  per session start with no backoff. Pre-existing shape, newly reachable; the fix
+  belongs in the 403 branch, not here.
 - `shouldCheck` still trusts a *parseable* timestamp completely, including one
   from the future. A clock that jumps backwards still suppresses checks until it
   catches up.
