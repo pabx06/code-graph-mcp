@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.147.0
+
+**Upgrading: every index rebuilds itself once, on first use after the upgrade.**
+`INDEX_VERSION` goes 70 -> 71, which is the only trigger this project has for
+correcting an index that is already wrong — and indexes grown incrementally ARE
+wrong, in a specific way described below. Expect one full re-index per project:
+13-17 s across four runs on a 3,453-file corpus here, proportional to repo size, and it
+happens automatically on the next index run. Nothing migrates, no flag or exit
+code changes, and no data is lost.
+
+To pin back: `npm i -g @sdsrs/code-graph@0.146.0`, or `cargo install
+code-graph-mcp --version 0.146.0`; plugin users can set the version in the
+marketplace entry. Pinning back keeps the old index as-is — the missing edges
+below simply stay missing.
+
+### An incrementally grown index was missing edges a rebuild has
+
+A bare call fans out to EVERY same-name candidate. Add a file defining a second
+`helper`, and a rebuild carries both `b.py:caller -> a.py:helper` and
+`b.py:caller -> c.py:helper`. The incremental run that added the file carried
+only the first: `b.py` did not change, and a file's relations are re-emitted only
+when its own content does. The post passes cannot close it — they relabel edges
+that exist, and they did their half correctly, marking the surviving edge
+`ambiguous`, which is exactly what made the gap invisible.
+
+The visible effect: `callgraph`, `impact` and `refs` under-reported a caller
+until that caller's own file was next edited, and nothing prompted that. It
+applied to `calls` and to `references` alike — a type named in a signature fans
+out by the same rule — and it was independent of repository size, reproducing on
+both the scoped and the global post-pass paths.
+
+The fix re-extracts the affected callers rather than synthesising the missing
+edge. Extraction is the only thing that reproduces extraction's own shape,
+including the proximity narrowing that decides which same-name candidate wins;
+a post pass that inserted the edge itself would mint edges a rebuild does not
+have. It runs as a second indexing round, triggered only when a run actually
+raises the number of definitions of a name that some bare caller elsewhere
+resolves by name.
+
+**What it costs when it fires.** On django (3,453 files), a new file defining
+`get_queryset` and `as_sql` pulls 23 caller files and takes the run from 344 ms
+to 2,840 ms. That is the cost of re-extracting those files, not overhead on top:
+re-indexing exactly those 23 files without the round takes 2,685 ms. An ordinary
+edit — one file, no new duplicate name — is unaffected: 1,232 ms vs 1,249 ms,
+inside the run-to-run spread. There is deliberately no cap on the caller set; a
+cap would restore the same silent divergence in a quieter form.
+
+### `snapshot inspect` no longer copies a raw `.db` before reading it
+
+Pointed at a raw SQLite snapshot, `inspect` used to copy the whole file into a
+temp directory and open the copy. It now opens the file in place, read-only,
+which means it also cannot write to a file you only asked it to look at. Two
+consequences you may notice: a read-only snapshot file (mode 0444, e.g. after
+`chmod -w` on a downloaded artifact) now inspects successfully where it used to
+fail with "attempt to write a readonly database"; and inspecting a large raw
+snapshot no longer needs temp space the size of the file, which on systems where
+`TMPDIR` is a tmpfs was RAM.
+
+Files that cannot be read that way — a WAL-mode database, or one with a hot
+rollback journal beside it — still go through the copy, so the answer is
+unchanged for them.
+
+### Not covered
+
+The import-bound case is still open and predates this release: a Rust call bound
+by an explicit `use crate::a::widget` fans out on a rebuild but not on an
+incremental run. It is registered, not fixed here.
+
 ## 0.146.0
 
 **Upgrading:** one new refusal, and three repairs to things that were failing
