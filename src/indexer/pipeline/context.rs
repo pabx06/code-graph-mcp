@@ -232,19 +232,27 @@ pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>
         tracing::info!("[repair] Repaired context strings for {} nodes", count);
         total += count;
 
-        // Termination backstop, defensive rather than load-bearing — and said
-        // that way on purpose, because the first version of this comment named a
-        // mechanism that cannot happen: it claimed an orphan node (one whose
-        // `files` row is gone) survives the page and is dropped later by the
-        // INNER JOIN in `get_nodes_with_files_by_ids`. It cannot.
-        // `get_nodes_missing_context` carries that same `JOIN files`, so such a
-        // node never enters a page at all.
+        // Termination backstop for the one case the `is_empty` check at the top
+        // cannot see: a page that is non-empty but repairs nothing leaves the
+        // NULL set exactly as it was, and the next pass fetches the same ids
+        // forever.
         //
-        // Termination really comes from the UPDATE: every id in a page has a
-        // files row, so each one gets a context string and the NULL set shrinks
-        // by `count` every pass. This break only guarantees that a page which
-        // somehow repaired nothing ends the loop rather than re-fetching itself
-        // forever. A comment that invents a reason is worse than no comment.
+        // It is inert today, and the reason is a containment relation between
+        // two queries rather than a property of either one:
+        // `get_nodes_missing_context` selects `JOIN files` plus
+        // `f.path != '<external>'`, and `get_nodes_with_files_by_ids` selects on
+        // that same `JOIN files` and nothing more. The producer's rows are a
+        // subset of the consumer's, so every id in a page survives the reload,
+        // takes a context string from the UPDATE, and leaves the NULL set.
+        //
+        // That relation is the load-bearing part, and it spans two files. Adding
+        // a predicate to the CONSUMER, or dropping the `JOIN files` from the
+        // PRODUCER — which would let orphan nodes into a page for the consumer's
+        // INNER JOIN to drop — breaks it, and then this line is the only thing
+        // between a routine startup repair and a spin. An earlier version of
+        // this comment called the orphan case impossible and the break merely
+        // defensive; it is impossible only because of the producer's JOIN, which
+        // is precisely the line an unrelated edit is free to move.
         if count == 0 {
             break;
         }

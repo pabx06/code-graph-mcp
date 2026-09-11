@@ -535,6 +535,113 @@ fn inspect_bounds_the_decompressed_payload() {
     );
 }
 
+/// A raw `.db` that `inspect` accepts, in a chosen journal mode.
+/// `Database::open` leaves a file in WAL; `delete` is what `snapshot create`'s
+/// `VACUUM INTO` actually emits. The header assertion is not decoration — a
+/// fixture that silently came out in the other mode would make every caller
+/// below test the arm it was not aiming at.
+fn raw_snapshot_fixture(path: &std::path::Path, journal_mode: &str, write_version: u8) {
+    {
+        let db = Database::open(path).unwrap();
+        db.conn()
+            .query_row(&format!("PRAGMA journal_mode = {journal_mode}"), [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        write_meta(db.conn(), META_SNAPSHOT_SOURCE_COMMIT, "deadbeefcafe").unwrap();
+        write_meta(db.conn(), META_SNAPSHOT_TOOL_VERSION, "9.9.9").unwrap();
+        write_meta(db.conn(), META_SNAPSHOT_SCHEMA_VERSION, "10").unwrap();
+        write_meta(db.conn(), META_SNAPSHOT_CREATED_AT, "1757600000").unwrap();
+    }
+    let head = std::fs::read(path).unwrap();
+    assert_eq!(
+        head[18], write_version,
+        "fixture asked for journal_mode={journal_mode} but the header says otherwise"
+    );
+    let own_name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let stray: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| *n != own_name)
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "fixture left side files behind, so a residue assertion on it would be vacuous: {stray:?}"
+    );
+}
+
+#[test]
+fn inspect_leaves_no_side_files_beside_the_file_it_reads() {
+    // Regression caught while making the raw arm open in place instead of
+    // staging through `fs::copy`: SQLite cannot read a WAL-mode database
+    // without a `-shm`, so an in-place read-only open MINTS `snapshot.db-wal`
+    // and `snapshot.db-shm` next to the user's file, and a read-only connection
+    // cannot remove them on close. A command whose entire job is to look at a
+    // file left two behind.
+    //
+    // Both modes run: `delete` is every artifact `snapshot create` produces and
+    // takes the in-place arm, `wal` is what a live `.code-graph/index.db` is and
+    // takes the staging arm. The read-only-directory sibling below is what stops
+    // a "clean up afterwards" fix from satisfying this one.
+    for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
+        let dir = TempDir::new().unwrap();
+        let raw = dir.path().join("snapshot.db");
+        raw_snapshot_fixture(&raw, mode, write_version);
+
+        let before = std::fs::read(&raw).unwrap();
+        crate::snapshot::inspect(&raw).unwrap();
+        let after = std::fs::read(&raw).unwrap();
+
+        assert_eq!(
+            before, after,
+            "{mode}: inspect modified the file it was only pointed at"
+        );
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "snapshot.db")
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "{mode}: inspect left files beside the snapshot: {residue:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_reads_a_wal_mode_raw_db_from_a_read_only_directory() {
+    // The WAL arm's reason to keep staging, stated as a failure rather than as
+    // residue: an in-place open has to create a `-shm` beside the file, and a
+    // read-only directory refuses that outright. The residue sibling above runs
+    // in a writable directory and could still be satisfied by deleting the side
+    // files after the fact; this one cannot.
+    //
+    // Mutation-verified by forcing `wal_mode` false in `inspect_with_cap`, and
+    // the verdict is worth recording because it is not the one to expect: the
+    // failure is `not a valid code-graph snapshot — meta is missing or
+    // unreadable`, NOT a permission error. `Database::open_readonly` returns Ok
+    // on an unreadable file (its `user_version` and `sqlite_master` probes are
+    // both `unwrap_or`), so the refusal surfaces at the `meta` lookup, which
+    // cannot tell "no shm" from "corrupt". An in-place WAL arm would therefore
+    // tell a user their snapshot is corrupt when the directory is merely
+    // read-only.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let raw = dir.path().join("snapshot.db");
+    raw_snapshot_fixture(&raw, "wal", 2);
+
+    let original = std::fs::metadata(dir.path()).unwrap().permissions();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = crate::snapshot::inspect(&raw);
+    std::fs::set_permissions(dir.path(), original).unwrap();
+
+    let meta = result.expect("a WAL-mode raw db in a read-only directory must still inspect");
+    assert_eq!(meta.tool_version, "9.9.9");
+    assert_eq!(meta.source_commit, "deadbeefcafe");
+}
+
 #[test]
 fn inspect_rejects_garbage_with_clear_error() {
     let dir = TempDir::new().unwrap();
