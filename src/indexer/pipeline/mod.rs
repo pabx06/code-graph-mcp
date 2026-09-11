@@ -389,6 +389,16 @@ pub fn apply_file_refreshes(
     // Before the marker restore below, not after: the fan-out round is another
     // `index_files` call, and `index_files` clears that marker when it finishes.
     // Restoring first would hand the clear something to destroy.
+    //
+    // This ordering does widen the window in which an EARLIER run's interrupted
+    // marker is absent, and that is a real cost, not a free choice. Round two
+    // sets and clears its own marker, so round two's body is covered; what is
+    // newly exposed is the discovery query, `collect_dirty_node_ids`, and round
+    // two's post-clear tail — context strings, post passes, the sentinel reap.
+    // A kill inside that window loses the evidence that a previous run never
+    // committed its cross-file edges, and the full re-index it exists to trigger
+    // never happens. The alternative destroys the marker outright, so this is
+    // the lesser of the two; it is not nothing.
     fan_out_to_new_duplicate_definitions(db, project_root, &hashes, model)?;
     if was_interrupted {
         crate::storage::queries::set_meta(
@@ -572,18 +582,41 @@ pub fn run_incremental_index_cached(
 /// ground underneath every phase. Two calls each keep their own consistent set,
 /// so nothing inside `index_files` changes at all.
 ///
-/// **Terminates in one extra round, by construction**: round two re-extracts
-/// files whose symbol sets it does not change, so no name's definition count can
-/// rise again. Pinned by `a_second_fanout_round_finds_nothing_to_do`.
+/// **Terminates in one extra round**: round two re-extracts files whose symbol
+/// sets it does not change, so no name's definition count can rise again.
+/// Pinned by `a_second_fanout_round_finds_nothing_to_do`.
 ///
-/// **What it costs, measured on django** (3,456 files, 48k nodes, 262k edges).
+/// That holds GIVEN the index is current for the caller files, which is true on
+/// the `run_incremental_index_cached` path — the run has just diffed the whole
+/// tree — and is exactly what `apply_file_refreshes` exists because it is not.
+/// There, only the files a query's result set mentioned are refreshed, under a
+/// budget, so a caller this round drags in by name is re-extracted from DISK and
+/// may carry a definition the index has never seen. Its count then rises inside
+/// round two, and there is no round three. The bound on that is the same one
+/// that made the original defect survivable: the next full incremental run
+/// closes it. Worth knowing before anyone turns "one extra round" into a loop
+/// on the strength of the first sentence.
+///
+/// **What it costs, measured on django** (3,453 files, 48k nodes, 262k edges,
+/// `--no-default-features` so no embedding model is loaded — with one, a pull
+/// also re-embeds those files and none of these numbers include that).
+///
 /// A new file defining `get_queryset` and `as_sql` — names django defines many
-/// times over — pulls **23** caller files, and the run goes 352 ms -> 2,993 ms.
-/// That is not overhead: re-indexing 23 ordinary django files on the UNPATCHED
-/// binary takes 2,690 ms, so the round costs what re-extracting those files
-/// costs and nothing beyond it. The ordinary interactive edit, which is what
-/// v0.143.0's scoped post passes bought, is unaffected: 1,232 ms -> 1,249 ms
-/// median of 7, inside the baseline's own 1,155-1,355 ms spread.
+/// times over — pulls **23** caller files. Same corpus state, same binary
+/// lineage, round forced off vs on: 344 ms -> 2,840 ms, a marginal 2,496 ms.
+/// That is the cost of the work, not overhead on top of it: re-indexing EXACTLY
+/// those 23 files with the round off takes 2,685 ms, so the round runs at 0.93
+/// of it. The matched control matters — an earlier version of this note compared
+/// against 23 *arbitrary* django files, which is a different 23.
+///
+/// The ordinary interactive edit, which is what v0.143.0's scoped post passes
+/// bought, is unaffected: 1,232 ms -> 1,249 ms median of 7, inside the
+/// baseline's own 1,155-1,355 ms spread.
+///
+/// What django cannot measure: it is Python-only, so the `(name, language)`
+/// filter contributes nothing to these numbers, and none of the 23 callers it
+/// pulls are `references` callers — so the widened relation set is unexercised
+/// here too. On a polyglot repo neither figure is an upper bound.
 ///
 /// There is deliberately **no cap** on the caller set. A cap would restore, in a
 /// quieter form, exactly the silent divergence this closes — the graph would be

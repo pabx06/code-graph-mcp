@@ -5166,35 +5166,141 @@ fn an_ordinary_edit_does_not_drag_callers_into_a_fanout_round() {
 }
 
 #[test]
-fn a_second_fanout_round_finds_nothing_to_do() {
-    // Termination for D#24's fan-out round, asserted rather than assumed.
+fn a_new_same_name_definition_reaches_an_untouched_bare_reference() {
+    // D#24's other half, found by pre-ship review of the first fix (2026-09-11).
     //
-    // `fan_out_to_new_duplicate_definitions` runs exactly once per
-    // `index_files` call, so nothing in the production path loops. What this
-    // pins is the reason that is SAFE: the round re-extracts files whose symbol
-    // sets it does not change, so no name's definition count can rise a second
-    // time and a hypothetical third round would have an empty trigger set. If
-    // that ever stopped holding, "runs once" would be hiding an unfinished
-    // repair rather than describing a fixed point.
+    // `CONF_CASE` labels TWO relations `ambiguous`, not one: `classify_edge_confidence`
+    // binds `CONF_WHERE`'s parameters as `params![REL_CALLS, REL_REFERENCES, ...]`
+    // (resolve.rs). A `references` edge therefore fans out to every same-name
+    // candidate exactly as a `calls` edge does — and the first version of the
+    // fan-out round filtered `e.relation = 'calls'` alone, so it repaired half
+    // the population and silently left the other half. Neither the code, the
+    // spec, nor the INDEX_VERSION note said `references` anywhere, so all three
+    // read as if the repair were complete.
     //
-    // Driven through the public entry point twice: the second
-    // `run_incremental_index` sees a clean tree, so its own snapshot/recount
-    // pair must produce no callers. Asserted on the graph, because the count is
-    // internal — a run that did re-extract would have to change something to
-    // matter, and byte-identical output over a re-run that indexes nothing is
-    // the observable form of "fixed point".
+    // Rust rather than Python because `references` is where a type is MENTIONED:
+    // `Option<Widget>` in a signature is a reference to `Widget`, not a call.
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let src = project_dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
-    fs::write(src.join("b.py"), "def caller():\n    helper()\n").unwrap();
+    fs::write(src.join("a.rs"), "pub struct Widget { pub a: i32 }\n").unwrap();
+    fs::write(
+        src.join("b.rs"),
+        "pub fn caller() -> Option<Widget> { None }\n",
+    )
+    .unwrap();
 
     let db = Database::open(&db_dir.path().join("index.db")).unwrap();
     run_full_index(&db, project_dir.path(), None, None).unwrap();
 
+    let refs_to = |rows: &[(String, String, String, String)], target: &str| -> bool {
+        rows.iter()
+            .any(|(s, r, t, _)| s == "src/b.rs:caller" && r == "references" && t == target)
+    };
+    let before = graph_projection_with_confidence(&db);
+    assert!(
+        refs_to(&before, "src/a.rs:Widget"),
+        "precondition: the signature's type mention is a `references` edge: {before:?}"
+    );
+
+    // One run, one file: c.rs appears with a second `Widget`. b.rs is
+    // byte-identical and is never opened by this run.
+    fs::write(src.join("c.rs"), "pub struct Widget { pub b: i32 }\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+
+    let control_dir = TempDir::new().unwrap();
+    let control = Database::open(&control_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, project_dir.path(), None, None).unwrap();
+
+    let inc = graph_projection_with_confidence(&db);
+    let full = graph_projection_with_confidence(&control);
+    assert!(
+        refs_to(&full, "src/a.rs:Widget") && refs_to(&full, "src/c.rs:Widget"),
+        "control: a rebuild fans the bare type mention out to both definitions: {full:?}"
+    );
+    assert!(
+        refs_to(&inc, "src/c.rs:Widget"),
+        "a `references` edge fans out by bare name exactly as a `calls` edge does, so the \
+         fan-out round must cover it too: {inc:?}"
+    );
+    assert_eq!(
+        inc, full,
+        "incremental edge set diverged from a rebuild of the same tree"
+    );
+}
+
+/// Node count for one file path — the observable for "was this re-extracted,
+/// and did its symbol set stay the same".
+fn node_count_of(db: &Database, path: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes n JOIN files f ON f.id = n.file_id WHERE f.path = ?1",
+            [path],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_second_fanout_round_finds_nothing_to_do() {
+    // Termination for D#24's fan-out round, asserted rather than assumed — and
+    // this is the SECOND version of this test, because the first one was vacuous
+    // and two independent pre-ship reviewers caught it.
+    //
+    // The claim: round two re-extracts files whose symbol sets it does not
+    // change, so no name's definition count can rise again and a hypothetical
+    // round three would have an empty trigger set. Production runs the round
+    // exactly once per `index_files` call, so nothing loops — but "runs once"
+    // only describes a fixed point if that claim holds; otherwise it is hiding
+    // an unfinished repair.
+    //
+    // The first version drove `run_incremental_index` twice and asserted the
+    // second run indexed nothing. That never reached the round: an unchanged
+    // tree has an empty diff, so `fanout_possible` is false and BOTH the
+    // snapshot and the round are skipped. Its assertions were held up by the
+    // empty-diff guard and would have passed with
+    // `fan_out_to_new_duplicate_definitions` deleted outright. A reviewer
+    // confirmed it with an instrumented run: `dirty_seed=0 fanout_possible=false`.
+    //
+    // So this version states the claim directly. It takes the count snapshot
+    // over the CALLER paths — the path set a round three would actually have —
+    // and asserts the recount yields nobody.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let src = project_dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    // b.py is both the bare-name CALLER the round pulls in and the DEFINER of a
+    // second duplicated name (`shared`, also in e.py) that an outside file
+    // (d.py) calls bare. Without that second role the assertion below cannot
+    // fail for any reason: re-extracting a file nobody references leaves no
+    // candidate for the recount to return, so a broken count predicate would
+    // still produce an empty set and the test would pass vacuously — which is
+    // the trap this test fell into twice already.
+    fs::write(src.join("a.py"), "def helper():\n    pass\n").unwrap();
+    fs::write(
+        src.join("b.py"),
+        "def caller():\n    helper()\n\n\ndef shared():\n    pass\n",
+    )
+    .unwrap();
+    fs::write(src.join("e.py"), "def shared():\n    pass\n").unwrap();
+    fs::write(src.join("d.py"), "def user():\n    shared()\n").unwrap();
+
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+    assert!(
+        graph_projection_with_confidence(&db)
+            .iter()
+            .any(|(s, r, t, c)| s == "src/d.py:user"
+                && r == REL_CALLS
+                && t == "src/b.py:shared"
+                && c == "ambiguous"),
+        "precondition: d.py holds an ambiguous bare call into b.py, so a wrongly \
+         risen `shared` would surface d.py in the recount"
+    );
+
     fs::write(src.join("c.py"), "def helper():\n    pass\n").unwrap();
-    let first = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
     let after_first = graph_projection_with_confidence(&db);
     assert!(
         after_first
@@ -5202,23 +5308,41 @@ fn a_second_fanout_round_finds_nothing_to_do() {
             .any(|(s, r, t, _)| s == "src/b.py:caller" && r == REL_CALLS && t == "src/c.py:helper"),
         "precondition: the fan-out round ran and created the edge: {after_first:?}"
     );
+
+    // Round three, by hand, over round two's own path set — and it must really
+    // RE-EXTRACT, not merely re-run. A second `run_incremental_index` here would
+    // find an unchanged tree and do nothing at all, which makes "no name rose"
+    // true for the wrong reason; that is the shape of the vacuity described
+    // above, one level deeper. So `index_files` is driven directly on the caller
+    // path, exactly as the round drives it, and the recount is taken across that
+    // re-extraction.
+    let callers = vec!["src/b.py".to_string()];
+    super::resolve::snapshot_definition_counts(db.conn(), &callers).unwrap();
+    let before_ids = node_count_of(&db, "src/b.py");
+    index_files(
+        &db,
+        project_dir.path(),
+        &callers,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
     assert!(
-        first.files_indexed > 0,
-        "precondition: the first run did index something"
+        before_ids > 0 && node_count_of(&db, "src/b.py") == before_ids,
+        "precondition: b.py was re-extracted and still holds the same symbols"
+    );
+    let next = super::resolve::bare_name_callers_of_new_duplicates(db.conn()).unwrap();
+    assert!(
+        next.is_empty(),
+        "the fan-out round is not a fixed point — a third round would re-extract {next:?}"
     );
 
-    // Nothing changed on disk. The diff is empty, so this run indexes no file —
-    // and the fan-out round must agree there is nothing left to fan out.
-    let second = run_incremental_index(&db, project_dir.path(), None, None).unwrap();
-    assert_eq!(
-        second.files_indexed, 0,
-        "a re-run over an unchanged tree must index nothing — a non-zero count here is the \
-         fan-out round re-firing on its own output"
-    );
     assert_eq!(
         graph_projection_with_confidence(&db),
         after_first,
-        "the fan-out round is not a fixed point: a second pass moved the graph"
+        "a second pass moved the graph"
     );
 }
 

@@ -600,25 +600,56 @@ pub(super) fn snapshot_definition_counts(
     conn: &rusqlite::Connection,
     paths: &[String],
 ) -> Result<()> {
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS temp.cg_fanout_paths;
-         DROP TABLE IF EXISTS temp.cg_fanout_before;
-         CREATE TEMP TABLE cg_fanout_paths (path TEXT PRIMARY KEY);",
-    )?;
+    drop_fanout_temps(conn)?;
+    conn.execute_batch("CREATE TEMP TABLE cg_fanout_paths (path TEXT PRIMARY KEY);")?;
     {
         let mut stmt = conn.prepare("INSERT OR IGNORE INTO cg_fanout_paths (path) VALUES (?1)")?;
         for p in paths {
             stmt.execute([p])?;
         }
     }
+    // `<module>` is excluded here and in the `after` half, so the two stay
+    // symmetric. Every file carries one, which makes it the most duplicated name
+    // in any index by a wide margin — 298 of 5,903 nodes in this repo's own,
+    // where the next most duplicated real name has 7 — so ADDING any file raises
+    // its count and drops it into the trigger set unconditionally. It selects no
+    // caller today (measured: zero `calls` or `references` edges target a
+    // `<module>` node; imports do, and imports are not in this round's relation
+    // set), so the cost is an index probe per module node on every file
+    // addition, paid for nothing. An ordinary EDIT never pays it, which is why
+    // no one-file-edit benchmark can see it. Excluded for the same reason
+    // `<external>` is left out of `paths`: a sentinel name is not a fan-out
+    // target.
     conn.execute_batch(
         "CREATE TEMP TABLE cg_fanout_before AS
            SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_fanout_paths p ON p.path = f.path
+           WHERE n.name <> '<module>'
            GROUP BY n.name, f.language;
          CREATE INDEX cg_fanout_before_k ON cg_fanout_before(nm, lang);",
+    )?;
+    Ok(())
+}
+
+/// Drop everything the fan-out pair creates.
+///
+/// Called on entry by [`snapshot_definition_counts`] and on both exits of
+/// [`bare_name_callers_of_new_duplicates`], including its error path. The
+/// sibling `drop_scope_temps` guards a hazard this pair does not have — a stale
+/// `cg_scope_paths` can silently scope the NEXT run, whereas these four are
+/// always created fresh together, so a leak costs retention on a long-lived MCP
+/// connection and cannot mis-scope anything. One case still escapes: if the
+/// round-1 `index_files` returns `Err`, the fan-out round never runs and these
+/// survive until the next run's entry drop. That is the documented bound, not an
+/// oversight.
+pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_fanout_paths;
+         DROP TABLE IF EXISTS temp.cg_fanout_before;
+         DROP TABLE IF EXISTS temp.cg_fanout_after;
+         DROP TABLE IF EXISTS temp.cg_fanout_up;",
     )?;
     Ok(())
 }
@@ -645,8 +676,19 @@ pub(super) fn snapshot_definition_counts(
 pub(super) fn bare_name_callers_of_new_duplicates(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<String>> {
-    use crate::domain::{CONF_AMBIGUOUS, REL_CALLS};
+    use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_REFERENCES};
 
+    // `(nm, lang)` all the way through, never `nm` alone. The pairs are already
+    // unique — `cg_fanout_after` groups by both — so no DISTINCT is needed here,
+    // and carrying the language is what keeps the round from firing across
+    // languages: a rise in the JavaScript count of `render` says nothing about a
+    // Python caller of `render`, because `CONF_CASE` joins its name count as
+    // `nc.lang IS tf.language` and so can never label that pair `ambiguous` in
+    // the first place. The first version dropped the language here and joined on
+    // name alone, which re-extracted callers in every language sharing a common
+    // name (render / update / init / handler / run / main) for no reachable
+    // edge — harmless to the graph, pure cost on a round that is deliberately
+    // uncapped, and pure node-id churn.
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_fanout_after;
          CREATE TEMP TABLE cg_fanout_after AS
@@ -658,13 +700,23 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CREATE INDEX cg_fanout_after_k ON cg_fanout_after(nm, lang);
          DROP TABLE IF EXISTS temp.cg_fanout_up;
          CREATE TEMP TABLE cg_fanout_up AS
-           SELECT DISTINCT a.nm AS nm
+           SELECT a.nm AS nm, a.lang AS lang
            FROM cg_fanout_after a
            LEFT JOIN cg_fanout_before b ON b.nm = a.nm AND b.lang IS a.lang
            WHERE a.cnt > COALESCE(b.cnt, 0);
-         CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm);",
+         CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm, lang);",
     )?;
 
+    // BOTH relations `CONF_CASE` can label `ambiguous`, not just `calls`:
+    // `classify_edge_confidence` binds its `CONF_WHERE` parameters as
+    // `params![REL_CALLS, REL_REFERENCES, ...]`. A `references` edge — a type
+    // mentioned in a signature, say — fans out to every same-name candidate
+    // exactly as a call does, so leaving it out repaired one population and
+    // silently left the other. Both constants come from `domain.rs` so this set
+    // cannot drift from `CONF_CASE`'s again; found by pre-ship review, which
+    // measured 14 of 35 ambiguous edges in this repo's own index as
+    // `references`.
+    //
     // `CROSS JOIN` in scope-first order for the same reason every post pass
     // spells it that way (see `PostPassScope::is_global`): SQLite has no
     // statistics for a temp table and will otherwise drive from
@@ -674,26 +726,25 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         "SELECT DISTINCT f.path
          FROM cg_fanout_up u
          CROSS JOIN nodes tgt ON tgt.name = u.nm
+         CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
          CROSS JOIN edges e ON e.target_id = tgt.id
-                           AND e.relation = '{REL_CALLS}'
+                           AND e.relation IN ('{REL_CALLS}', '{REL_REFERENCES}')
                            AND e.confidence = '{CONF_AMBIGUOUS}'
          CROSS JOIN nodes src ON src.id = e.source_id
          CROSS JOIN files f ON f.id = src.file_id
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)"
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let paths: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(stmt);
-
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS temp.cg_fanout_paths;
-         DROP TABLE IF EXISTS temp.cg_fanout_before;
-         DROP TABLE IF EXISTS temp.cg_fanout_after;
-         DROP TABLE IF EXISTS temp.cg_fanout_up;",
-    )?;
-    Ok(paths)
+    // Collected into a Result first so the temps are dropped on the error path
+    // too, not only on success — `?` here would leak all four.
+    let collected = (|| -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&sql)?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(paths)
+    })();
+    drop_fanout_temps(conn)?;
+    collected
 }
 
 pub(super) fn bind_calls_to_imported_targets(

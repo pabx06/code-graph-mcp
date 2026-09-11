@@ -1,6 +1,6 @@
 ---
 status: implemented
-revision: 3
+revision: 4
 ---
 
 # D#24 — a new same-name definition never reaches an untouched bare caller
@@ -214,6 +214,57 @@ divergence in a quieter form.
   no matter what the counts said. Relaxing `a.cnt > COALESCE(b.cnt, 0)` to `>=`
   left it passing. Rewritten to start from two definitions, where the count is
   the only thing left holding the round back, and the mutation now kills it.
+
+### What review found (rev 4)
+
+Two independent reviewers, empty context, one worktree each. Verdict from both:
+SHIP-WITH-FIXES. Neither could break the two-round design — the in-flight marker,
+the `cg_fanout_*` / `cg_scope_*` temp namespaces, the `<external>` sentinel
+lifecycle and `run_file_paths` were each attacked and held — and a 14-case
+differential harness found the patched binary matching a rebuild on 13 of 14
+shapes where the unpatched one diverged on 9, including the `PostPassScope::Global`
+branch no unit test covers.
+
+What they found that mattered, all repaired here:
+
+1. **The repair was half a repair.** `classify_edge_confidence` binds its
+   relation pair as `params![REL_CALLS, REL_REFERENCES, …]`, so a `references`
+   edge fans out by bare name exactly as a call does — and the round filtered
+   `calls` alone. 14 of 35 ambiguous edges in this repo's own index are
+   `references`. This document had zero occurrences of the word. Widened, with
+   both constants sourced from `domain.rs` so the set cannot drift from
+   `CONF_CASE` again.
+2. **The termination test was vacuous, and BOTH reviewers found it independently.**
+   Its second `run_incremental_index` saw an unchanged tree, so the empty-diff
+   guard skipped the round entirely; one reviewer proved it with an instrumented
+   run printing `dirty_seed=0 fanout_possible=false`. It would have passed with
+   the whole feature deleted. Rewritten to drive `index_files` on the caller path
+   directly and assert the recount is empty — and the fixture had to be rebuilt
+   twice more before the assertion could fail at all.
+3. **`cg_fanout_up` dropped the language** the snapshot's own doc said was
+   load-bearing, so adding a JavaScript `helper` re-extracted a Python caller.
+   Correctness-neutral, pure cost and node-id churn.
+4. **`<module>` entered the trigger set on every file addition** — the most
+   duplicated name in any index (298 of 5,903 nodes here). Selects nothing today;
+   excluded.
+5. **A guard was lost without a test going red.** `cfd4aa2` re-homed two
+   untouched tests onto its new meta-table check, leaving the legacy
+   `schema_version == 0` verdict guarded by nothing: disabling it alone left the
+   suite at 1,816/0. `inspect_refuses_a_live_index_that_has_meta_but_no_snapshot_rows`
+   closes it, mutation-verified.
+6. **A non-WAL db with a hot rollback journal was called corrupt.** It cannot be
+   opened read-only at all, and `unwrap_or(0)` turned that into the wrong
+   verdict. `inspect` now falls back to staging when the in-place probe errors.
+7. Smaller: a 32-bit `usize` truncation in the header read, a `with_context` that
+   demoted the actionable schema-too-new line to a `Caused by:`, a stale
+   `Cargo.toml` line reference, and four comments asserting things their own code
+   contradicted.
+
+Not repaired, registered instead: an import-bound Rust call diverges
+incremental-vs-rebuild (`use crate::a::widget` — the rebuild fans out, the
+incremental does not). PRE-EXISTING, reproduced identically on both binaries, and
+it contradicts the claim that `ambiguous` is *exactly* the affected set. Filed
+rather than fixed under this change.
 
 ### Risks this carries into review
 

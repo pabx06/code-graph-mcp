@@ -163,12 +163,23 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     //
     // 20 bytes rather than 16 because the raw arm also needs byte 18, the SQLite
     // header's "file format write version" (1 = rollback journal, 2 = WAL). A
-    // file of 16..20 bytes still gets its magic compared; it simply reads as
-    // non-WAL, which is harmless — nothing that short survives the meta check.
+    // file of 16..=18 bytes is too short to carry byte 18 and so reads as
+    // non-WAL; 19 and 20 byte files do carry it and can read as WAL. Harmless
+    // either way — nothing that short survives the checks below — but stated
+    // exactly, because an earlier version of this comment said "16..20 reads as
+    // non-WAL" and that is false for two of those five sizes.
     let mut head = [0u8; 20];
     let head: &[u8] = if file_size_bytes >= 16 {
         use std::io::Read;
-        let want = std::cmp::min(20, file_size_bytes as usize);
+        // `min` on the u64, THEN cast. `file_size_bytes as usize` first would
+        // truncate on a 32-bit target, and a file whose size is an exact
+        // multiple of 2^32 would cast to 0 — `read_exact` on an empty slice
+        // succeeds, so a perfectly valid snapshot would be refused as "not a
+        // code-graph snapshot". The `>= 16` gate above is on the u64 and does
+        // not catch it. Windows and Linux ship x86_64/aarch64 here, so this has
+        // never been reachable in a released artifact; it is still the wrong
+        // order to write.
+        let want = std::cmp::min(20u64, file_size_bytes) as usize;
         let mut f = std::fs::File::open(file)
             .with_context(|| format!("read snapshot file '{}'", file.display()))?;
         f.read_exact(&mut head[..want])
@@ -181,18 +192,21 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
 
     // zstd magic = 0x28 0xB5 0x2F 0xFD; SQLite = "SQLite format 3\0".
     //
-    // Only the compressed arm materialises anything: decompression has to land
-    // somewhere, and `decompress_with_cap` is what bounds where it lands. The
-    // raw arm is already a SQLite file, so it is opened where it lies. This
-    // binding keeps that tempdir alive for as long as `db` holds a path inside
-    // it; the raw arm never creates one.
-    let _staging_dir;
-    let db = if head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    // Three ways in, and two of them materialise a staging copy: the compressed
+    // arm always (decompression has to land somewhere, and `decompress_with_cap`
+    // is what bounds where), the raw arm when the file is WAL-mode or when an
+    // in-place read turns out to be impossible. This binding keeps whichever
+    // tempdir was used alive for as long as `db` holds a path inside it, and is
+    // declared BEFORE `db` so it drops after it.
+    let mut _staging_dir: Option<tempfile::TempDir> = None;
+    let mut opened_in_place = false;
+    let mut db = if head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         let tmp = tempfile::tempdir().context("inspect tempdir")?;
         let decompressed = tmp.path().join("snapshot.db");
         install::decompress_with_cap(file, &decompressed, cap).context("zstd decode")?;
-        _staging_dir = tmp;
-        Database::open(&decompressed)?
+        let opened = Database::open(&decompressed)?;
+        _staging_dir = Some(tmp);
+        opened
     } else if head.starts_with(b"SQLite format 3\0") {
         // Deliberately UNCAPPED, and the first version of this fix got it wrong:
         // it applied `cap` here too, which refuses this repository's own
@@ -230,16 +244,27 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // a real `create --out`), so every artifact this tool produces takes the
         // in-place arm. What reaches the staging arm is someone pointing
         // `inspect` at a live `.code-graph/index.db` — which is not a snapshot
-        // and gets refused by the meta check below either way.
+        // and is refused below. Refused by the `schema_version == 0` verdict, to
+        // be exact, NOT by the meta-table check: a live index HAS a `meta`
+        // table, it just holds no `snapshot_*` rows. An earlier version of this
+        // comment named the wrong one.
+        //
+        // No `.with_context` on the open. `open_readonly`'s own refusals are
+        // already the actionable sentence — "Database schema version v99 is
+        // newer than supported v10. Please update code-graph-mcp." — and
+        // wrapping demoted it to a `Caused by:` line on this arm while the
+        // staging arm printed it bare, so the two arms answered the same input
+        // in different shapes.
         if wal_mode {
             let tmp = tempfile::tempdir().context("inspect tempdir")?;
             let staged = tmp.path().join("snapshot.db");
             std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
-            _staging_dir = tmp;
-            Database::open(&staged)?
+            let opened = Database::open(&staged)?;
+            _staging_dir = Some(tmp);
+            opened
         } else {
-            Database::open_readonly(file)
-                .with_context(|| format!("open snapshot file '{}'", file.display()))?
+            opened_in_place = true;
+            Database::open_readonly(file)?
         }
     } else {
         anyhow::bail!(
@@ -247,32 +272,59 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
             file.display()
         );
     };
-    let conn = db.conn();
+    // A file with no schema at all must be called the same thing whichever arm
+    // read it. The staged arm gets `Database::open`'s bootstrap, so a file that
+    // clears the 16-byte magic check while holding nothing else still opens onto
+    // an empty `meta` and reaches the `schema_version == 0` verdict below.
+    // Opening in place creates nothing, so the same file would instead surface
+    // SQLite's `no such table: meta` from the first read. `open_readonly` cannot
+    // report it — its `user_version` and `sqlite_master` probes are both
+    // `unwrap_or`, so it returns Ok on a file it cannot actually read. Hence
+    // this probe, run for both arms.
+    //
+    // Scoped claim, because an earlier version of this comment said the check
+    // was "the price of the arms not disagreeing" and that is only true for the
+    // narrow case it was written about. Pre-ship review found two inputs where
+    // the arms still answer differently — a db whose `nodes` table is missing a
+    // column makes the staging arm's bootstrap emit a multi-kilobyte SQL dump
+    // where the in-place arm gives one line — so what this buys is agreement on
+    // the schema-less file, not agreement in general.
+    const META_PROBE: &str =
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'";
+    let mut probe: rusqlite::Result<i64> = db.conn().query_row(META_PROBE, [], |r| r.get(0));
 
-    // Both arms must call a structurally broken file by the same name. The
-    // staged arm gets `Database::open`'s bootstrap, so a file that clears the
-    // 16-byte magic check while holding no schema still opens onto an empty
-    // `meta` and reaches the `schema_version == 0` verdict below. Opening in
-    // place creates nothing, so that same file would instead surface SQLite's
-    // `no such table: meta` from the first read. `open_readonly` cannot report
-    // it either — its `user_version` and `sqlite_master` probes are both
-    // `unwrap_or`, so it returns Ok on a corrupt file. Hence this check, run for
-    // both arms: for the staged one it is always true and costs a sqlite_master
-    // lookup, which is the price of the arms not disagreeing.
-    let meta_table_present = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-    if !meta_table_present {
+    // An Err here from the in-place arm is not "corrupt", it is "this file
+    // cannot be read read-only", and the two have to be told apart. The case
+    // that forced it: a non-WAL db with a HOT ROLLBACK JOURNAL beside it — left
+    // by any writer that died mid-transaction, including a crashed
+    // `snapshot create` — cannot be opened read-only at all, because SQLite must
+    // roll the journal back first and a read-only connection may not write.
+    // `unwrap_or(0)` swallowed that and reported the file corrupt, while the
+    // staging copy reads it perfectly: the copy is opened writable, so the
+    // rollback just happens. Pre-ship review demonstrated the two arms
+    // disagreeing on identical bytes by flipping header byte 18 alone.
+    //
+    // This is the same misdiagnosis the WAL split exists to prevent — telling a
+    // user their snapshot is corrupt when the real problem is that we chose an
+    // access mode the file does not permit. Falling back to the copy costs a
+    // staging write on a path that was already going to fail, and restores the
+    // pre-0.147.0 behaviour exactly.
+    if probe.is_err() && opened_in_place {
+        let tmp = tempfile::tempdir().context("inspect tempdir")?;
+        let staged = tmp.path().join("snapshot.db");
+        std::fs::copy(file, &staged).context("stage snapshot for inspect")?;
+        db = Database::open(&staged)?;
+        _staging_dir = Some(tmp);
+        probe = db.conn().query_row(META_PROBE, [], |r| r.get(0));
+    }
+
+    if probe.unwrap_or(0) <= 0 {
         anyhow::bail!(
             "{} is not a valid code-graph snapshot — meta is missing or unreadable (file may be truncated or corrupt)",
             file.display()
         );
     }
+    let conn = db.conn();
 
     let source_commit =
         meta::read_meta(conn, meta::META_SNAPSHOT_SOURCE_COMMIT)?.unwrap_or_default();

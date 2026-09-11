@@ -643,6 +643,132 @@ fn inspect_reads_a_wal_mode_raw_db_from_a_read_only_directory() {
 }
 
 #[test]
+fn inspect_refuses_a_live_index_that_has_meta_but_no_snapshot_rows() {
+    // The `schema_version == 0 && source_commit.is_empty() && tool_version.is_empty()`
+    // verdict, which until now had no guard at all.
+    //
+    // Pre-ship review measured it: disabling that verdict alone left the full
+    // suite at 1816 passed / 0 failed. The two tests that used to reach it —
+    // `inspect_rejects_truncated_sqlite_header` and
+    // `inspect_bounds_the_decompressed_payload` — build a magic-plus-zeros
+    // fixture, which after the in-place arm landed has no `meta` table at all,
+    // so they now stop at the meta probe instead and never get that far. Both
+    // checks emit a byte-identical message, so nothing went red when the guard
+    // moved out from under them.
+    //
+    // This fixture reaches the verdict on purpose: a LIVE `.code-graph/index.db`
+    // has a full schema — `meta` table included — and simply holds no
+    // `snapshot_*` rows. Without the verdict, `inspect` reports it as a valid
+    // snapshot with zeroed fields, which is precisely the "fake valid empty
+    // snapshot" the truncated-header test's comment says must not happen.
+    // `journal_mode = delete` so it takes the in-place arm, where the loss was.
+    let dir = TempDir::new().unwrap();
+    let live = dir.path().join("index.db");
+    {
+        let db = Database::open(&live).unwrap();
+        db.conn()
+            .query_row("PRAGMA journal_mode = delete", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+    }
+    let head = std::fs::read(&live).unwrap();
+    assert_eq!(head[18], 1, "fixture must take the in-place arm");
+    let has_meta: i64 = rusqlite::Connection::open(&live)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        has_meta, 1,
+        "fixture must HAVE a meta table, or it stops at the meta probe and proves nothing"
+    );
+
+    let err = crate::snapshot::inspect(&live).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not a valid code-graph snapshot"),
+        "an index with an empty meta table is not a snapshot and must be refused: {msg}"
+    );
+}
+
+#[test]
+fn inspect_reads_a_non_wal_db_with_a_hot_rollback_journal() {
+    // A non-WAL database with a hot `-journal` beside it — what any writer that
+    // died mid-transaction leaves, including a crashed `snapshot create` —
+    // cannot be opened read-only: SQLite has to roll the journal back first, and
+    // a read-only connection may not write. The first version of the in-place
+    // arm swallowed that error in an `unwrap_or(0)` and told the user the file
+    // was corrupt, while the staging copy reads it perfectly, because the copy
+    // is opened writable and the rollback simply happens.
+    //
+    // Pre-ship review demonstrated the two arms disagreeing on identical bytes
+    // by flipping header byte 18 alone. `inspect` now falls back to staging when
+    // the in-place probe errors, so this must succeed.
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.db");
+    raw_snapshot_fixture(&src, "delete", 1);
+
+    // Open a transaction and copy BOTH files while it is live: the copy then has
+    // a journal that a fresh opener must roll back.
+    let hot = dir.path().join("hot.db");
+    {
+        let conn = rusqlite::Connection::open(&src).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = delete;").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('x', 'y')",
+            [],
+        )
+        .unwrap();
+        let src_journal = dir.path().join("src.db-journal");
+        assert!(
+            src_journal.exists(),
+            "precondition: an open write transaction leaves a rollback journal"
+        );
+        std::fs::copy(&src, &hot).unwrap();
+        std::fs::copy(&src_journal, dir.path().join("hot.db-journal")).unwrap();
+        conn.execute_batch("ROLLBACK;").unwrap();
+    }
+    assert!(
+        dir.path().join("hot.db-journal").exists(),
+        "precondition: the fixture carries a hot journal"
+    );
+
+    let meta = crate::snapshot::inspect(&hot)
+        .expect("a non-WAL db with a hot rollback journal must still inspect");
+    assert_eq!(meta.tool_version, "9.9.9");
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_reads_a_snapshot_whose_file_is_read_only() {
+    // An improvement the in-place arm bought that its own commit did not claim,
+    // found by pre-ship review. `fs::copy` preserves the source's permission
+    // bits, so staging a mode-0444 snapshot produced a 0444 copy that
+    // `Database::open` could not write to, and `inspect` failed with
+    // "attempt to write a readonly database". Opening in place read-only has no
+    // such problem. The scenario is ordinary: `chmod -w` on a downloaded release
+    // artifact, or anything restored from a backup.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let raw = dir.path().join("snapshot.db");
+    raw_snapshot_fixture(&raw, "delete", 1);
+
+    let original = std::fs::metadata(&raw).unwrap().permissions();
+    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let result = crate::snapshot::inspect(&raw);
+    std::fs::set_permissions(&raw, original).unwrap();
+
+    let meta = result.expect("a read-only snapshot file must still inspect");
+    assert_eq!(meta.tool_version, "9.9.9");
+}
+
+#[test]
 fn inspect_rejects_garbage_with_clear_error() {
     let dir = TempDir::new().unwrap();
     let bad = dir.path().join("garbage.db.zst");
