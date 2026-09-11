@@ -235,6 +235,30 @@ test('cachedBinaryStaleVsState bypasses throttle only for a present-but-stale bi
   assert.equal(cachedBinaryStaleVsState({ latestVersion: '0.45.1' }, { binaryPath }), false);
 });
 
+// Audit 2026-09-07 JS-22. `update-state.json` is written by several paths and
+// read by four; a truncated or hand-edited `lastCheck` that Date cannot parse
+// makes `elapsed` NaN, and NaN fails EVERY `elapsed >= X` comparison in this
+// function — including the `force` arm, which is the one high-intent bypass a
+// user has. The updater then never checks again, `doctor` still reports
+// up-to-date (it reads the same state), and the only cure is deleting the file
+// by hand. `isUpdateSuspended` already refuses to be parked by a half-written
+// state file; this is the same hazard one field over.
+test('shouldCheck treats an unparseable lastCheck as "long ago" instead of parking forever', () => {
+  const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
+  const corrupt = { lastCheck: 'not-a-date', updateAvailable: false };
+
+  assert.equal(shouldCheck(corrupt), true,
+    'an unreadable timestamp must not silence the updater');
+  assert.equal(shouldCheck(corrupt, { force: true }), true,
+    'force is the user-facing bypass and must survive a corrupt timestamp');
+  assert.equal(shouldCheck({ ...corrupt, rateLimited: true }), true,
+    'a missing lastCheck already bypasses the rate-limit arm; an unreadable one must not be stricter');
+
+  // Negative controls: a parseable timestamp keeps every throttle it had.
+  assert.equal(shouldCheck({ lastCheck: minsAgo(10), updateAvailable: false }), false);
+  assert.equal(shouldCheck({ lastCheck: minsAgo(30), updateAvailable: false, rateLimited: true }), false);
+});
+
 test('shouldCheck re-verifies an up-to-date state on a short cadence (release-publish race)', () => {
   const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
 
@@ -552,6 +576,33 @@ test('commandExists returns true for a known command (node)', () => {
 
 test('commandExists returns false for a non-existent command', () => {
   assert.equal(commandExists('__nonexistent_cmd_xyz_12345__'), false);
+});
+
+// Audit 2026-09-07 JS-21. `which`/`where` walks every PATH entry, and a hung
+// network mount on one of them blocks the call forever. This probe is not on the
+// hook budget path, but `downloadAndInstall` holds INSTALL_LOCK_FILE while it
+// runs, and that lock is only reclaimed after 10 minutes — so one unresponsive
+// PATH entry parks installs and self-heal for every other session too. Every
+// other child in this file is already bounded (`hidden({ timeout: 60000 })` for
+// the binary curl, 30000 for the sidecar, `timeoutMs` for the marketplace pull);
+// this was the one that was not.
+test('commandExists bounds the PATH probe so a hung mount cannot park the installer', () => {
+  let seen = null;
+  const fakeExec = (_cmd, _args, opts) => { seen = opts; };
+
+  commandExists('node', { exec: fakeExec });
+
+  assert.ok(seen, 'commandExists must route its probe through the injected exec');
+  assert.equal(typeof seen.timeout, 'number',
+    'the PATH probe must carry a timeout — an unbounded `which` holds install.lock for 10 minutes');
+  assert.ok(Number.isFinite(seen.timeout) && seen.timeout > 0,
+    `timeout must be a positive finite ms value, got ${seen.timeout}`);
+  assert.ok(seen.timeout <= 10000,
+    `an absolute ceiling, not one derived from the constant under test: got ${seen.timeout}ms`);
+
+  // Negative control: the real probe still answers correctly with the timeout in
+  // place, so the bound did not turn a working lookup into a false negative.
+  assert.equal(commandExists('node'), true);
 });
 
 test('cachedBinaryPath returns expected platform binary path', () => {

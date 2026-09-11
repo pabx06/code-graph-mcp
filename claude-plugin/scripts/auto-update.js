@@ -18,15 +18,25 @@ const { acquireLock } = require('./install-lock');
 
 // ── Environment Checks ────────────────────────────────────
 
+// `which`/`where` walks every PATH entry, so one unresponsive network mount
+// blocks it indefinitely. Not a hook-budget path, but `downloadAndInstall` holds
+// INSTALL_LOCK_FILE across its probes and that lock is only reclaimed after 10
+// minutes, so an unbounded probe parks installs and self-heal for every other
+// session too. 5s is far above any real PATH walk and far below the lock's
+// reclaim window (audit 2026-09-07 JS-21).
+const PATH_PROBE_TIMEOUT_MS = 5000;
+
 /**
  * Check if a command-line tool is available on the system PATH.
  * @param {string} cmd - Command name (e.g., 'curl', 'tar')
+ * @param {{exec?: Function, timeoutMs?: number}} [opts] - Injection seam for tests,
+ *   same shape as `refreshMarketplaceClone`.
  * @returns {boolean}
  */
-function commandExists(cmd) {
+function commandExists(cmd, { exec = execFileSync, timeoutMs = PATH_PROBE_TIMEOUT_MS } = {}) {
   try {
     const whichCmd = process.platform === 'win32' ? 'where' : 'which';
-    execFileSync(whichCmd, [cmd], hidden({ stdio: 'ignore' }));
+    exec(whichCmd, [cmd], hidden({ stdio: 'ignore', timeout: timeoutMs }));
     return true;
   } catch {
     return false;
@@ -249,7 +259,14 @@ function isUpdateSuspended(state) {
 //      keeps the 6h steady-state interval.
 function shouldCheck(state, { force = false, binaryMissing = false, binaryStale = false } = {}) {
   if (!state.lastCheck) return true;
-  const elapsed = Date.now() - new Date(state.lastCheck).getTime();
+  // A truncated or hand-edited `lastCheck` that Date cannot parse yields NaN,
+  // and NaN fails EVERY `elapsed >= X` below — including the `force` arm, the
+  // one bypass a user has. The updater then never checks again while `doctor`,
+  // reading the same file, still reports up-to-date. Treat unreadable as "no
+  // idea when, assume long ago", which is what a MISSING lastCheck already does
+  // one line up (audit 2026-09-07 JS-22).
+  const lastCheckMs = new Date(state.lastCheck).getTime();
+  const elapsed = Number.isFinite(lastCheckMs) ? Date.now() - lastCheckMs : Infinity;
   if (state.rateLimited) return elapsed >= RATE_LIMIT_INTERVAL_MS;
   if (binaryMissing) return true;
   if (!isUpdateSuspended(state)) {

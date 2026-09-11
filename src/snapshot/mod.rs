@@ -134,6 +134,12 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
 /// the direct output of [`create`] before zstd compression). The format is
 /// detected from the file's magic bytes, not the extension.
 pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
+    inspect_with_cap(file, install::MAX_DECOMPRESSED_BYTES)
+}
+
+/// [`inspect`], with the decompressed-size ceiling as a parameter so the cap is
+/// reachable from a test without a 100 MB fixture.
+pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     use crate::storage::db::Database;
 
     // First-call site for the user's path. Without context the user-facing
@@ -143,24 +149,41 @@ pub fn inspect(file: &Path) -> Result<SnapshotMeta> {
         .with_context(|| format!("stat snapshot file '{}'", file.display()))?
         .len();
 
-    let raw_bytes =
-        std::fs::read(file).with_context(|| format!("read snapshot file '{}'", file.display()))?;
+    // Read the magic only. This used to be `fs::read` the whole file followed by
+    // `zstd::decode_all`, which held the compressed AND the fully decompressed
+    // payload in memory with no ceiling — while `install.rs` next door has capped
+    // the identical artifact at 100 MB since it was written. `inspect` is a
+    // scripted release-artifact check, so it is pointed at bytes nobody has
+    // vouched for yet. Audit 2026-09-07 SURF-25.
+    let mut magic = [0u8; 16];
+    let magic_len = {
+        use std::io::Read;
+        let mut f = std::fs::File::open(file)
+            .with_context(|| format!("read snapshot file '{}'", file.display()))?;
+        f.read(&mut magic)
+            .with_context(|| format!("read snapshot file '{}'", file.display()))?
+    };
+    let magic = &magic[..magic_len];
+
+    let tmp = tempfile::tempdir().context("inspect tempdir")?;
+    let decompressed = tmp.path().join("snapshot.db");
 
     // zstd magic = 0x28 0xB5 0x2F 0xFD; SQLite = "SQLite format 3\0".
-    let db_bytes = if raw_bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        zstd::decode_all(&raw_bytes[..]).context("zstd decode")?
-    } else if raw_bytes.starts_with(b"SQLite format 3\0") {
-        raw_bytes
+    if magic.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        install::decompress_with_cap(file, &decompressed, cap).context("zstd decode")?;
+    } else if magic.starts_with(b"SQLite format 3\0") {
+        // The raw arm needs the same ceiling: it is the same artifact, and
+        // staging it is what a later `Database::open` reads.
+        if file_size_bytes > cap {
+            anyhow::bail!("snapshot exceeds {cap} byte cap");
+        }
+        std::fs::copy(file, &decompressed).context("stage snapshot for inspect")?;
     } else {
         anyhow::bail!(
             "{} is not a code-graph snapshot — expected zstd-compressed (.db.zst) or raw SQLite (.db)",
             file.display()
         );
-    };
-
-    let tmp = tempfile::tempdir().context("inspect tempdir")?;
-    let decompressed = tmp.path().join("snapshot.db");
-    std::fs::write(&decompressed, &db_bytes).context("write snapshot for inspect")?;
+    }
 
     let db = Database::open(&decompressed)?;
     let conn = db.conn();

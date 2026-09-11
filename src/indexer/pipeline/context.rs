@@ -154,67 +154,85 @@ pub(super) fn regenerate_context_strings(
 /// Repair nodes that have NULL context_string (likely from a failed Phase 3).
 /// This is called at startup after index verification.
 pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>) -> Result<usize> {
-    let missing_ids = get_nodes_missing_context(db.conn())?;
-    if missing_ids.is_empty() {
-        return Ok(0);
-    }
+    let mut total = 0usize;
+    // `get_nodes_missing_context` returns one capped page. This used to take a
+    // single page and return, while `spawn_startup_repair` calls this exactly
+    // once per process — so an index with more NULL context strings than the cap
+    // could never finish repairing, and the count logged below (always <= the
+    // cap) never revealed that it had been truncated. Audit 2026-09-07 CORE-17.
+    loop {
+        let missing_ids = get_nodes_missing_context(db.conn())?;
+        if missing_ids.is_empty() {
+            break;
+        }
 
-    tracing::info!(
-        "[repair] Found {} nodes with NULL context_string, rebuilding...",
-        missing_ids.len()
-    );
+        tracing::info!(
+            "[repair] Found {} nodes with NULL context_string, rebuilding...",
+            missing_ids.len()
+        );
 
-    // Load node details with file paths
-    let nodes_with_files = get_nodes_with_files_by_ids(db.conn(), &missing_ids)?;
+        // Load node details with file paths
+        let nodes_with_files = get_nodes_with_files_by_ids(db.conn(), &missing_ids)?;
 
-    // Load edges for all affected nodes in one batch
-    let all_edges = get_edges_batch(db.conn(), &missing_ids)?;
+        // Load edges for all affected nodes in one batch
+        let all_edges = get_edges_batch(db.conn(), &missing_ids)?;
 
-    // Build context strings
-    let mut context_updates: Vec<(i64, String)> = Vec::new();
-    for nwf in &nodes_with_files {
-        let node = &nwf.node;
-        let edges = all_edges.get(&node.id);
-        let cat = categorize_edges(edges, format_route_from_metadata);
+        // Build context strings
+        let mut context_updates: Vec<(i64, String)> = Vec::new();
+        for nwf in &nodes_with_files {
+            let node = &nwf.node;
+            let edges = all_edges.get(&node.id);
+            let cat = categorize_edges(edges, format_route_from_metadata);
 
-        let ctx = build_context_string(&NodeContext {
-            node_type: node.node_type.clone(),
-            name: node.name.clone(),
-            qualified_name: node.qualified_name.clone(),
-            file_path: nwf.file_path.clone(),
-            language: nwf.language.clone(),
-            signature: node.signature.clone(),
-            return_type: node.return_type.clone(),
-            param_types: node.param_types.clone(),
-            code_content: Some(node.code_content.clone()),
-            routes: cat.routes,
-            callees: cat.callees,
-            callers: cat.callers,
-            inherits: cat.inherits,
-            imports: cat.imports,
-            implements: cat.implements,
-            exports: cat.exports,
-            doc_comment: node.doc_comment.clone(),
-        });
+            let ctx = build_context_string(&NodeContext {
+                node_type: node.node_type.clone(),
+                name: node.name.clone(),
+                qualified_name: node.qualified_name.clone(),
+                file_path: nwf.file_path.clone(),
+                language: nwf.language.clone(),
+                signature: node.signature.clone(),
+                return_type: node.return_type.clone(),
+                param_types: node.param_types.clone(),
+                code_content: Some(node.code_content.clone()),
+                routes: cat.routes,
+                callees: cat.callees,
+                callers: cat.callers,
+                inherits: cat.inherits,
+                imports: cat.imports,
+                implements: cat.implements,
+                exports: cat.exports,
+                doc_comment: node.doc_comment.clone(),
+            });
 
-        context_updates.push((node.id, ctx));
-    }
+            context_updates.push((node.id, ctx));
+        }
 
-    // Update in DB within a transaction (avoids per-row fsync under autocommit)
-    if !context_updates.is_empty() {
-        let tx = db.savepoint("sp_context_updates")?;
-        update_context_strings_batch(db.conn(), &context_updates)?;
-        tx.commit()?;
+        // Update in DB within a transaction (avoids per-row fsync under autocommit)
+        if !context_updates.is_empty() {
+            let tx = db.savepoint("sp_context_updates")?;
+            update_context_strings_batch(db.conn(), &context_updates)?;
+            tx.commit()?;
 
-        // Re-embed if model available
-        if let Some(m) = model {
-            if db.vec_enabled() {
-                embed_and_store_batch(db, m, &context_updates)?;
+            // Re-embed if model available
+            if let Some(m) = model {
+                if db.vec_enabled() {
+                    embed_and_store_batch(db, m, &context_updates)?;
+                }
             }
+        }
+
+        let count = context_updates.len();
+        tracing::info!("[repair] Repaired context strings for {} nodes", count);
+        total += count;
+
+        // No progress on a non-empty page: every id in it was unrepairable — a
+        // node whose `files` row is gone is dropped by the INNER JOIN in
+        // `get_nodes_with_files_by_ids`, so the same page would come back
+        // forever. Stop instead of spinning.
+        if count == 0 {
+            break;
         }
     }
 
-    let count = context_updates.len();
-    tracing::info!("[repair] Repaired context strings for {} nodes", count);
-    Ok(count)
+    Ok(total)
 }

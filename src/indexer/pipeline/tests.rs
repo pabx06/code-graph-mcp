@@ -2293,6 +2293,84 @@ fn test_python_external_survives_incremental_index() {
 }
 
 #[test]
+fn test_repair_null_context_strings_drains_past_one_page() {
+    // Audit 2026-09-07 CORE-17. `get_nodes_missing_context` caps its result at
+    // 10,000 rows; `repair_null_context_strings` took ONE page and returned, and
+    // `spawn_startup_repair` runs it exactly once per process. An index carrying
+    // more than a page of NULL context strings therefore never finished
+    // repairing — and the log line prints a count that is always <= the cap, so
+    // nothing said it had been truncated. The contract asserted here is the one
+    // the function's name claims, stated absolutely rather than in terms of the
+    // page size: after a repair, no NULL context strings are left.
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+
+    fs::write(
+        project_dir.path().join("a.ts"),
+        "function alpha() { return 1; }\n",
+    )
+    .unwrap();
+    run_full_index(&db, project_dir.path(), None, None).unwrap();
+
+    // Hang synthetic nodes off the real file row, so the INNER JOIN on `files`
+    // in `get_nodes_with_files_by_ids` finds them and they are genuinely
+    // repairable. 10,500 is a hardcoded count deliberately larger than the
+    // page, not one computed from it.
+    let file_id: i64 = db
+        .conn()
+        .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    {
+        // `savepoint` is the pipeline's own idiom; a bare `unchecked_transaction`
+        // here would trip the hardening guard that scans this directory.
+        let sp = db.savepoint("sp_seed_null_contexts").unwrap();
+        {
+            let mut stmt = db
+                .conn()
+                .prepare(
+                    "INSERT INTO nodes (file_id, type, name, start_line, end_line, \
+                     code_content, context_string) VALUES (?1, 'function', ?2, 1, 1, 'x', NULL)",
+                )
+                .unwrap();
+            for i in 0..10_500 {
+                stmt.execute((file_id, format!("synthetic_{i}"))).unwrap();
+            }
+        }
+        sp.commit().unwrap();
+    }
+
+    let nulls_before: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE context_string IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        nulls_before > 10_000,
+        "precondition: the fixture must exceed one page, got {nulls_before}"
+    );
+
+    let repaired = repair_null_context_strings(&db, None).unwrap();
+
+    let nulls_after: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE context_string IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        nulls_after, 0,
+        "one repair pass must drain every NULL context string, not just the first page \
+         ({repaired} repaired, {nulls_after} still NULL)"
+    );
+}
+
+#[test]
 fn test_repair_null_context_strings() {
     let project_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();

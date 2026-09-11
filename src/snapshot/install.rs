@@ -217,9 +217,11 @@ fn fetch_latest_snapshot_asset_url(owner: &str, repo: &str) -> Option<String> {
 
 use anyhow::Context;
 
-const MAX_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
-                                                       // Cap the COMPRESSED payload too — a snapshot zst is single-digit MB in practice,
-                                                       // but a missing/lying Content-Length must not let a huge body exhaust memory/disk.
+// `pub(crate)` so `snapshot::inspect` bounds the SAME artifact class by the SAME
+// number rather than growing a second opinion about how big a snapshot may be.
+pub(crate) const MAX_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+                                                                  // Cap the COMPRESSED payload too — a snapshot zst is single-digit MB in practice,
+                                                                  // but a missing/lying Content-Length must not let a huge body exhaust memory/disk.
 const MAX_COMPRESSED_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
 /// Wait up to `cap` for the child to exit; SIGTERM it on Unix if it doesn't,
@@ -550,7 +552,7 @@ fn verify_checksum_impl(url: &str, artifact: &Path, pin: Option<String>) -> Resu
     Ok(())
 }
 
-fn decompress_with_cap(src: &Path, dst: &Path, cap: u64) -> Result<()> {
+pub(crate) fn decompress_with_cap(src: &Path, dst: &Path, cap: u64) -> Result<()> {
     let f = std::fs::File::open(src).context("open compressed")?;
     let mut decoder = zstd::Decoder::new(f).context("zstd decoder init")?;
     let mut out = std::fs::File::create(dst).context("create decompressed")?;

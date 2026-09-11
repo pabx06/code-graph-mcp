@@ -1,5 +1,77 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading:** one new refusal, and three repairs to things that were failing
+without saying so. `snapshot inspect` now declines a snapshot larger than 100 MB
+decompressed — the ceiling `snapshot install` has applied to the same artifact
+since it was written. No other output, flag, or exit code changes, and
+`INDEX_VERSION` stays at 70, so no index rebuilds.
+
+Four items from the 2026-09-07 audit queue. What they share is the reason they
+survived four rounds of review: each one fails silently. None of them logs an
+error, returns a non-zero exit, or turns a test red — which is also why the
+suites were green across every round that carried them.
+
+### `snapshot inspect` decompressed without a ceiling
+
+`inspect` read the whole file into memory and handed it to `zstd::decode_all`,
+holding the compressed and the fully decompressed payload at once with no bound
+(SURF-25). It is the scripted verification step for a published release artifact,
+so it is pointed at bytes nobody has vouched for yet — and the install path next
+door has capped the identical artifact at 100 MB since it was written. It now
+reads the magic only, streams through the same `decompress_with_cap` the
+installer uses, and applies the same ceiling to the raw-SQLite arm, which was
+equally unbounded. The cap is one constant shared by both callers rather than a
+second opinion about how big a snapshot may be.
+
+### Startup context-string repair stopped after one page
+
+`get_nodes_missing_context` caps its result at 10,000 rows, and
+`repair_null_context_strings` took one page and returned — while the startup
+repair thread calls it exactly once per process (CORE-17). An index carrying more
+than 10,000 NULL context strings could therefore never finish repairing, on any
+number of restarts, and the log line reported a count that is always at or below
+the cap, so nothing indicated it had been truncated. It now drains, stopping on a
+page that repairs nothing so an unrepairable row cannot spin it.
+
+### An unreadable `lastCheck` parked the updater permanently
+
+`update-state.json` is written by several paths and read by four. A truncated or
+hand-edited `lastCheck` that `Date` cannot parse made `elapsed` NaN, and NaN
+fails *every* comparison in `shouldCheck` — including the `force` arm, the one
+high-intent bypass a user has (JS-22). The updater then never checked again,
+while `doctor`, reading the same file, still reported up to date; the only cure
+was deleting the file by hand. An unreadable timestamp is now treated as "no idea
+when, assume long ago", which is what a *missing* `lastCheck` already did one
+line above it.
+
+### The PATH probe had no timeout
+
+`commandExists` shells out to `which`/`where`, which walks every PATH entry, and
+passed no timeout (JS-21). Not a hook-budget path — but `downloadAndInstall`
+holds `install.lock` across its probes and that lock is only reclaimed after ten
+minutes, so a single unresponsive network mount on PATH parked installs and
+self-heal for every other session too. Bounded at 5s, far above any real PATH
+walk. Every other child process in that file was already bounded; this was the
+one that was not.
+
+### Not covered
+
+- The `snapshot inspect` ceiling is a refusal, not a streaming reader: a
+  legitimate snapshot above 100 MB is now declined by `inspect` exactly as it
+  already was by `install`. If that limit ever needs raising it has to move in
+  one place, which is the point.
+- The repair loop drains one page at a time and holds a page in memory, as
+  before. It does not make the repair incremental across restarts; it makes a
+  single run finish.
+- `shouldCheck` still trusts a *parseable* timestamp completely, including one
+  from the future. A clock that jumps backwards still suppresses checks until it
+  catches up.
+- The 5s PATH-probe bound is a constant, not a budget consumed from a caller. On
+  a machine where `which` legitimately takes longer, `commandExists` now returns
+  false where it used to block and answer.
+
 ## 0.145.1
 
 **Upgrading:** update the plugin and the red line at session start goes away.

@@ -489,6 +489,52 @@ fn inspect_rejects_truncated_sqlite_header() {
 }
 
 #[test]
+fn inspect_bounds_the_decompressed_payload() {
+    // Audit 2026-09-07 SURF-25. `inspect` is a scripted release-artifact check,
+    // so it is pointed at bytes nobody has vouched for yet, and it used to
+    // `fs::read` the whole file and `zstd::decode_all` it with no ceiling —
+    // while `install.rs` has capped the identical artifact at 100 MB since it
+    // was written. A 4 KiB cap against a 5 KiB payload proves the ceiling is
+    // enforced without a 100 MB fixture, and the numbers are explicit rather
+    // than derived from MAX_DECOMPRESSED_BYTES, so raising that constant cannot
+    // quietly make this test vacuous.
+    let dir = TempDir::new().unwrap();
+    let zst_path = dir.path().join("bomb.db.zst");
+    let payload = vec![0u8; 5 * 1024];
+    std::fs::write(&zst_path, zstd::encode_all(&payload[..], 1).unwrap()).unwrap();
+
+    let err = crate::snapshot::inspect_with_cap(&zst_path, 4 * 1024).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cap"),
+        "expected the decompression cap to refuse this, got: {msg}"
+    );
+
+    // Raw SQLite is the same artifact and needs the same ceiling; without the
+    // size check that arm would stage an arbitrarily large file uncapped.
+    let raw_path = dir.path().join("big.db");
+    let mut raw = b"SQLite format 3\0".to_vec();
+    raw.resize(5 * 1024, 0);
+    std::fs::write(&raw_path, &raw).unwrap();
+    let err = crate::snapshot::inspect_with_cap(&raw_path, 4 * 1024).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("cap"),
+        "the raw-SQLite arm must honour the same ceiling, got: {msg}"
+    );
+
+    // Negative control: the same raw file under a cap that admits it gets past
+    // the ceiling and fails later, on its content — so the refusals above are
+    // the cap talking, not the fixture being unreadable.
+    let err = crate::snapshot::inspect_with_cap(&raw_path, 1024 * 1024).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("cap"),
+        "under a generous cap the failure must not be the cap: {msg}"
+    );
+}
+
+#[test]
 fn inspect_rejects_garbage_with_clear_error() {
     let dir = TempDir::new().unwrap();
     let bad = dir.path().join("garbage.db.zst");
