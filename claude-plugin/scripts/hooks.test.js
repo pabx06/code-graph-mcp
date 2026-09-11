@@ -270,8 +270,9 @@ test('registered PreToolUse/PostToolUse/UserPromptSubmit timeouts come from HOOK
 // every child back on its own unclamped timeout with the whole suite green.
 // Both halves — the name a hook is invoked as, and the key it looks itself up
 // by — are asserted here against each other (pre-ship review 2026-09-05).
-test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a deadline', () => {
-  const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
+// Both budget guards below read the same set, so it is built once. A second
+// hand-rolled copy of this walk is how the two halves would drift apart.
+function registeredHookScripts() {
   const { buildSettingsHookEntries } = require('./lifecycle');
   const SCRIPT = /scripts[/\\]([A-Za-z0-9_-]+\.js)/;
 
@@ -288,6 +289,12 @@ test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a dead
   // SessionStart comes from the plugin manifest, not from lifecycle.js.
   const manifest = fs.readFileSync(HOOKS_JSON, 'utf8');
   for (const m of manifest.matchAll(new RegExp(SCRIPT.source, 'g'))) registered.add(m[1]);
+  return registered;
+}
+
+test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a deadline', () => {
+  const { HOOK_TIMEOUT_SECONDS } = require('./hook-fail-open');
+  const registered = registeredHookScripts();
   assert.ok(registered.size >= 7, `only ${registered.size} hook scripts found: ${[...registered]}`);
 
   for (const script of registered) {
@@ -311,6 +318,77 @@ test('every registered hook script is a HOOK_TIMEOUT_SECONDS key and arms a dead
       `a deadline, so its children cannot be clamped to it`
     );
   }
+});
+
+// The other half of the deadline mechanism, and the queue item the JS-18 /
+// JS-23 / JS-32 round left open (audit 2026-09-07). The guard above proves a
+// registered hook ARMS a budget; nothing proved it SPENDS one. All three of
+// those defects had the identical shape — a hook that armed a deadline and then
+// handed its child a literal `timeout: 8000` the budget could not shrink — and
+// each was found by reading, one at a time, because arming is what was checked.
+//
+// The discrimination the audit flagged as the expensive part: three registered
+// hooks (`pre-grep-guide`, `pre-read-guide`, `post-grep-inject`) spawn nothing
+// themselves and delegate to modules that spend the budget, so requiring a
+// budget call in every registered file would fail on three correct ones. The
+// trigger is therefore "does THIS file start a child", and only then is the
+// literal forbidden.
+//
+// NOT a duplicate of `incremental-index.test.js`'s "no child of this hook
+// carries a hard-coded timeout (JS-32)". That one scans one file, and was added
+// with the fix for that file; this one generalises it over the registered set,
+// which is the part that was missing — each of JS-18, JS-23 and JS-32 was found
+// by hand, after the previous one, because nothing asked the question of every
+// hook at once. Keep both: the per-file guard also pins the positive wiring
+// (`timeout: budget`, `budget === null` skips), which a corpus-wide scan cannot
+// assert without knowing each hook's own budget helper by name.
+test('a registered hook that spawns a child must spend the budget, not a literal', () => {
+  const registered = registeredHookScripts();
+
+  // Line-prefix stripping only, like the sibling guard in
+  // tmpdir-drift-guard.test.js. Two registered hooks carry `timeout: 0` inside
+  // PROSE explaining that node reads it as no timeout at all; a scanner that
+  // cannot tell code from commentary fires on both of them today. Trailing `//`
+  // removal can also truncate a line at a `//` inside a string literal, which
+  // can only hide an offender, never invent one.
+  // Line numbers are carried from the ORIGINAL file, not from the filtered
+  // array: dropping comment lines and then counting the survivors reports a
+  // number that does not exist in the file, which is how you get a reader
+  // doubting the guard instead of the offending line.
+  const codeOf = (script) =>
+    fs.readFileSync(path.join(__dirname, script), 'utf8')
+      .split('\n')
+      .map((l, i) => [i + 1, l])
+      .filter(([, l]) => !/^\s*(?:\/\/|\*|\/\*)/.test(l))
+      .map(([n, l]) => [n, l.replace(/\/\/.*$/, '')]);
+
+  const SPAWNS = /(?:^|[^A-Za-z0-9_.])(?:spawnSync|execFileSync|execSync|spawn)\s*\(/;
+  const LITERAL_TIMEOUT = /\btimeout:\s*\d/;
+
+  let spawners = 0;
+  for (const script of registered) {
+    const lines = codeOf(script);
+    if (!lines.some(([, l]) => SPAWNS.test(l))) continue; // delegates; the callee owns the budget
+    spawners++;
+    const offenders = lines
+      .filter(([, l]) => LITERAL_TIMEOUT.test(l))
+      .map(([n, l]) => `${script}:${n}: ${l.trim()}`);
+    assert.deepEqual(
+      offenders, [],
+      `these lines hand a child a literal timeout the hook's own budget cannot shrink — ` +
+      `spend the budget instead (remainingMs / a childBudgetMs-style helper), and return ` +
+      `without running when it is gone:\n${offenders.join('\n')}`
+    );
+  }
+
+  // Anti-vacuity floor, absolute rather than derived from the set it guards: if
+  // every registered hook stopped spawning directly, the loop above would assert
+  // nothing at all and stay green.
+  assert.ok(
+    spawners >= 4,
+    `expected at least 4 registered hooks to start a child directly; saw ${spawners}. ` +
+    `Either the corpus shrank or the spawn detector stopped matching — both make this guard vacuous`
+  );
 });
 
 test('hooks.json SessionStart timeout matches HOOK_TIMEOUT_SECONDS', () => {
