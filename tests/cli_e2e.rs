@@ -11465,7 +11465,7 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
     );
     assert_eq!(code, 0);
     let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(refs["symbol"], "Alpha.helper");
+    assert_eq!(refs["symbol"], "helper");
     let names: Vec<&str> = refs["references"]
         .as_array()
         .unwrap()
@@ -11504,6 +11504,7 @@ fn test_cli_python_qualified_method_refs_callgraph_and_impact() {
     );
     assert_eq!(code, 0);
     let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "helper");
     let names: Vec<&str> = graph["results"]
         .as_array()
         .unwrap()
@@ -11609,6 +11610,7 @@ def beta_caller():
     );
     assert_eq!(code, 0);
     let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "helper");
     let names: Vec<&str> = graph["results"]
         .as_array()
         .unwrap()
@@ -11669,7 +11671,7 @@ def beta_caller():
     // With --file, the qualifier is strict even though that file has a bare
     // helper under other classes.
     for command in ["refs", "callgraph", "impact"] {
-        let (stdout, _, code) = run_cli(
+        let (stdout, stderr, code) = run_cli(
             &project,
             &[command, "Gamma.helper", "--file", "two.py", "--json"],
         );
@@ -11679,6 +11681,18 @@ def beta_caller():
         );
         let miss: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
         assert_eq!(miss["symbol"], "Gamma.helper");
+        if command == "impact" {
+            assert!(
+                miss["candidates"]
+                    .as_array()
+                    .is_some_and(|candidates| !candidates.is_empty()),
+                "impact qualified miss must retain recovery candidates: {miss}"
+            );
+            assert!(
+                stderr.contains("Defined in:"),
+                "impact qualified miss must retain the human recovery hint: {stderr}"
+            );
+        }
     }
 
     // 4. Stale file refresh for qualified target in impact re-queries node IDs
@@ -11707,6 +11721,87 @@ def caller_three():
     let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(impact["symbol"], "helper");
     assert_eq!(impact["direct_callers"], 2);
+}
+
+#[test]
+fn test_cli_qualified_selection_ignores_test_duplicate_without_file() {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join("tests")).unwrap();
+    std::fs::write(
+        project.path().join("src/worker.py"),
+        "class Worker:\n    def run(self): return 1\n\ndef prod_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("tests/test_worker.py"),
+        "class Worker:\n    def run(self): return 2\n\ndef test_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["refs", "Worker.run", "--relation", "calls", "--json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(refs["symbol"], "run");
+    let ref_names = refs["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(ref_names.contains(&"prod_caller"), "{refs}");
+    assert!(!ref_names.contains(&"test_caller"), "{refs}");
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "Worker.run",
+            "--direction",
+            "callers",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "run");
+    assert!(graph["results"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["name"] == "prod_caller")));
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "Worker.run", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let impact: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(impact["symbol"], "run");
+    assert_eq!(impact["direct_callers"], 1);
+
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &[
+            "refs",
+            "Worker.run",
+            "--file",
+            "tests/test_worker.py",
+            "--relation",
+            "calls",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "explicit test file must remain selectable: {stderr}"
+    );
+    let refs: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(refs["references"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["name"] == "test_caller")));
 }
 
 #[test]
@@ -11746,6 +11841,7 @@ fn test_cli_missing_qualifier_falls_back_to_unique_bare_symbol() {
         "bare fallback emitted a stale hint: {stderr}"
     );
     let graph: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(graph["symbol"], "probe");
     assert!(graph["results"]
         .as_array()
         .is_some_and(|rows| !rows.is_empty()));

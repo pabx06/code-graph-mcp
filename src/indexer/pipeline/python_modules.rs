@@ -40,7 +40,8 @@ pub(super) struct PythonImportBinding {
     pub is_explicit_alias: bool,
 }
 
-pub(super) type PythonImportBindings = HashMap<(String, String), PythonImportBinding>;
+/// Visible imports keyed by lexical scope and the local name they bind.
+pub(super) type PythonImportBindings = HashMap<(String, String), Vec<PythonImportBinding>>;
 pub(super) type PythonLocalBindings = HashMap<String, HashSet<String>>;
 
 fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
@@ -90,7 +91,9 @@ fn walk_python_scopes(
                     collect_py_param_idents(&params, source, &mut locals);
                 }
                 if let Some(body) = node.child_by_field_name("body") {
-                    collect_py_body_bindings(&body, source, &mut locals, 0);
+                    let mut globals = HashSet::new();
+                    collect_py_body_bindings(&body, source, &mut locals, &mut globals, 0);
+                    locals.retain(|name| !globals.contains(name));
                 }
 
                 // A method's relation source is qualified (`Class.method`).
@@ -126,6 +129,7 @@ fn collect_py_body_bindings(
     node: &tree_sitter::Node,
     source: &str,
     out: &mut HashSet<String>,
+    globals: &mut HashSet<String>,
     depth: usize,
 ) {
     if depth > 50 {
@@ -143,11 +147,14 @@ fn collect_py_body_bindings(
                 collect_binding_pattern(&left, source, out);
             }
         }
-        "for_statement" | "for_in_clause" => {
+        "for_statement" => {
             if let Some(left) = node.child_by_field_name("left") {
                 collect_binding_pattern(&left, source, out);
             }
         }
+        // A comprehension's `for_in_clause` owns a nested Python 3 scope. Its
+        // loop target must not shadow an import in the enclosing function.
+        "for_in_clause" => {}
         "with_item" | "as_clause" => {
             if let Some(alias) = node.child_by_field_name("alias") {
                 collect_binding_pattern(&alias, source, out);
@@ -170,11 +177,31 @@ fn collect_py_body_bindings(
                 collect_binding_pattern(&name, source, out);
             }
         }
+        "global_statement" => {
+            for i in 0..node.named_child_count() {
+                if let Some(name) = node.named_child(i) {
+                    if name.kind() == "identifier" {
+                        globals.insert(node_text(&name, source).to_string());
+                    }
+                }
+            }
+        }
+        // A nonlocal name is not local to this function, but it still blocks a
+        // module import because lookup is directed to an enclosing function.
+        "nonlocal_statement" => {
+            for i in 0..node.named_child_count() {
+                if let Some(name) = node.named_child(i) {
+                    if name.kind() == "identifier" {
+                        out.insert(node_text(&name, source).to_string());
+                    }
+                }
+            }
+        }
         _ => {}
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            collect_py_body_bindings(&child, source, out, depth + 1);
+            collect_py_body_bindings(&child, source, out, globals, depth + 1);
         }
     }
 }
@@ -226,7 +253,7 @@ fn collect_binding_pattern(node: &tree_sitter::Node, source: &str, out: &mut Has
 /// bindings are fallback-visible from function scopes; function-local imports
 /// stay scoped to the function that contains them.
 pub(super) fn build_python_import_bindings(relations: &[ParsedRelation]) -> PythonImportBindings {
-    let mut bindings = HashMap::new();
+    let mut bindings: PythonImportBindings = HashMap::new();
     for rel in relations.iter().filter(|rel| rel.relation == REL_IMPORTS) {
         let Some(metadata) = rel
             .metadata
@@ -245,38 +272,61 @@ pub(super) fn build_python_import_bindings(relations: &[ParsedRelation]) -> Pyth
             .get("python_scope")
             .and_then(|v| v.as_str())
             .unwrap_or("<module>");
-        bindings.insert(
-            (scope.to_string(), local_name.to_string()),
-            PythonImportBinding {
-                module: module.to_string(),
-                imported_name: rel.target_name.clone(),
-                is_module_import: metadata
-                    .get("is_module_import")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                is_explicit_alias: metadata
-                    .get("python_explicit_alias")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            },
-        );
+        let binding = PythonImportBinding {
+            module: module.to_string(),
+            imported_name: rel.target_name.clone(),
+            is_module_import: metadata
+                .get("is_module_import")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            is_explicit_alias: metadata
+                .get("python_explicit_alias")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        };
+        let coexist = binding.is_module_import && !binding.is_explicit_alias;
+        let entry = bindings
+            .entry((scope.to_string(), local_name.to_string()))
+            .or_default();
+        if coexist
+            && entry
+                .iter()
+                .all(|existing| existing.is_module_import && !existing.is_explicit_alias)
+        {
+            if !entry.contains(&binding) {
+                entry.push(binding);
+            }
+        } else {
+            // Imported symbols and explicit aliases rebind their local name.
+            // A plain import after either form also replaces that binding, but
+            // subsequent plain dotted imports with the same root can coexist.
+            entry.clear();
+            entry.push(binding);
+        }
     }
     bindings
 }
 
-pub(super) fn find_python_import_binding<'a>(
+/// Find every import binding visible for one local name.
+///
+/// The slice normally has one entry. It contains multiple entries only for
+/// plain dotted module imports that bind the same leading component, such as
+/// `import pkg.models` followed by `import pkg.views`.
+pub(super) fn find_python_import_bindings<'a>(
     bindings: &'a PythonImportBindings,
     local_bindings: &PythonLocalBindings,
     scope: &str,
     local_name: &str,
-) -> Option<&'a PythonImportBinding> {
+) -> Option<&'a [PythonImportBinding]> {
     if let Some(binding) = bindings.get(&(scope.to_string(), local_name.to_string())) {
-        return Some(binding);
+        return Some(binding.as_slice());
     }
     if python_import_is_shadowed(bindings, local_bindings, scope, local_name) {
         return None;
     }
-    bindings.get(&("<module>".to_string(), local_name.to_string()))
+    bindings
+        .get(&("<module>".to_string(), local_name.to_string()))
+        .map(Vec::as_slice)
 }
 
 /// Return whether a function-local binding blocks a module-level import.
@@ -308,7 +358,7 @@ pub(super) fn python_import_is_shadowed(
 /// does not name the bound target. Callers must not reinterpret that receiver
 /// through filename or bare-name guessing.
 pub(super) fn python_bound_call_target(
-    binding: &PythonImportBinding,
+    bindings: &[PythonImportBinding],
     written_segments: &[String],
     python_module_map: &HashMap<String, Vec<String>>,
 ) -> Option<(String, Option<String>)> {
@@ -316,32 +366,80 @@ pub(super) fn python_bound_call_target(
         return None;
     }
 
-    if binding.is_module_import {
-        if !python_module_map.contains_key(&binding.module) {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            python_bound_call_target_one(binding, written_segments, python_module_map)
+        })
+        .max_by_key(|(_, _, specificity)| *specificity)
+        .map(|(module, owner, _)| (module, owner))
+}
+
+/// Translate one Python import binding and rank how specifically it matched.
+///
+/// Exact plain dotted imports outrank a package-root fallback. The rank lets a
+/// shared-root binding set select `pkg.models` for `pkg.models.load()` without
+/// depending on import order.
+fn python_bound_call_target_one(
+    binding: &PythonImportBinding,
+    written_segments: &[String],
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Option<(String, Option<String>, usize)> {
+    let promote_submodules = |base: &str, consumed: usize, specificity: usize| {
+        if !python_module_map.contains_key(base) {
             return None;
         }
+        let remaining = &written_segments[consumed..];
+        let mut promoted = 0usize;
+        for count in 1..=remaining.len() {
+            let module = format!("{}.{}", base, remaining[..count].join("."));
+            if python_module_map.contains_key(&module) {
+                promoted = count;
+            }
+        }
+        let module = if promoted == 0 {
+            base.to_string()
+        } else {
+            format!("{}.{}", base, remaining[..promoted].join("."))
+        };
+        let owner = remaining
+            .get(promoted..)
+            .filter(|segments| !segments.is_empty())
+            .map(|segments| segments.join("."));
+        Some((module, owner, specificity + promoted))
+    };
+
+    if binding.is_module_import {
         let module_segments: Vec<&str> = binding.module.split('.').collect();
-        let consumed = if binding.is_explicit_alias {
+        if binding.is_explicit_alias {
             // An explicit alias replaces the complete module path, including
             // the valid but unusual `import pkg.sub as pkg` spelling.
-            1
+            return promote_submodules(&binding.module, 1, module_segments.len() * 2);
         } else if written_segments.len() >= module_segments.len()
             && written_segments
                 .iter()
                 .zip(&module_segments)
                 .all(|(written, module)| written == module)
         {
-            module_segments.len()
-        } else {
-            // Plain `import pkg.sub` binds `pkg`, but `pkg.helper()` does not
-            // name `pkg.sub.helper`; the complete dotted path must be written.
-            return None;
-        };
-        let owner = written_segments
-            .get(consumed..)
-            .filter(|segments| !segments.is_empty())
-            .map(|segments| segments.join("."));
-        return Some((binding.module.clone(), owner));
+            return promote_submodules(
+                &binding.module,
+                module_segments.len(),
+                module_segments.len() * 2,
+            );
+        } else if written_segments.len() == 1
+            && module_segments.len() > 1
+            && written_segments[0].as_str() == module_segments[0]
+        {
+            // `import pkg.sub` also binds `pkg`; a direct `pkg.helper()` call
+            // can therefore target the package module, never `pkg.sub`.
+            return promote_submodules(module_segments[0], 1, 1);
+        } else if module_segments.len() == 1 && written_segments[0].as_str() == module_segments[0] {
+            // `import pkg` permits `pkg.sub.func()`. Promote the longest
+            // receiver prefix that is an indexed module and leave any tail as
+            // a class or nested owner.
+            return promote_submodules(&binding.module, 1, 2);
+        }
+        return None;
     }
 
     // `from pkg import sub as s` can bind a real submodule. Prefer that module
@@ -352,18 +450,14 @@ pub(super) fn python_bound_call_target(
         format!("{}.{}", binding.module, binding.imported_name)
     };
     if python_module_map.contains_key(&submodule) {
-        let owner = written_segments
-            .get(1..)
-            .filter(|segments| !segments.is_empty())
-            .map(|segments| segments.join("."));
-        return Some((submodule, owner));
+        return promote_submodules(&submodule, 1, 2);
     }
     if !python_module_map.contains_key(&binding.module) {
         return None;
     }
     let mut owner_segments = vec![binding.imported_name.clone()];
     owner_segments.extend(written_segments.iter().skip(1).cloned());
-    Some((binding.module.clone(), Some(owner_segments.join("."))))
+    Some((binding.module.clone(), Some(owner_segments.join(".")), 1))
 }
 
 /// Directories Python would import from: the project root, plus every
@@ -597,6 +691,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn global_and_comprehension_bindings_follow_python_scope_rules() {
+        let source = "def invoke(items):\n    global api\n    api = None\n    values = [run for run in items]\n    return api(), run()\n\ndef outer():\n    value = None\n    def inner():\n        nonlocal value\n        return value()\n";
+        let tree = crate::parser::treesitter::parse_tree(source, "python").unwrap();
+        let bindings = collect_python_local_bindings(&tree, source);
+        let invoke = bindings.get("invoke").expect("invoke scope");
+        assert!(
+            !invoke.contains("api"),
+            "global escaped local set: {invoke:?}"
+        );
+        assert!(
+            !invoke.contains("run"),
+            "comprehension target leaked into function: {invoke:?}"
+        );
+        assert!(
+            bindings
+                .get("inner")
+                .is_some_and(|names| names.contains("value")),
+            "nonlocal must block a module import: {bindings:?}"
+        );
+    }
+
     fn map_of(paths: &[&str]) -> HashMap<String, Vec<String>> {
         build_python_module_map(&paths.iter().map(|p| p.to_string()).collect())
     }
@@ -612,13 +728,17 @@ mod tests {
         };
 
         assert_eq!(
-            python_bound_call_target(&plain, &["pkg".into(), "sub".into()], &module_map),
+            python_bound_call_target(
+                std::slice::from_ref(&plain),
+                &["pkg".into(), "sub".into()],
+                &module_map,
+            ),
             Some(("pkg.sub".into(), None))
         );
         assert_eq!(
-            python_bound_call_target(&plain, &["pkg".into()], &module_map),
-            None,
-            "`import pkg.sub` must not reinterpret pkg.helper() as pkg.sub.helper()"
+            python_bound_call_target(std::slice::from_ref(&plain), &["pkg".into()], &module_map,),
+            Some(("pkg".into(), None)),
+            "`import pkg.sub` binds pkg, but must not reinterpret pkg.helper() as pkg.sub.helper()"
         );
 
         let alias = PythonImportBinding {
@@ -626,13 +746,41 @@ mod tests {
             ..plain
         };
         assert_eq!(
-            python_bound_call_target(&alias, &["alias".into()], &module_map),
+            python_bound_call_target(std::slice::from_ref(&alias), &["alias".into()], &module_map,),
             Some(("pkg.sub".into(), None))
         );
         assert_eq!(
-            python_bound_call_target(&alias, &["pkg".into()], &module_map),
+            python_bound_call_target(std::slice::from_ref(&alias), &["pkg".into()], &module_map,),
             Some(("pkg.sub".into(), None)),
             "an explicit alias remains authoritative even when it equals the root component"
+        );
+    }
+
+    #[test]
+    fn package_import_promotes_indexed_receiver_prefix_to_submodule() {
+        let module_map = map_of(&["pkg/__init__.py", "pkg/sub.py", "pkg/sub/deep.py"]);
+        let binding = PythonImportBinding {
+            module: "pkg".into(),
+            imported_name: "pkg".into(),
+            is_module_import: true,
+            is_explicit_alias: false,
+        };
+
+        assert_eq!(
+            python_bound_call_target(
+                std::slice::from_ref(&binding),
+                &["pkg".into(), "sub".into()],
+                &module_map,
+            ),
+            Some(("pkg.sub".into(), None))
+        );
+        assert_eq!(
+            python_bound_call_target(
+                std::slice::from_ref(&binding),
+                &["pkg".into(), "sub".into(), "Owner".into()],
+                &module_map,
+            ),
+            Some(("pkg.sub".into(), Some("Owner".into())))
         );
     }
 

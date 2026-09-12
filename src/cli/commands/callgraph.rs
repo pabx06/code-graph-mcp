@@ -163,6 +163,11 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     // `symbol.to_string()` above). Either way, `symbol` below is the correct
     // identifier to print in the "No call graph results" eprintln.
     let symbol = resolved_symbol.as_str();
+    let output_symbol = if is_exact_qualified {
+        selection.bare_name.as_str()
+    } else {
+        symbol
+    };
 
     // Query-time freshness (audit 2026-08-22 P2-11 — the one read command the
     // wiring had skipped on BOTH surfaces). What goes stale here is not a line
@@ -214,7 +219,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         // exists with zero edges also reaches this branch, and hinting at
         // reindexing there would send the user chasing a non-problem.
         let absent = if is_exact_qualified {
-            queries::get_node_ids_by_qualified_name(conn, symbol)
+            crate::resolve::selectable_qualified_definitions(conn, symbol, file_filter)
                 .map(|nodes| nodes.is_empty())
                 .unwrap_or(false)
         } else {
@@ -286,7 +291,10 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 })
             })
             .collect();
-        let mut output = serde_json::json!({ "results": results });
+        let mut output = serde_json::json!({
+            "symbol": output_symbol,
+            "results": results,
+        });
         if test_count > 0 {
             output["test_callers_hidden"] = serde_json::json!(test_count);
         }

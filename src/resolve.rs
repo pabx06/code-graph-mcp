@@ -14,6 +14,29 @@ use rusqlite::Connection;
 
 use crate::storage::queries::{self, NameCandidate};
 
+/// Return exact qualified definitions using the shared surface selection rule.
+///
+/// Without an explicit file selector, test symbols are excluded just as they
+/// are from [`detect_ambiguity`]. Supplying a file is an intentional bypass so
+/// callers can select a definition in a test file. The storage query already
+/// excludes the `<external>` sentinel.
+pub fn selectable_qualified_definitions(
+    conn: &Connection,
+    qualified_name: &str,
+    explicit_file: Option<&str>,
+) -> Result<Vec<queries::NodeWithFile>> {
+    Ok(
+        queries::get_nodes_with_files_by_qualified_name(conn, qualified_name)?
+            .into_iter()
+            .filter(|candidate| explicit_file.is_none_or(|wanted| wanted == candidate.file_path))
+            .filter(|candidate| {
+                explicit_file.is_some()
+                    || !crate::domain::is_test_symbol(&candidate.node.name, &candidate.file_path)
+            })
+            .collect(),
+    )
+}
+
 /// Which surface is rendering the message — only affects flag/tool wording
 /// (`--file` vs `file_path`, `show --node-id` vs `get_ast_node`), never the
 /// ambiguity decision itself.

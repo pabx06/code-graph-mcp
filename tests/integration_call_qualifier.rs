@@ -1699,6 +1699,53 @@ def nested_runtime(holder):
 }
 
 #[test]
+fn python_shared_import_roots_and_package_submodules_all_resolve() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(root, "pkg/__init__.py", "");
+    write(root, "pkg/models.py", "def load(): return 1\n");
+    write(root, "pkg/views.py", "def render(): return 2\n");
+    write(root, "pkg/sub.py", "def func(): return 3\n");
+    write(
+        root,
+        "app.py",
+        r#"
+import pkg.models
+import pkg.views
+import pkg
+
+def run():
+    pkg.models.load()
+    pkg.views.render()
+    pkg.sub.func()
+"#,
+    );
+    let db_path = root.join(".code-graph/graph.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::open(&db_path).unwrap();
+    run_full_index(&db, root, None, None).unwrap();
+
+    for (name, file) in [
+        ("load", "pkg/models.py"),
+        ("render", "pkg/views.py"),
+        ("func", "pkg/sub.py"),
+    ] {
+        let edges = python_call_edges(&db, name);
+        assert!(
+            edges.iter().any(|edge| edge.0 == "run" && edge.2 == file),
+            "missing package-bound {name} edge: {edges:?}"
+        );
+    }
+    let pending: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM pending_unresolved_calls", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, 0, "resolved package calls must not stay pending");
+}
+
+#[test]
 fn python_binding_patterns_shadow_imports_without_attribute_false_positives() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -1747,7 +1794,20 @@ def looped():
         run()
 
 def comprehension():
-    return [run() for run in []]
+    values = [run for run in []]
+    return run()
+
+def global_rebind():
+    global run
+    run = lambda: 1
+    return run()
+
+def outer():
+    run = lambda: 1
+    def nonlocal_call():
+        nonlocal run
+        return run()
+    return nonlocal_call()
 
 def context():
     return object()
@@ -1787,16 +1847,18 @@ def invoke():
     assert!(imported_callers.contains("attribute"));
     assert!(imported_callers.contains("subscript"));
     assert!(imported_callers.contains("invoke"));
+    assert!(imported_callers.contains("comprehension"));
+    assert!(imported_callers.contains("global_rebind"));
     for shadowed in [
         "parameter",
         "annotated",
         "assigned",
         "destructured",
         "looped",
-        "comprehension",
         "with_bound",
         "walrus",
         "nested",
+        "nonlocal_call",
         "Scope.invoke",
     ] {
         assert!(
@@ -1825,12 +1887,13 @@ fn python_project_builtins_win_only_when_uniquely_defined() {
     write(
         root,
         "builtins_override.py",
-        "def len(value): return 7\ndef open(path): return 8\n",
+        "def len(value): return 7\ndef open(path): return 8\ndef id(value): return value\n",
     );
+    write(root, "other_builtin.py", "def id(value): return value\n");
     write(
         root,
         "caller.py",
-        "from builtins_override import open\ndef call_len(): return len([])\ndef call_open(): return open('x')\ndef genuine(): return print('x')\n",
+        "from builtins_override import open\ndef call_len(): return len([])\ndef call_open(): return open('x')\ndef call_id(): return id(1)\ndef genuine(): return print('x')\n",
     );
     let db_path = root.join(".code-graph/graph.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -1843,7 +1906,23 @@ fn python_project_builtins_win_only_when_uniquely_defined() {
     assert!(python_call_edges(&db, "open")
         .iter()
         .any(|edge| edge.0 == "call_open" && edge.2 == "builtins_override.py"));
+    assert!(
+        python_call_edges(&db, "id").is_empty(),
+        "an ambiguous project override must not capture a Python builtin"
+    );
     assert!(python_call_edges(&db, "print").is_empty());
+    let pending_print: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM pending_unresolved_calls WHERE target_name = 'print'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_print, 0,
+        "a genuine builtin call must be removed from the pending queue"
+    );
 }
 
 #[test]

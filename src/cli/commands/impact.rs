@@ -80,13 +80,40 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
             emit_exact_ambiguity(raw_symbol, &candidates, json_mode)
         }
         Err(CliSymbolSelectionError::QualifiedNotFound) => {
+            let bare_name = strip_qualified_prefix(raw_symbol);
+            let candidates: Vec<queries::NameCandidate> =
+                queries::get_nodes_with_files_by_name(conn, bare_name)?
+                    .into_iter()
+                    .filter(|candidate| {
+                        crate::resolve::is_selectable_definition(&candidate.file_path)
+                    })
+                    .map(|candidate| queries::NameCandidate {
+                        name: candidate.node.name,
+                        file_path: candidate.file_path,
+                        node_type: candidate.node.node_type,
+                        node_id: candidate.node.id,
+                        start_line: candidate.node.start_line,
+                    })
+                    .collect();
             if json_mode {
+                let suggestions = candidates
+                    .iter()
+                    .take(crate::resolve::SUGGESTION_CAP)
+                    .map(|candidate| {
+                        serde_json::json!({
+                            "name": candidate.name,
+                            "type": candidate.node_type,
+                            "file_path": candidate.file_path,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 println!(
                     "{}",
                     serde_json::json!({
                         "error": "Symbol not found in file",
                         "symbol": raw_symbol,
                         "file": explicit_file.unwrap_or_default(),
+                        "candidates": suggestions,
                     })
                 );
             }
@@ -95,6 +122,16 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
                 raw_symbol,
                 explicit_file.unwrap_or_default()
             );
+            let mut defined_in = candidates
+                .iter()
+                .map(|candidate| candidate.file_path.as_str())
+                .collect::<Vec<_>>();
+            defined_in.sort_unstable();
+            defined_in.dedup();
+            defined_in.truncate(crate::resolve::SUGGESTION_CAP);
+            if !defined_in.is_empty() {
+                eprintln!("[code-graph] Defined in: {}", defined_in.join(", "));
+            }
             std::process::exit(1);
         }
     };
@@ -105,10 +142,9 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
 
     let fetch_nodes = |sym: &str| -> Result<Vec<queries::NodeResult>> {
         if is_exact_qualified {
-            let ids = queries::get_node_ids_by_qualified_name(conn, sym)?
+            let ids = crate::resolve::selectable_qualified_definitions(conn, sym, file_filter)?
                 .into_iter()
-                .filter(|(_, fp)| file_filter.is_none_or(|wanted| wanted == fp))
-                .map(|(id, _)| id)
+                .map(|candidate| candidate.node.id)
                 .collect::<Vec<_>>();
             Ok(ids
                 .into_iter()

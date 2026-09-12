@@ -4543,6 +4543,76 @@ def unknown_receiver(alpha):
     let result = parse_tool_result(&resp);
     assert_eq!(result["qualified_name"], "Alpha.helper");
 }
+
+#[test]
+fn test_mcp_qualified_selection_ignores_test_duplicate_without_file() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+    fs::write(
+        project.path().join("src/worker.py"),
+        "class Worker:\n    def run(self): return 1\n\ndef prod_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("tests/test_worker.py"),
+        "class Worker:\n    def run(self): return 2\n\ndef test_caller(): return Worker.run(None)\n",
+    )
+    .unwrap();
+    let server = common::init_server(&project);
+
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({"symbol_name": "Worker.run", "relation": "calls"}),
+    );
+    let result = parse_tool_result(&server.handle_message(&refs).unwrap());
+    assert!(result.get("error").is_none(), "{result}");
+    let names = result["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"prod_caller"), "{result}");
+    assert!(!names.contains(&"test_caller"), "{result}");
+
+    let graph = tool_call_json(
+        "get_call_graph",
+        serde_json::json!({
+            "symbol_name": "Worker.run",
+            "direction": "callers",
+            "depth": 1
+        }),
+    );
+    let result = parse_tool_result(&server.handle_message(&graph).unwrap());
+    assert!(result.get("error").is_none(), "{result}");
+    assert_eq!(result["function"], "Worker.run");
+
+    let ast = tool_call_json(
+        "get_ast_node",
+        serde_json::json!({"symbol_name": "Worker.run", "compact": true}),
+    );
+    let result = parse_tool_result(&server.handle_message(&ast).unwrap());
+    assert!(result.get("error").is_none(), "{result}");
+    assert_eq!(result["qualified_name"], "Worker.run");
+
+    let refs = tool_call_json(
+        "find_references",
+        serde_json::json!({
+            "symbol_name": "Worker.run",
+            "file_path": "tests/test_worker.py",
+            "relation": "calls"
+        }),
+    );
+    let result = parse_tool_result(&server.handle_message(&refs).unwrap());
+    assert!(
+        result["references"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "test_caller")),
+        "explicit test file must remain selectable: {result}"
+    );
+}
+
 #[test]
 fn test_python_module_alias_call_resolution() {
     let project = TempDir::new().unwrap();

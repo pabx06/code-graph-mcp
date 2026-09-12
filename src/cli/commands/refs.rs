@@ -106,11 +106,14 @@ impl RefsTarget {
             .unwrap_or_default(),
             RefsTarget::Orphan(id) => vec![*id],
             RefsTarget::QualifiedName { file_path } => {
-                queries::get_node_ids_by_qualified_name(conn, symbol)?
-                    .into_iter()
-                    .filter(|(_, fp)| file_path.as_deref().is_none_or(|wanted| wanted == fp))
-                    .map(|(id, _)| id)
-                    .collect()
+                crate::resolve::selectable_qualified_definitions(
+                    conn,
+                    symbol,
+                    file_path.as_deref(),
+                )?
+                .into_iter()
+                .map(|candidate| candidate.node.id)
+                .collect()
             }
             RefsTarget::Name {
                 file_path: Some(fp),
@@ -148,24 +151,20 @@ impl RefsTarget {
         let cands: Vec<queries::NameCandidate> = match self {
             RefsTarget::Node { .. } | RefsTarget::Orphan(_) => return Ok(()),
             RefsTarget::QualifiedName { file_path } => {
-                let matches = queries::get_node_ids_by_qualified_name(conn, symbol)?;
-                let filtered: Vec<_> = matches
-                    .into_iter()
-                    .filter(|(_, fp)| file_path.as_deref().is_none_or(|wanted| wanted == fp))
-                    .collect();
-                if filtered.len() > 1 {
-                    let cands: Vec<queries::NameCandidate> = filtered
+                let matches = crate::resolve::selectable_qualified_definitions(
+                    conn,
+                    symbol,
+                    file_path.as_deref(),
+                )?;
+                if matches.len() > 1 {
+                    let cands: Vec<queries::NameCandidate> = matches
                         .into_iter()
-                        .filter_map(|(id, fp)| {
-                            queries::get_node_by_id(conn, id).ok().flatten().map(|n| {
-                                queries::NameCandidate {
-                                    name: n.name,
-                                    file_path: fp,
-                                    node_type: n.node_type,
-                                    node_id: n.id,
-                                    start_line: n.start_line,
-                                }
-                            })
+                        .map(|candidate| queries::NameCandidate {
+                            name: candidate.node.name,
+                            file_path: candidate.file_path,
+                            node_type: candidate.node.node_type,
+                            node_id: candidate.node.id,
+                            start_line: candidate.node.start_line,
                         })
                         .collect();
                     emit_exact_ambiguity(symbol, &cands, json_mode);
@@ -286,11 +285,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             }
         };
         if selection.lookup == CliSymbolLookup::ExactQualified {
-            let qualified_ids = queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
-                .into_iter()
-                .filter(|(_, fp)| explicit_file.is_none_or(|wanted| wanted == fp))
-                .map(|(id, _)| id)
-                .collect::<Vec<_>>();
+            let qualified_ids =
+                crate::resolve::selectable_qualified_definitions(conn, raw_symbol, explicit_file)?
+                    .into_iter()
+                    .map(|candidate| candidate.node.id)
+                    .collect::<Vec<_>>();
             {
                 let target = RefsTarget::QualifiedName {
                     file_path: explicit_file.map(|s| s.to_string()),
@@ -412,6 +411,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
     // single binding — the tuple above must own the String so `get_node_by_id`'s
     // return doesn't get dropped across the .as_str() borrow.
     let symbol = symbol.as_str();
+    let output_symbol = if matches!(&target, RefsTarget::QualifiedName { .. }) {
+        strip_qualified_prefix(symbol)
+    } else {
+        symbol
+    };
 
     // `relation` is already canonicalized by `normalize_relation` above, which
     // only ever yields a `RELATION_FILTER_VOCAB` member or "all" — so this maps
@@ -521,7 +525,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
             *by_relation.entry(r.relation.clone()).or_insert(0) += 1;
         }
         let mut envelope = serde_json::json!({
-            "symbol": symbol,
+            "symbol": output_symbol,
             "total_references": items.len(),
             "by_relation": by_relation,
             "references": items,

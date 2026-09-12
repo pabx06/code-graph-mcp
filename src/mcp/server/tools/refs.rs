@@ -65,10 +65,14 @@ impl McpServer {
 
         let qualified_matches =
             if let Some(symbol_name) = symbol_name_arg.filter(|s| s.contains('.')) {
-                queries::get_node_ids_by_qualified_name(self.db.conn(), symbol_name)?
-                    .into_iter()
-                    .filter(|(_, fp)| file_path.is_none_or(|wanted| wanted == fp))
-                    .collect::<Vec<_>>()
+                crate::resolve::selectable_qualified_definitions(
+                    self.db.conn(),
+                    symbol_name,
+                    file_path,
+                )?
+                .into_iter()
+                .map(|candidate| (candidate.node.id, candidate.file_path))
+                .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };

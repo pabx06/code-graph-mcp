@@ -19,9 +19,7 @@ use crate::storage::queries::{
     list_pending_unresolved_calls,
 };
 
-use super::python_modules::{
-    build_python_module_map, project_module_files, python_same_package_files,
-};
+use super::python_modules::{project_module_files, python_same_package_files};
 
 /// Decoded form of `edges.metadata` for REL_CALLS rows. See
 /// `docs/superpowers/specs/2026-05-11-bare-name-call-qualifier-design.md`
@@ -447,27 +445,19 @@ pub(super) fn mark_call_edges_ambiguous(
 /// flags that as the canonical false-positive class), with
 /// `refine_ambiguous_targets` applied when multiple candidates share the name.
 ///
+/// `python_module_map` must be the map built by the owning index run. Passing it
+/// in avoids a second all-Python-files scan on every interactive edit.
+///
 /// Returns the number of edges inserted by this sweep.
-pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>) -> Result<usize> {
+pub(super) fn resolve_pending_calls(
+    db: &Database,
+    crate_roots: &HashSet<String>,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> Result<usize> {
     let pending = list_pending_unresolved_calls(db.conn())?;
     if pending.is_empty() {
         return Ok(0);
     }
-
-    // Rebuild the same module map the batch/deferred paths use. Pending rows
-    // survive across indexing invocations, so retaining a previous run's map
-    // would be stale precisely when a missing module file has just appeared.
-    let python_module_map = {
-        let mut paths = HashSet::new();
-        let mut stmt = db
-            .conn()
-            .prepare("SELECT path FROM files WHERE language = 'python'")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            paths.insert(row?);
-        }
-        build_python_module_map(&paths)
-    };
 
     // Build name → [(node_id, language)] map ONCE, then iterate pending rows
     // in memory. Narrowed by `n.name IN (SELECT DISTINCT target_name ...)` so
@@ -531,6 +521,24 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
             })
             .unwrap_or_default();
 
+        let parsed_metadata = parse_callee_metadata(row.metadata.as_deref());
+        if candidates.is_empty() {
+            if row.source_language == "python"
+                && crate::domain::is_python_builtin_call_target(&row.target_name)
+            {
+                to_delete.push(row.id);
+            } else if matches!(
+                &parsed_metadata,
+                Some(CalleeMeta::PythonImport { module, .. })
+                    if row.source_language == "python"
+                        && !python_module_map.contains_key(module)
+            ) {
+                // An external import cannot become resolvable on a later pass.
+                to_delete.push(row.id);
+            }
+            continue;
+        }
+
         let source_path = source_id_to_path
             .get(&row.source_id)
             .cloned()
@@ -550,7 +558,6 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
         // fallback. Rust Self/path qualifiers remain structural and bind
         // nothing when their fixed qualifier has no match. RecvType remains
         // additive for other languages.
-        let parsed_metadata = parse_callee_metadata(row.metadata.as_deref());
         let had_python_qualifier = row.source_language == "python" && parsed_metadata.is_some();
         let mut stored_metadata = row.metadata.as_deref();
         let mut preserve_all = false;
@@ -562,7 +569,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                     &row.target_name,
                     &candidates,
                     db,
-                    &python_module_map,
+                    python_module_map,
                 )?;
                 if targets.is_empty() {
                     if python_module_map.contains_key(&module) {
@@ -584,7 +591,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                     &candidates,
                     &source_path,
                     db,
-                    &python_module_map,
+                    python_module_map,
                 )?;
                 if filtered.is_empty() {
                     stored_metadata = None;
@@ -606,7 +613,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                     &candidates,
                     &source_path,
                     db,
-                    &python_module_map,
+                    python_module_map,
                 )?;
                 if filtered.is_empty() {
                     stored_metadata = None;
@@ -626,7 +633,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &HashSet<String>
                     &candidates,
                     &source_path,
                     db,
-                    &python_module_map,
+                    python_module_map,
                 )?;
                 if filtered.is_empty() {
                     stored_metadata = None;
@@ -1884,6 +1891,7 @@ mod tests {
     mod pending_qualifier {
         use super::*;
         use crate::domain::REL_CALLS;
+        use crate::indexer::pipeline::python_modules::build_python_module_map;
         use crate::storage::db::Database;
         use crate::storage::queries::{
             insert_node, insert_pending_unresolved_call, list_pending_unresolved_calls,
@@ -1902,6 +1910,9 @@ mod tests {
                 },
             )
             .unwrap()
+        }
+        fn module_map(paths: &[&str]) -> HashMap<String, Vec<String>> {
+            build_python_module_map(&paths.iter().map(|path| path.to_string()).collect())
         }
         fn method(
             conn: &rusqlite::Connection,
@@ -2012,7 +2023,8 @@ mod tests {
             )
             .unwrap();
 
-            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
+            let modules = module_map(&["app.py", "writer.py", "other.py"]);
+            let added = resolve_pending_calls(&db, &Default::default(), &modules).unwrap();
             let targets = call_targets(conn, run);
 
             assert_eq!(
@@ -2049,7 +2061,8 @@ mod tests {
             let helper = method(conn, "helper", None, f_util);
             insert_pending_unresolved_call(conn, run, "helper", "python", None).unwrap();
 
-            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
+            let added =
+                resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap();
             assert_eq!(added, 1, "bare unique call must still resolve");
             assert_eq!(call_targets(conn, run), vec![helper]);
         }
@@ -2078,7 +2091,10 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(resolve_pending_calls(&db, &Default::default()).unwrap(), 1);
+            assert_eq!(
+                resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap(),
+                1
+            );
             assert_eq!(
                 call_targets_with_confidence(conn, run),
                 vec![(local_save, "extracted".into())],
@@ -2114,7 +2130,8 @@ mod tests {
             )
             .unwrap();
 
-            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
+            let added =
+                resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap();
             assert_eq!(added, 1, "empty Python stype filter must fall back");
             assert_eq!(call_targets(conn, run), vec![profile_method]);
             assert_eq!(
@@ -2242,7 +2259,8 @@ mod tests {
             )
             .unwrap();
 
-            let added = resolve_pending_calls(&db, &Default::default()).unwrap();
+            let added =
+                resolve_pending_calls(&db, &Default::default(), &Default::default()).unwrap();
             assert_eq!(added, 1, "unmatched Python path must use bare fallback");
             assert_eq!(call_targets(conn, run), vec![helper]);
             assert_eq!(

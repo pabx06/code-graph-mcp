@@ -167,25 +167,17 @@ pub(crate) fn select_cli_symbol(
 ) -> Result<std::result::Result<CliSymbolSelection, CliSymbolSelectionError>> {
     let bare_name = strip_qualified_prefix(raw_symbol).to_string();
     if raw_symbol.contains('.') {
-        let matches: Vec<(i64, String)> =
-            queries::get_node_ids_by_qualified_name(conn, raw_symbol)?
-                .into_iter()
-                .filter(|(_, path)| explicit_file.is_none_or(|wanted| wanted == path))
-                .collect();
+        let matches =
+            crate::resolve::selectable_qualified_definitions(conn, raw_symbol, explicit_file)?;
         if matches.len() > 1 {
             let candidates = matches
                 .into_iter()
-                .filter_map(|(id, path)| {
-                    queries::get_node_by_id(conn, id)
-                        .ok()
-                        .flatten()
-                        .map(|node| queries::NameCandidate {
-                            name: node.name,
-                            file_path: path,
-                            node_type: node.node_type,
-                            node_id: node.id,
-                            start_line: node.start_line,
-                        })
+                .map(|candidate| queries::NameCandidate {
+                    name: candidate.node.name,
+                    file_path: candidate.file_path,
+                    node_type: candidate.node.node_type,
+                    node_id: candidate.node.id,
+                    start_line: candidate.node.start_line,
                 })
                 .collect();
             return Ok(Err(CliSymbolSelectionError::Ambiguous(candidates)));

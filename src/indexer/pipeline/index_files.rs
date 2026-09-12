@@ -51,7 +51,7 @@ use super::js_modules::{
 };
 use super::python_modules::{
     build_python_import_bindings, build_python_module_map, collect_python_local_bindings,
-    find_python_import_binding, project_module_files, python_bound_call_target,
+    find_python_import_bindings, project_module_files, python_bound_call_target,
     python_import_is_shadowed, resolve_python_module_targets,
 };
 use super::resolve::{
@@ -1445,7 +1445,7 @@ fn resolve_batch_relations(
                     ) {
                         continue;
                     }
-                    if let Some(binding) = find_python_import_binding(
+                    if let Some(bindings) = find_python_import_bindings(
                         &python_import_bindings,
                         &python_local_bindings,
                         &rel.source_name,
@@ -1454,10 +1454,11 @@ fn resolve_batch_relations(
                         // Relative imports need package context that the current
                         // module map does not model. Keep their existing pending
                         // behavior until that resolution is implemented.
-                        if !binding.module.is_empty()
-                            && !binding.module.starts_with('.')
-                            && !binding.is_module_import
-                        {
+                        if let Some(binding) = bindings.last().filter(|binding| {
+                            !binding.module.is_empty()
+                                && !binding.module.starts_with('.')
+                                && !binding.is_module_import
+                        }) {
                             if python_module_map.contains_key(&binding.module) {
                                 // Resolve against the complete pool. Besides
                                 // removing batch-order dependence, this keeps a
@@ -1519,14 +1520,14 @@ fn resolve_batch_relations(
                             ) {
                                 continue;
                             }
-                            if let Some(binding) = find_python_import_binding(
+                            if let Some(bindings) = find_python_import_bindings(
                                 &python_import_bindings,
                                 &python_local_bindings,
                                 &rel.source_name,
                                 first,
                             ) {
                                 if let Some((module, owner)) =
-                                    python_bound_call_target(binding, &segments, python_module_map)
+                                    python_bound_call_target(bindings, &segments, python_module_map)
                                 {
                                     let mut metadata = serde_json::json!({
                                         "q": "python_import",
@@ -2594,7 +2595,7 @@ pub(super) fn index_files(
     let pending_resolved = if all_indexed.is_empty() {
         0
     } else {
-        resolve_pending_calls(db, &crate_roots)?
+        resolve_pending_calls(db, &crate_roots, &python_module_map)?
     };
     total_edges_created += pending_resolved;
     if pending_resolved > 0 {
